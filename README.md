@@ -44,9 +44,9 @@ conda activate index-tts-vllm
 
 ### 3. 安装 pytorch
 
-建议安装 pytorch 2.7.0 或更高版本（对应 vllm v1.x），具体安装指令请参考：[pytorch 官网](https://pytorch.org/get-started/locally/)
+建议安装 pytorch 2.7.0 或更高版本（对应 vllm 0.9.x），具体安装指令请参考：[pytorch 官网](https://pytorch.org/get-started/locally/)
 
-本项目已完全支持 vLLM v1.x 版本，享受v1的所有性能优化特性
+本项目已完全支持 vLLM v1 引擎（通过 VLLM_USE_V1=1 启用），享受v1引擎的所有性能优化特性
 
 ### 4. 安装依赖
 ```bash
@@ -79,7 +79,7 @@ python webui.py
 ```
 第一次启动可能会久一些，因为要对 bigvgan 进行 cuda 核编译
 
-注：本项目已经完全兼容 vLLM v1 版本，支持v1的所有优化特性
+注：本项目已经完全兼容 vLLM v1 引擎（通过 VLLM_USE_V1=1 启用），支持v1引擎的所有优化特性
 
 
 ## API
@@ -89,7 +89,7 @@ python webui.py
 python api_server.py --model_dir /your/path/to/Index-TTS --port 11996
 ```
 
-注：本项目已经完全兼容 vLLM v1 版本，支持v1的所有优化特性
+注：本项目已经完全兼容 vLLM v1 引擎（通过 VLLM_USE_V1=1 启用），支持v1引擎的所有优化特性
 
 ### 启动参数
 - `--model_dir`: 模型权重下载路径
@@ -117,3 +117,5 @@ with open("output.wav", "wb") as f:
 
 ## 并发测试
 参考 [`simple_test.py`](simple_test.py)，需先启动 API 服务
+
+并发测试结果会输出平均 RTF (Real-Time Factor)，单卡 RTX 4090 可以轻松处理 16 并发请求
