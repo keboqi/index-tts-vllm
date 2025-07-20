@@ -110,6 +110,7 @@ class TTSMultiModalProcessor(BaseMultiModalProcessor[TTSProcessingInfo]):
         prompt: str,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
+        tok_kwargs: Optional[Mapping[str, object]] = None,
     ) -> BatchFeature:
         # print("prompt:", prompt)
         # print("mm_data:", mm_data)
