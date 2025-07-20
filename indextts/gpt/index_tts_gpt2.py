@@ -94,6 +94,16 @@ class TTSDummyInputsBuilder(BaseDummyInputsBuilder[TTSProcessingInfo]):
             },
         )
 
+    def get_dummy_mm_data(self, seq_len: int, mm_counts: Mapping[str, int]) -> Mapping[str, object]:
+        """Get dummy multimodal data for vLLM v1 compatibility."""
+        return {
+            # "audio": [torch.zeros((1, 1024))] * mm_counts.get("audio", 0)
+        }
+
+    def get_dummy_text(self, seq_len: int) -> str:
+        """Get dummy text for vLLM v1 compatibility."""
+        return ""
+
 
 class TTSMultiModalProcessor(BaseMultiModalProcessor[TTSProcessingInfo]):
 
