@@ -457,3 +457,8 @@ class GPT2TTSModel(nn.Module, SupportsPP, SupportsMultiModal):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
+
+    @classmethod
+    def is_backend_compatible(cls) -> bool:
+        """Check if the model is compatible with the current backend (vLLM v1)."""
+        return True
