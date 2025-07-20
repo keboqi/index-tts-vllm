@@ -112,7 +112,6 @@ class TTSMultiModalProcessor(BaseMultiModalProcessor[TTSProcessingInfo]):
         prompt: str,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
-        **kwargs,  # Accept additional kwargs like tok_kwargs for vLLM v1 compatibility
     ) -> BatchFeature:
         # print("prompt:", prompt)
         # print("mm_data:", mm_data)
