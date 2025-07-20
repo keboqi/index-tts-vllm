@@ -1,6 +1,8 @@
 
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+# Enable vLLM v1 engine
+os.environ["VLLM_USE_V1"] = "1"
 
 import asyncio
 import io

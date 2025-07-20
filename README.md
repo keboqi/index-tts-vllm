@@ -44,10 +44,9 @@ conda activate index-tts-vllm
 
 ### 3. 安装 pytorch
 
-优先建议安装 pytorch 2.7.0（对应 vllm 0.9.0），具体安装指令请参考：[pytorch 官网](https://pytorch.org/get-started/locally/)
+建议安装 pytorch 2.7.0 或更高版本（对应 vllm v1.x），具体安装指令请参考：[pytorch 官网](https://pytorch.org/get-started/locally/)
 
-若显卡不支持，请安装 pytorch 2.5.1（对应 vllm 0.7.3），并将 [requirements.txt](requirements.txt) 中 `vllm==0.9.0` 修改为 `vllm==0.7.3`
-
+本项目已完全支持 vLLM v1.x 版本，享受v1的所有性能优化特性
 
 ### 4. 安装依赖
 ```bash
@@ -76,21 +75,21 @@ bash convert_hf_format.sh /path/to/your/model_dir
 将 [`webui.py`](webui.py) 中的 `model_dir` 修改为模型权重下载路径，然后运行：
 
 ```bash
-VLLM_USE_V1=0 python webui.py
+python webui.py
 ```
 第一次启动可能会久一些，因为要对 bigvgan 进行 cuda 核编译
 
-注：一定要带上 `VLLM_USE_V1=0` ，因为本项目没有对 vllm 的 v1 版本做兼容
+注：本项目已经完全兼容 vLLM v1 版本，支持v1的所有优化特性
 
 
 ## API
 使用 fastapi 封装了 api 接口，启动示例如下：
 
 ```bash
-VLLM_USE_V1=0 python api_server.py --model_dir /your/path/to/Index-TTS --port 11996
+python api_server.py --model_dir /your/path/to/Index-TTS --port 11996
 ```
 
-注：一定要带上 `VLLM_USE_V1=0` ，因为本项目没有对 vllm 的 v1 版本做兼容
+注：本项目已经完全兼容 vLLM v1 版本，支持v1的所有优化特性
 
 ### 启动参数
 - `--model_dir`: 模型权重下载路径

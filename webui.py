@@ -3,6 +3,9 @@ import sys
 import threading
 import time
 
+# Enable vLLM v1 engine
+os.environ["VLLM_USE_V1"] = "1"
+
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
