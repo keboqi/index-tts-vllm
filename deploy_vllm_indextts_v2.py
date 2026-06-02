@@ -122,6 +122,8 @@ VLLM_PORT = 8000
 SNAPSHOT_STARTUP_TIMEOUT = 1800
 SNAPSHOT_REQUEST_TIMEOUT = 900
 INTERNAL_TOKEN_ENV = "INDEXTTS_INTERNAL_TOKEN"
+GPU_MEMORY_UTILIZATION = 0.15
+QWENEMO_GPU_MEMORY_UTILIZATION = 0.05
 
 STABLE_AUDIO3_VARIANTS = ("medium", "small-music", "small-sfx")
 
@@ -646,7 +648,13 @@ def legacy_serve_without_snapshot():
     
     # Build the command
     cmd = [
-        "python", "-u", "fastapi_webui_v2.py"
+        "python",
+        "-u",
+        "fastapi_webui_v2.py",
+        "--gpu_memory_utilization",
+        str(GPU_MEMORY_UTILIZATION),
+        "--qwenemo_gpu_memory_utilization",
+        str(QWENEMO_GPU_MEMORY_UTILIZATION),
     ]
     
     print(f"   Command: {' '.join(cmd)}")
@@ -846,6 +854,10 @@ class IndexTTSVllmServer:
             str(VLLM_PORT),
             "--model_dir",
             "checkpoints",
+            "--gpu_memory_utilization",
+            str(GPU_MEMORY_UTILIZATION),
+            "--qwenemo_gpu_memory_utilization",
+            str(QWENEMO_GPU_MEMORY_UTILIZATION),
             "--use_torch_compile",
         ]
         print(f"Starting FastAPI server: {' '.join(cmd)}")

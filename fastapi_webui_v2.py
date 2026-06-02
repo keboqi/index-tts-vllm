@@ -253,7 +253,8 @@ class AppSettings:
     model_dir: str = "checkpoints"
     is_fp16: bool = False
     use_torch_compile: bool = False
-    gpu_memory_utilization: float = 0.25
+    gpu_memory_utilization: float = 0.15
+    qwenemo_gpu_memory_utilization: float = 0.05
 
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "AppSettings":
@@ -265,6 +266,7 @@ class AppSettings:
             is_fp16=bool(args.is_fp16),
             use_torch_compile=bool(args.use_torch_compile),
             gpu_memory_utilization=float(args.gpu_memory_utilization),
+            qwenemo_gpu_memory_utilization=float(args.qwenemo_gpu_memory_utilization),
         )
 
 # Global thread executor for blocking operations
@@ -3463,7 +3465,8 @@ parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the
 parser.add_argument("--model_dir", type=str, default="checkpoints", help="Model checkpoints directory")
 parser.add_argument("--is_fp16", action="store_true", default=False, help="Fp16 infer")
 parser.add_argument("--use_torch_compile", action="store_true", default=False, help="use torch compile")
-parser.add_argument("--gpu_memory_utilization", type=float, default=0.25, help="GPU memory utilization")
+parser.add_argument("--gpu_memory_utilization", type=float, default=0.15, help="GPU memory utilization")
+parser.add_argument("--qwenemo_gpu_memory_utilization", type=float, default=0.05, help="QwenEmotion GPU memory utilization")
 
 # Parse args if run as script, otherwise use defaults
 try:
@@ -3477,7 +3480,8 @@ except SystemExit:
         model_dir="checkpoints",
         is_fp16=False,
         use_torch_compile=False,
-        gpu_memory_utilization=0.25
+        gpu_memory_utilization=0.15,
+        qwenemo_gpu_memory_utilization=0.05
     )
 
 SETTINGS = AppSettings.from_namespace(cmd_args)
@@ -10211,7 +10215,8 @@ class TTSManager:
                     model_dir=SETTINGS.model_dir,
                     is_fp16=SETTINGS.is_fp16,
                     use_torch_compile=SETTINGS.use_torch_compile,
-                    gpu_memory_utilization=SETTINGS.gpu_memory_utilization
+                    gpu_memory_utilization=SETTINGS.gpu_memory_utilization,
+                    qwenemo_gpu_memory_utilization=SETTINGS.qwenemo_gpu_memory_utilization
                 )
                 
                 # Initialize speaker preset manager
