@@ -110,7 +110,7 @@ def _vllm_sleep_mode_enabled() -> bool:
 
 class IndexTTS2:
     def __init__(
-        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.15, use_torch_compile=False
+        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.15, qwenemo_gpu_memory_utilization=0.05, use_torch_compile=False
     ):
         """
         Args:
@@ -119,7 +119,7 @@ class IndexTTS2:
             is_fp16 (bool): whether to use fp16.
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device (default: None, which enables it automatically on CUDA).
-            qwenemo_gpu_memory_utilization (float): GPU memory utilization for QwenEmotion vLLM engine (default: 0.15).
+            qwenemo_gpu_memory_utilization (float): GPU memory utilization for QwenEmotion vLLM engine (default: 0.05).
             use_torch_compile (bool): whether to use torch.compile for s2mel acceleration (default: False). Uses fullgraph=True with torch.split to avoid dynamic slicing issues.
         """
         if device is not None:
