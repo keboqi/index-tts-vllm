@@ -3284,7 +3284,7 @@ Content-Type: audio/mpeg</div>
                                             <div class="api-param-group">
                                                 <div class="api-param-group-title">Form Data</div>
                                                 <div class="api-param"><span class="api-param-name">name</span> <span class="api-param-type">string</span> <span class="api-param-desc">— Speaker name</span></div>
-                                                <div class="api-param"><span class="api-param-name">audio_file</span> <span class="api-param-type">file</span> <span class="api-param-desc">— Reference audio</span></div>
+                                                <div class="api-param"><span class="api-param-name">audio_file</span> <span class="api-param-type">file</span> <span class="api-param-desc">— Reference audio. Use a file part instead of large base64 form fields so server-side trimming can run.</span></div>
                                                 <div class="api-param"><span class="api-param-name">enhance_voice</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— ClearVoice enhancement</span></div>
                                                 <div class="api-param"><span class="api-param-name">enhancement_model</span> <span class="api-param-type">string</span> <span class="api-param-desc">— 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', 'MossFormer2_SE_48K'</span></div>
                                                 <div class="api-param"><span class="api-param-name">super_resolution_voice</span> <span class="api-param-type">bool</span> <span class="api-param-desc">— 48kHz upsampling</span></div>
