@@ -284,11 +284,24 @@ class SpeakerPresetManager:
             return False
             
         try:
+            preset_data = self.presets[preset_name]
             # Delete cache file
-            cache_path = Path(self.presets[preset_name]['cache_file'])
+            cache_path = Path(preset_data['cache_file'])
             if cache_path.exists():
                 cache_path.unlink()
-            
+
+            # Delete managed reference audio only when it lives inside this
+            # preset cache directory. Never remove arbitrary user-provided paths.
+            audio_path_value = preset_data.get('audio_path')
+            if audio_path_value:
+                audio_path = Path(audio_path_value)
+                try:
+                    audio_path.resolve().relative_to(self.cache_dir.resolve())
+                    if audio_path.exists():
+                        audio_path.unlink()
+                except Exception:
+                    pass
+
             # Remove from memory cache
             if preset_name in self._memory_cache:
                 del self._memory_cache[preset_name]

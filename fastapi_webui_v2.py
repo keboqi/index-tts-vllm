@@ -54,7 +54,9 @@ import math
 import re
 import shutil
 import subprocess
+import shlex
 import urllib.request
+import urllib.error
 import hashlib
 import zipfile
 import unicodedata
@@ -197,6 +199,9 @@ import argparse
 
 
 ALLOWED_TRANSCRIPTION_PIPELINES = {"gemini", "whisperx", "qwen_omnivad", "parakeet"}
+TTS_BACKEND_INDEX = "index"
+TTS_BACKEND_CONFUCIUS = "confucius"
+ALLOWED_TTS_BACKENDS = {TTS_BACKEND_INDEX, TTS_BACKEND_CONFUCIUS}
 
 
 def _normalize_transcription_pipeline(value: Any, default: str = "gemini") -> str:
@@ -245,6 +250,17 @@ def _env_ffmpeg_threads(name: str = "FFMPEG_THREADS") -> int:
     return min(parsed, cpu_threads)
 
 
+def _normalize_tts_backend(value: Any, default: str = TTS_BACKEND_INDEX) -> str:
+    backend = str(value or "").strip().lower().replace("-", "_")
+    if backend in {"index_tts", "indextts", "index_tts2", "index2"}:
+        return TTS_BACKEND_INDEX
+    if backend in {"confucius4_tts", "confucius_tts", "confucius4"}:
+        return TTS_BACKEND_CONFUCIUS
+    if backend in ALLOWED_TTS_BACKENDS:
+        return backend
+    return default
+
+
 @dataclass(frozen=True)
 class AppSettings:
     verbose: bool = False
@@ -255,6 +271,13 @@ class AppSettings:
     use_torch_compile: bool = False
     gpu_memory_utilization: float = 0.15
     qwenemo_gpu_memory_utilization: float = 0.05
+    tts_backend: str = TTS_BACKEND_INDEX
+    confucius_repo_dir: str = "../Confucius4-TTS"
+    confucius_host: str = "127.0.0.1"
+    confucius_port: int = 8001
+    confucius_start_command: str = ""
+    confucius_start_timeout: float = 900.0
+    confucius_request_timeout: float = 600.0
 
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "AppSettings":
@@ -267,6 +290,13 @@ class AppSettings:
             use_torch_compile=bool(args.use_torch_compile),
             gpu_memory_utilization=float(args.gpu_memory_utilization),
             qwenemo_gpu_memory_utilization=float(args.qwenemo_gpu_memory_utilization),
+            tts_backend=_normalize_tts_backend(getattr(args, "tts_backend", TTS_BACKEND_INDEX)),
+            confucius_repo_dir=str(getattr(args, "confucius_repo_dir", "../Confucius4-TTS")),
+            confucius_host=str(getattr(args, "confucius_host", "127.0.0.1")),
+            confucius_port=int(getattr(args, "confucius_port", 8001)),
+            confucius_start_command=str(getattr(args, "confucius_start_command", "")),
+            confucius_start_timeout=float(getattr(args, "confucius_start_timeout", 900.0)),
+            confucius_request_timeout=float(getattr(args, "confucius_request_timeout", 600.0)),
         )
 
 # Global thread executor for blocking operations
@@ -523,6 +553,7 @@ ALLOWED_GEMINI_MODELS = {
 GEMINI_AUDIO_EXPORT_BITRATE = "128k"
 GEMINI_CACHE_VERSION = 1
 SPEAKER_PREVIEW_DIR = Path("speaker_presets") / "previews"
+SPEAKER_REFERENCE_DIR = Path("speaker_presets") / "references"
 SPEAKER_PREVIEW_BITRATE = "128k"
 CHUNK_SPLIT_DEFAULT_MIN_MINUTES = 10.0
 CHUNK_SPLIT_DEFAULT_MAX_MINUTES = 15.0
@@ -2285,6 +2316,7 @@ async def _build_translation_segments(
     initial_speaker_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
+    tts_backend: Optional[str] = None,
     clearvoice_settings: Optional[Dict[str, Any]] = None,
     # Cached source paths for fast session storage (avoids re-encoding)
     original_audio_source_path: Optional[str] = None,
@@ -2512,6 +2544,7 @@ async def _build_translation_segments(
         default_emotion_weight,
         DEFAULT_EMOTION_WEIGHT,
     )
+    resolved_tts_backend = _normalize_tts_backend(tts_backend, SETTINGS.tts_backend)
     if normalized_default_speaker:
         if not detected_speaker_ids and speaker_profiles:
             for profile in speaker_profiles:
@@ -2585,6 +2618,7 @@ async def _build_translation_segments(
         source_video_filename=source_video_filename,
         default_speaker_preset=normalized_default_speaker,
         default_emotion_weight=normalized_default_emotion,
+        tts_backend=resolved_tts_backend,
         # Pass cached paths for fast session storage
         original_audio_path=original_audio_source_path,
         backing_track_path=backing_track_source_path,
@@ -2621,6 +2655,7 @@ async def _build_translation_segments(
         "translate_enabled": translate_enabled,
         "response_format": response_format_value,
         "bitrate": bitrate_value,
+        "tts_backend": resolved_tts_backend,
         "prompt": final_prompt,
         "gemini_model": resolved_gemini_model,
         "translation_llm_model": resolved_translation_llm_model,
@@ -2727,6 +2762,7 @@ class TranslateSessionData:
     translate_enabled: bool
     response_format: str
     bitrate: str
+    tts_backend: str
     input_mime_type: Optional[str]
     clearvoice_settings: Dict[str, Any]
     base_segments: List[Dict[str, Any]]
@@ -3467,6 +3503,13 @@ parser.add_argument("--is_fp16", action="store_true", default=False, help="Fp16 
 parser.add_argument("--use_torch_compile", action="store_true", default=False, help="use torch compile")
 parser.add_argument("--gpu_memory_utilization", type=float, default=0.15, help="GPU memory utilization")
 parser.add_argument("--qwenemo_gpu_memory_utilization", type=float, default=0.05, help="QwenEmotion GPU memory utilization")
+parser.add_argument("--tts_backend", type=str, default=TTS_BACKEND_INDEX, choices=sorted(ALLOWED_TTS_BACKENDS), help="Default TTS backend: index or confucius")
+parser.add_argument("--confucius_repo_dir", type=str, default="../Confucius4-TTS", help="Path to the Confucius4-TTS repository for lazy managed startup")
+parser.add_argument("--confucius_host", type=str, default="127.0.0.1", help="Host for the managed Confucius4-TTS FastAPI backend")
+parser.add_argument("--confucius_port", type=int, default=8001, help="Port for the managed Confucius4-TTS FastAPI backend")
+parser.add_argument("--confucius_start_command", type=str, default="", help="Optional command used to start Confucius4-TTS instead of the default launcher")
+parser.add_argument("--confucius_start_timeout", type=float, default=900.0, help="Seconds to wait for lazy Confucius4-TTS startup")
+parser.add_argument("--confucius_request_timeout", type=float, default=600.0, help="Seconds to wait for each Confucius4-TTS synthesis request")
 
 # Parse args if run as script, otherwise use defaults
 try:
@@ -3481,7 +3524,14 @@ except SystemExit:
         is_fp16=False,
         use_torch_compile=False,
         gpu_memory_utilization=0.15,
-        qwenemo_gpu_memory_utilization=0.05
+        qwenemo_gpu_memory_utilization=0.05,
+        tts_backend=TTS_BACKEND_INDEX,
+        confucius_repo_dir="../Confucius4-TTS",
+        confucius_host="127.0.0.1",
+        confucius_port=8001,
+        confucius_start_command="",
+        confucius_start_timeout=900.0,
+        confucius_request_timeout=600.0,
     )
 
 SETTINGS = AppSettings.from_namespace(cmd_args)
@@ -3518,6 +3568,7 @@ ROOT_OUTPUT_DIR = _resolve_outputs_root(APP_DIR)
 os.makedirs(ROOT_OUTPUT_DIR / "tasks", exist_ok=True)
 os.makedirs((APP_DIR / "prompts").resolve(), exist_ok=True)
 os.makedirs((APP_DIR / "speaker_presets").resolve(), exist_ok=True)
+os.makedirs((APP_DIR / SPEAKER_REFERENCE_DIR).resolve(), exist_ok=True)
 TRANSLATE_OUTPUT_DIR = str((ROOT_OUTPUT_DIR / "translate_results").resolve())
 os.makedirs(TRANSLATE_OUTPUT_DIR, exist_ok=True)
 TRANSLATE_SESSION_MEDIA_DIR = str((ROOT_OUTPUT_DIR / "translate_session_media").resolve())
@@ -3559,6 +3610,292 @@ def _guess_media_type_from_extension(filename: str) -> str:
         "mkv": "video/x-matroska",
     }
     return mapping.get(ext, "application/octet-stream")
+
+
+CONFUCIUS_LANGUAGE_CODES = {
+    "en", "zh", "ja", "ko", "de", "fr", "es", "id", "it", "th", "pt", "ru", "ms", "vi"
+}
+CONFUCIUS_LANGUAGE_CODE_OVERRIDES = {
+    "auto": "",
+    "english": "en",
+    "en": "en",
+    "chinese": "zh",
+    "mandarin": "zh",
+    "zh": "zh",
+    "zh-cn": "zh",
+    "zh_cn": "zh",
+    "zh-tw": "zh",
+    "zh_tw": "zh",
+    "japanese": "ja",
+    "jp": "ja",
+    "ja": "ja",
+    "korean": "ko",
+    "kr": "ko",
+    "ko": "ko",
+    "german": "de",
+    "de": "de",
+    "french": "fr",
+    "fr": "fr",
+    "spanish": "es",
+    "es": "es",
+    "indonesian": "id",
+    "id": "id",
+    "italian": "it",
+    "it": "it",
+    "thai": "th",
+    "th": "th",
+    "portuguese": "pt",
+    "pt": "pt",
+    "russian": "ru",
+    "ru": "ru",
+    "malay": "ms",
+    "ms": "ms",
+    "vietnamese": "vi",
+    "viet": "vi",
+    "vi": "vi",
+}
+
+
+def _detect_confucius_language_from_text(text: str) -> str:
+    if any("\u3040" <= char <= "\u30ff" for char in text):
+        return "ja"
+    if any("\uac00" <= char <= "\ud7af" for char in text):
+        return "ko"
+    if any("\u0e00" <= char <= "\u0e7f" for char in text):
+        return "th"
+    if any("\u0400" <= char <= "\u04ff" for char in text):
+        return "ru"
+    if any("\u4e00" <= char <= "\u9fff" for char in text):
+        return "zh"
+    return "en"
+
+
+def _resolve_confucius_language(language_hint: Optional[str], text: str = "") -> str:
+    normalized = (language_hint or "").strip().lower()
+    if " - " in normalized:
+        normalized = normalized.split(" - ", 1)[0].strip()
+    resolved = CONFUCIUS_LANGUAGE_CODE_OVERRIDES.get(normalized)
+    if resolved:
+        return resolved
+    if normalized in CONFUCIUS_LANGUAGE_CODES:
+        return normalized
+    compact = re.sub(r"[^a-z0-9_-]+", "", normalized)
+    resolved = CONFUCIUS_LANGUAGE_CODE_OVERRIDES.get(compact)
+    if resolved:
+        return resolved
+    if compact in CONFUCIUS_LANGUAGE_CODES:
+        return compact
+    return _detect_confucius_language_from_text(text or "")
+
+
+def _confucius_base_url() -> str:
+    host = (SETTINGS.confucius_host or "127.0.0.1").strip()
+    return f"http://{host}:{int(SETTINGS.confucius_port)}"
+
+
+def _resolve_confucius_repo_dir() -> Path:
+    repo_dir = Path(SETTINGS.confucius_repo_dir or "../Confucius4-TTS").expanduser()
+    if not repo_dir.is_absolute():
+        repo_dir = APP_DIR / repo_dir
+    return repo_dir.resolve()
+
+
+def _http_json_get_sync(url: str, timeout: float) -> Dict[str, Any]:
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = response.read()
+    if not data:
+        return {}
+    return json.loads(data.decode("utf-8"))
+
+
+def _http_json_audio_post_sync(url: str, payload: Dict[str, Any], timeout: float) -> bytes:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "audio/wav, audio/mpeg, application/octet-stream",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Confucius4-TTS HTTP {exc.code}: {detail}") from exc
+
+
+class ManagedConfuciusBackend:
+    """Lazy process manager and HTTP client for Confucius4-TTS."""
+
+    def __init__(self) -> None:
+        self._process: Optional[subprocess.Popen] = None
+        self._started_process = False
+        self._lock = asyncio.Lock()
+
+    @property
+    def base_url(self) -> str:
+        return _confucius_base_url()
+
+    def _process_running(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+    def _health_sync(self, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
+        try:
+            return _http_json_get_sync(f"{self.base_url}/health", timeout=timeout)
+        except Exception:
+            return None
+
+    async def health(self, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
+        return await _run_blocking(self._health_sync, timeout)
+
+    def _build_start_command(self, repo_dir: Path) -> Tuple[List[str], Dict[str, str]]:
+        env = os.environ.copy()
+        env["HOST"] = SETTINGS.confucius_host
+        env["PORT"] = str(SETTINGS.confucius_port)
+        env["CONFUCIUS_API_HOST"] = SETTINGS.confucius_host
+        env["CONFUCIUS_API_PORT"] = str(SETTINGS.confucius_port)
+
+        custom_command = (SETTINGS.confucius_start_command or "").strip()
+        if custom_command:
+            return shlex.split(custom_command, posix=os.name != "nt"), env
+
+        launcher = repo_dir / "scripts" / "run_fastapi_uv.sh"
+        if os.name != "nt" and launcher.exists():
+            return ["bash", str(launcher)], env
+
+        return [
+            sys.executable,
+            "fastapi_app.py",
+            "--host",
+            SETTINGS.confucius_host,
+            "--port",
+            str(SETTINGS.confucius_port),
+        ], env
+
+    def _start_sync(self) -> None:
+        if self._process_running():
+            return
+        repo_dir = _resolve_confucius_repo_dir()
+        app_path = repo_dir / "fastapi_app.py"
+        if not app_path.exists():
+            raise RuntimeError(
+                f"Confucius4-TTS repository not found at {repo_dir}. "
+                "Set --confucius_repo_dir to the cloned Confucius4-TTS path."
+            )
+        command, env = self._build_start_command(repo_dir)
+        print(
+            f"[Confucius4-TTS] Lazy starting managed backend on {self.base_url} "
+            f"from {repo_dir}..."
+        )
+        self._process = subprocess.Popen(command, cwd=str(repo_dir), env=env)
+        self._started_process = True
+
+    async def ensure_ready(self) -> Dict[str, Any]:
+        async with self._lock:
+            health = await self.health(timeout=1.0)
+            if health and health.get("model_loaded"):
+                return health
+
+            if not self._process_running():
+                await _run_blocking(self._start_sync)
+
+            timeout = max(1.0, float(SETTINGS.confucius_start_timeout))
+            started = time.perf_counter()
+            last_health: Optional[Dict[str, Any]] = None
+            while time.perf_counter() - started < timeout:
+                last_health = await self.health(timeout=2.0)
+                if last_health and last_health.get("model_loaded"):
+                    print("[Confucius4-TTS] Managed backend is ready.")
+                    return last_health
+                if self._process is not None and self._process.poll() is not None:
+                    raise RuntimeError(
+                        f"Confucius4-TTS backend exited during startup "
+                        f"(exit code {self._process.returncode})."
+                    )
+                await asyncio.sleep(2.0)
+
+            raise RuntimeError(
+                f"Timed out waiting {timeout:.0f}s for Confucius4-TTS to become ready. "
+                f"Last health: {last_health}"
+            )
+
+    def _resolve_prompt_path(self, prompt_wav: Optional[str]) -> Optional[str]:
+        if not prompt_wav:
+            return None
+        path = Path(prompt_wav).expanduser()
+        if not path.is_absolute():
+            path = APP_DIR / path
+        return str(path.resolve())
+
+    async def synthesize_to_file(
+        self,
+        *,
+        text: str,
+        output_path: str,
+        language: Optional[str],
+        prompt_wav: Optional[str],
+        speech_length: int = 0,
+        diffusion_steps: int = 10,
+        max_text_tokens_per_sentence: int = 80,
+        verbose: bool = False,
+    ) -> str:
+        await self.ensure_ready()
+        lang = _resolve_confucius_language(language, text)
+        payload: Dict[str, Any] = {
+            "text": text,
+            "lang": lang,
+            "output_format": "wav",
+            "diffusion_steps": max(1, int(diffusion_steps or 10)),
+            "max_text_tokens": max(1, int(max_text_tokens_per_sentence or 80)),
+            "verbose": bool(verbose),
+        }
+        resolved_prompt = self._resolve_prompt_path(prompt_wav)
+        if resolved_prompt:
+            payload["prompt_wav"] = resolved_prompt
+        if speech_length and int(speech_length) > 0:
+            payload["target_duration_seconds"] = max(0.0, int(speech_length) / 1000.0)
+
+        audio_bytes = await _run_blocking(
+            _http_json_audio_post_sync,
+            f"{self.base_url}/v1/tts/audio",
+            payload,
+            max(1.0, float(SETTINGS.confucius_request_timeout)),
+        )
+        await async_write_file(output_path, audio_bytes)
+        return output_path
+
+    async def status(self) -> Dict[str, Any]:
+        health = await self.health(timeout=1.0)
+        return {
+            "backend": TTS_BACKEND_CONFUCIUS,
+            "lazy": True,
+            "base_url": self.base_url,
+            "repo_dir": str(_resolve_confucius_repo_dir()),
+            "managed_pid": self._process.pid if self._process_running() else None,
+            "managed_process_running": self._process_running(),
+            "healthy": bool(health and health.get("model_loaded")),
+            "health": health,
+        }
+
+    async def shutdown(self) -> None:
+        if not self._started_process or not self._process_running():
+            return
+        process = self._process
+        assert process is not None
+        print("[Confucius4-TTS] Stopping managed backend...")
+        process.terminate()
+        try:
+            await _run_blocking(process.wait, 15)
+        except Exception:
+            process.kill()
+            await _run_blocking(process.wait)
+
+
+confucius_backend_manager = ManagedConfuciusBackend()
 
 
 def _clean_ytdl_error(exc: Exception) -> str:
@@ -4865,6 +5202,7 @@ def _session_to_manifest(session: TranslateSessionData) -> Dict[str, Any]:
         "translate_enabled": session.translate_enabled,
         "response_format": session.response_format,
         "bitrate": session.bitrate,
+        "tts_backend": session.tts_backend,
         "input_mime_type": session.input_mime_type,
         "clearvoice_settings": copy.deepcopy(session.clearvoice_settings),
         "base_segments": copy.deepcopy(session.base_segments),
@@ -4969,6 +5307,7 @@ async def _rehydrate_session_from_manifest(manifest: Dict[str, Any]) -> Translat
         default_emotion_weight=manifest.get("default_emotion_weight"),
         original_audio_path=manifest.get("original_audio_path"),
         original_audio_info=audio_info,
+        tts_backend=manifest.get("tts_backend"),
         session_id=manifest.get("session_id"),
         persist_media=False,
     )
@@ -5104,6 +5443,7 @@ async def _generate_chunk_audio_from_session(
     merge_backing_track: bool,
     silence_volume_percent: float,
     force_gemini_regenerate: bool = False,
+    tts_backend: Optional[str] = None,
     transcription_pipeline: Optional[str] = None,
     whisperx_proxy_refiner: Any = None,
     default_speaker_preset: Optional[str] = None,
@@ -5115,6 +5455,10 @@ async def _generate_chunk_audio_from_session(
     qwen_omnivad_merge_gap_seconds: Any = None,
 ) -> Tuple[str, str, Dict[str, Any]]:
     response_format = _normalize_translate_output_format(response_format)
+    resolved_tts_backend = _normalize_tts_backend(
+        tts_backend or getattr(chunk_session, "tts_backend", None),
+        SETTINGS.tts_backend,
+    )
     transcription_pipeline = (
         transcription_pipeline
         or getattr(chunk_session, "transcription_pipeline", None)
@@ -5261,6 +5605,7 @@ async def _generate_chunk_audio_from_session(
         initial_speaker_overrides=chunk_session.speaker_overrides,
         default_speaker_preset=default_speaker_preset,
         default_emotion_weight=default_emotion_weight,
+        tts_backend=resolved_tts_backend,
         clearvoice_settings=clearvoice_settings,
         transcription_pipeline=transcription_pipeline,
         whisperx_proxy_refiner=whisperx_proxy_refiner,
@@ -5289,6 +5634,7 @@ async def _generate_chunk_audio_from_session(
         backing_volume_percent=backing_volume_percent,
         default_speaker_preset=default_speaker_preset,
         default_emotion_weight=default_emotion_weight,
+        tts_backend=resolved_tts_backend,
         return_unmixed_audio=merge_with_backing and backing_track_audio is not None,
     )
 
@@ -7315,6 +7661,7 @@ async def _create_translate_session(
     default_emotion_weight: Optional[float] = None,
     original_audio_path: Optional[str] = None,
     original_audio_info: Optional[AudioAssetInfo] = None,
+    tts_backend: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> TranslateSessionData:
     response_format = _normalize_translate_output_format(response_format)
@@ -7329,6 +7676,7 @@ async def _create_translate_session(
         DEFAULT_EMOTION_WEIGHT,
     )
     resolved_transcription_pipeline = _normalize_transcription_pipeline(transcription_pipeline)
+    resolved_tts_backend = _normalize_tts_backend(tts_backend, SETTINGS.tts_backend)
     resolved_whisperx_proxy_refiner = (
         _coerce_to_bool(whisperx_proxy_refiner)
         and resolved_transcription_pipeline == "whisperx"
@@ -7423,6 +7771,7 @@ async def _create_translate_session(
         translate_enabled=translate_enabled,
         response_format=response_format,
         bitrate=bitrate,
+        tts_backend=resolved_tts_backend,
         input_mime_type=input_mime_type,
         clearvoice_settings=dict(clearvoice_settings or {}),
         base_segments=copy.deepcopy(base_segments),
@@ -9377,10 +9726,11 @@ async def _synthesize_translated_audio(
     pad_to_original: bool = True,
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
+    tts_backend: Optional[str] = None,
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
     return_unmixed_audio: bool = False,
 ) -> Tuple[bytes, str, Dict[str, Any]]:
-    tts = tts_manager.get_tts()
+    resolved_tts_backend = _normalize_tts_backend(tts_backend, SETTINGS.tts_backend)
     frame_rate = int(original_audio.frame_rate or 22050)
     sample_width = int(original_audio.sample_width or 2)
     channels = int(original_audio.channels or 1)
@@ -9532,10 +9882,12 @@ async def _synthesize_translated_audio(
 
         try:
             async with semaphore:
-                inference_path = await tts.infer(
+                inference_path = await _synthesize_tts_to_file(
+                    tts_backend=resolved_tts_backend,
                     spk_audio_prompt=spk_prompt_value,
                     text=translated_text,
                     output_path=generated_path,
+                    language=dest_language,
                     interval_silence=0,
                     speech_length=generation_target_ms,
                     diffusion_steps=10,
@@ -9572,6 +9924,7 @@ async def _synthesize_translated_audio(
             "duration_ms": duration_ms,
             "source_text": source_text,
             "translated_text": translated_text,
+            "tts_backend": resolved_tts_backend,
         }
         if speaker_label:
             log_entry["speaker"] = speaker_label
@@ -10021,6 +10374,7 @@ async def _synthesize_translated_audio(
         "original_duration_ms": original_duration_ms,
         "generated_duration_ms": final_duration_ms,
         "generation_log": generation_log,
+        "tts_backend": resolved_tts_backend,
         "padded_to_original": pad_to_original,
         "backing_volume_percent": backing_volume_percent,
     }
@@ -10374,17 +10728,27 @@ class SpeakerAPIWrapper:
                         cv_features.append("MossFormer2_SR_48K super-resolution")
                     description_parts.append("ClearVoice: " + " + ".join(cv_features))
                 description = " | ".join(description_parts)
-                
+
+                reference_dir = APP_DIR / SPEAKER_REFERENCE_DIR
+                await loop.run_in_executor(executor, lambda: reference_dir.mkdir(parents=True, exist_ok=True))
+                source_suffix = Path(final_audio_path).suffix.lower() or ".wav"
+                safe_reference_name = _sanitize_preview_basename(speaker_name)
+                durable_audio_path = reference_dir / f"{safe_reference_name}_{uuid.uuid4().hex[:8]}{source_suffix}"
+                await loop.run_in_executor(
+                    executor,
+                    functools.partial(shutil.copyfile, final_audio_path, str(durable_audio_path)),
+                )
+
                 # Use SpeakerPresetManager to add the speaker - run in thread pool to avoid blocking
                 # This operation processes audio through TTS pipeline and can take several seconds
                 success = await loop.run_in_executor(
                     executor,
                     self.preset_manager.add_speaker_preset,
                     speaker_name,
-                    final_audio_path,
+                    str(durable_audio_path),
                     description
                 )
-                
+
                 if success:
                     response: Dict[str, Any] = {
                         "status": "success", 
@@ -10397,11 +10761,12 @@ class SpeakerAPIWrapper:
                             "enhancement": apply_enhancement,
                             "super_resolution": apply_super_resolution
                         }
-                    preview_result = await _create_speaker_preview_mp3(final_audio_path, speaker_name)
+                    preview_result = await _create_speaker_preview_mp3(str(durable_audio_path), speaker_name)
                     if preview_result:
                         response["preview_url"] = _speaker_preview_url(speaker_name)
                     return response
                 else:
+                    await async_remove_file(str(durable_audio_path))
                     return {"status": "error", "message": f"Failed to add speaker '{speaker_name}'"}
             
             finally:
@@ -10547,6 +10912,79 @@ class SpeakerAPIWrapper:
 # Global speaker API wrapper (will be initialized after TTS)
 speaker_api = None
 
+
+async def _resolve_confucius_prompt_audio(
+    *,
+    spk_audio_prompt: Optional[str],
+    speaker_preset: Optional[str],
+) -> Optional[str]:
+    preset_name = (speaker_preset or "").strip()
+    if preset_name:
+        if not speaker_api:
+            raise RuntimeError("Speaker manager is not initialized; cannot resolve speaker preset for Confucius4-TTS.")
+        audio_paths = await speaker_api.get_speaker_audio_paths(preset_name)
+        if not audio_paths:
+            raise RuntimeError(f"Speaker preset '{preset_name}' has no saved reference audio for Confucius4-TTS.")
+        return audio_paths[0]
+    prompt = (spk_audio_prompt or "").strip()
+    return prompt or None
+
+
+async def _synthesize_tts_to_file(
+    *,
+    tts_backend: Optional[str],
+    text: str,
+    output_path: str,
+    spk_audio_prompt: str = "",
+    speaker_preset: Optional[str] = None,
+    language: Optional[str] = None,
+    interval_silence: int = 0,
+    speech_length: int = 0,
+    diffusion_steps: int = 10,
+    max_text_tokens_per_sentence: int = 120,
+    verbose: bool = False,
+    emo_audio_prompt: Optional[str] = None,
+    emo_alpha: float = DEFAULT_EMOTION_WEIGHT,
+    use_emo_text: bool = False,
+    emo_text: Optional[str] = None,
+) -> str:
+    backend = _normalize_tts_backend(tts_backend, SETTINGS.tts_backend)
+    if backend == TTS_BACKEND_INDEX:
+        tts = tts_manager.get_tts()
+        return await tts.infer(
+            spk_audio_prompt=spk_audio_prompt,
+            text=text,
+            output_path=output_path,
+            interval_silence=interval_silence,
+            speech_length=speech_length,
+            diffusion_steps=diffusion_steps,
+            verbose=verbose,
+            speaker_preset=speaker_preset,
+            emo_audio_prompt=emo_audio_prompt,
+            emo_alpha=emo_alpha,
+            use_emo_text=use_emo_text,
+            emo_text=emo_text if use_emo_text else None,
+            max_text_tokens_per_sentence=max_text_tokens_per_sentence,
+        )
+
+    if use_emo_text or emo_text or emo_audio_prompt:
+        print("[Confucius4-TTS] Ignoring IndexTTS emotion controls for Confucius backend.")
+    prompt_wav = await _resolve_confucius_prompt_audio(
+        spk_audio_prompt=spk_audio_prompt,
+        speaker_preset=speaker_preset,
+    )
+    return await confucius_backend_manager.synthesize_to_file(
+        text=text,
+        output_path=output_path,
+        language=language,
+        prompt_wav=prompt_wav,
+        speech_length=speech_length,
+        diffusion_steps=diffusion_steps,
+        max_text_tokens_per_sentence=max_text_tokens_per_sentence,
+        verbose=verbose,
+    )
+
+
 # API Models
 class TranslateRequest(BaseModel):
     audio: Optional[str] = Field(default=None, description="Base64-encoded audio or download URL.")
@@ -10555,6 +10993,10 @@ class TranslateRequest(BaseModel):
         description="Filename/id of a video downloaded through the WebUI video downloader.",
     )
     dest_language: str = Field(..., description="Target language for translation, e.g., 'English'.")
+    tts_backend: Optional[Literal["index", "confucius"]] = Field(
+        default=None,
+        description="TTS backend for synthesis. Defaults to server --tts_backend.",
+    )
     audio_mime_type: Optional[str] = Field(default=None, description="MIME type of the audio, e.g., 'audio/wav'.")
     base_filename: Optional[str] = Field(
         default=None,
@@ -10786,6 +11228,10 @@ class TranslateSegmentInput(BaseModel):
 class SegmentPreviewRequest(BaseModel):
     session_id: str = Field(..., description="Active translate session identifier.")
     segment: TranslateSegmentInput = Field(..., description="Segment payload to preview.")
+    tts_backend: Optional[Literal["index", "confucius"]] = Field(
+        default=None,
+        description="Optional TTS backend override for this preview.",
+    )
     generated_volume_percent: Optional[float] = Field(
         default=None,
         ge=MIN_GENERATED_VOLUME_PERCENT,
@@ -10807,6 +11253,10 @@ class SegmentPreviewRequest(BaseModel):
 class TranslateGenerateRequest(BaseModel):
     session_id: str = Field(..., description="Session identifier returned from /api/translate_segments.")
     segments: List[TranslateSegmentInput] = Field(..., description="Segments to render, including edits and selection.")
+    tts_backend: Optional[Literal["index", "confucius"]] = Field(
+        default=None,
+        description="Optional TTS backend override; defaults to the stored session backend.",
+    )
     response_format: Optional[Literal["mp3", "wav", "flac", "aac", "opus", "ogg", "webm"]] = Field(
         default=None, description="Desired audio format for output. Defaults to the original request value."
     )
@@ -10867,6 +11317,10 @@ class ChunkBatchGenerateRequest(BaseModel):
     dest_language: Optional[str] = Field(
         default=None,
         description="Override destination language; defaults to the stored chunk language.",
+    )
+    tts_backend: Optional[Literal["index", "confucius"]] = Field(
+        default=None,
+        description="Optional TTS backend override for generated chunks.",
     )
     response_format: Optional[Literal["mp3", "wav", "flac", "aac", "opus", "ogg", "webm"]] = Field(
         default=None,
@@ -10962,6 +11416,8 @@ class ChunkBatchGenerateRequest(BaseModel):
 
 class CloneRequest(BaseModel):
     text: str = Field(..., description="The text to generate audio for.")
+    tts_backend: Optional[Literal["index", "confucius"]] = Field(default=None, description="TTS backend override.")
+    language: Optional[str] = Field(default=None, description="Language code/label for Confucius4-TTS.")
     reference_audio: Optional[str] = Field(default=None, description="Reference audio URL or base64")
     reference_text: Optional[str] = Field(default=None, description="Optional transcript")
     pitch: Optional[Literal["very_low", "low", "moderate", "high", "very_high"]] = Field(default=None)
@@ -10992,6 +11448,8 @@ class CloneRequest(BaseModel):
 
 class SpeakRequest(BaseModel):
     text: str = Field(..., description="The text to generate audio for.")
+    tts_backend: Optional[Literal["index", "confucius"]] = Field(default=None, description="TTS backend override.")
+    language: Optional[str] = Field(default=None, description="Language code/label for Confucius4-TTS.")
     name: Optional[str] = Field(default=None, description="The name of the voice character")
     pitch: Optional[Literal["very_low", "low", "moderate", "high", "very_high"]] = Field(default=None)
     speed: Optional[Literal["very_low", "low", "moderate", "high", "very_high"]] = Field(default=None)
@@ -11129,6 +11587,7 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown (if needed)
     print("🔄 Shutting down IndexTTS vLLM v2...")
+    await confucius_backend_manager.shutdown()
     # Shutdown the thread executor
     executor.shutdown(wait=True)
 
@@ -12260,6 +12719,7 @@ async def api_video_replace_audio(payload: VideoReplaceAudioRequest):
 async def api_translate_split_audio(
     request: Request,
     dest_language: Optional[str] = Form(None),
+    tts_backend: Optional[str] = Form(None),
     audio: Optional[str] = Form(None),
     downloaded_video_id: Optional[str] = Form(None),
     audio_mime_type: Optional[str] = Form(None),
@@ -12285,6 +12745,7 @@ async def api_translate_split_audio(
 
     try:
         payload: Optional[Dict[str, Any]] = None
+        tts_backend_value = tts_backend
         enhance_voice_value = enhance_voice
         audio_separator_enabled_value = audio_separator_enabled
         audio_separator_model_value = audio_separator_model
@@ -12304,6 +12765,7 @@ async def api_translate_split_audio(
 
         if payload is not None:
             dest_language = payload.get("dest_language", dest_language)
+            tts_backend_value = payload.get("tts_backend", tts_backend_value)
             audio = payload.get("audio", audio)
             downloaded_video_id = payload.get("downloaded_video_id", downloaded_video_id)
             audio_mime_type = payload.get("audio_mime_type", audio_mime_type)
@@ -12350,6 +12812,7 @@ async def api_translate_split_audio(
             return _status_error("Source audio is required for chunk splitting.")
 
         dest_language_value = (dest_language or "").strip() or "unspecified"
+        tts_backend_value = _normalize_tts_backend(tts_backend_value, SETTINGS.tts_backend)
         apply_super_resolution = preprocess_options.apply_super_resolution
         apply_enhancement = preprocess_options.apply_enhancement
         parallel_config = preprocess_options.parallel_config
@@ -12429,6 +12892,7 @@ async def api_translate_split_audio(
 
         split_request_summary = {
             "dest_language": dest_language_value,
+            "tts_backend": tts_backend_value,
             "chunk_min_minutes": min_minutes,
             "chunk_max_minutes": max_minutes,
             "min_silence_ms": min_silence_ms_value,
@@ -12833,6 +13297,7 @@ async def api_translate_split_audio(
                                     source_video_filename=downloaded_video_source.get("filename") if downloaded_video_source else None,
                                     original_audio_path=chunk_audio_path if path_exists else None,
                                     original_audio_info=chunk_audio_info,
+                                    tts_backend=tts_backend_value,
                                 )
 
                                 chunk_manifest = _session_to_manifest(chunk_session)
@@ -13061,6 +13526,7 @@ async def api_translate_split_audio(
                             source_base_name=resolved_base_name,
                             source_video_path=downloaded_video_source.get("path") if downloaded_video_source else None,
                             source_video_filename=downloaded_video_source.get("filename") if downloaded_video_source else None,
+                            tts_backend=tts_backend_value,
                         )
                         chunk_session_manifests.append(_session_to_manifest(fallback_session))
                         chunk_entries.append(_serialize_chunk_session(fallback_session))
@@ -13702,6 +14168,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
                             merge_backing_track=merge_backing_requested,
                             silence_volume_percent=silence_volume_percent_value,
                             force_gemini_regenerate=force_gemini_regenerate_flag,
+                            tts_backend=payload.tts_backend,
                             transcription_pipeline=transcription_pipeline_value,
                             whisperx_proxy_refiner=whisperx_proxy_refiner_flag,
                             default_speaker_preset=session.default_speaker_preset,
@@ -13794,6 +14261,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
 async def api_translate_segments(
     request: Request,
     dest_language: Optional[str] = Form(None),
+    tts_backend: Optional[str] = Form(None),
     response_format: Optional[str] = Form(None),
     bitrate: Optional[str] = Form(None),
     audio: Optional[str] = Form(None),
@@ -13846,6 +14314,7 @@ async def api_translate_segments(
     try:
         payload: Optional[Dict[str, Any]] = None
         dest_language_value = dest_language
+        tts_backend_value = tts_backend
         response_format_value = response_format
         bitrate_value = bitrate
         audio_reference = audio
@@ -13900,6 +14369,7 @@ async def api_translate_segments(
 
         if payload is not None:
             dest_language_value = payload.get("dest_language", dest_language_value)
+            tts_backend_value = payload.get("tts_backend", tts_backend_value)
             response_format_value = payload.get("response_format", response_format_value)
             bitrate_value = payload.get("bitrate", bitrate_value)
             audio_reference = payload.get("audio", audio_reference)
@@ -13987,6 +14457,8 @@ async def api_translate_segments(
             return _status_error("Destination language (dest_language) is required.")
 
         response_format_value = _normalize_translate_output_format(response_format_value)
+        raw_tts_backend_value = tts_backend_value
+        tts_backend_value = _normalize_tts_backend(tts_backend_value, SETTINGS.tts_backend)
         bitrate_value = bitrate_value or TRANSLATE_DEFAULT_BITRATE
         translate_enabled = _coerce_to_bool(translate_flag_value if translate_flag_value is not None else True)
         ignore_non_speech_flag = _coerce_to_bool(ignore_non_speech_value)
@@ -14033,6 +14505,11 @@ async def api_translate_segments(
         )
         if reuse_session_error is not None:
             return reuse_session_error
+        if not raw_tts_backend_value and reuse_source_session is not None:
+            tts_backend_value = _normalize_tts_backend(
+                getattr(reuse_source_session, "tts_backend", None),
+                SETTINGS.tts_backend,
+            )
         reuse_backing_available = bool(reuse_source_session and _session_has_backing_audio(reuse_source_session))
         audio_separator_enabled_flag = preprocess_options.audio_separator_enabled
         audio_separator_model_key = preprocess_options.audio_separator_model
@@ -14116,6 +14593,7 @@ async def api_translate_segments(
 
         request_summary = {
             "dest_language": dest_language_value,
+            "tts_backend": tts_backend_value,
             "response_format": response_format_value,
             "bitrate": bitrate_value,
             "enhancement": apply_enhancement,
@@ -14268,6 +14746,7 @@ async def api_translate_segments(
                         initial_speaker_overrides=getattr(reuse_session_for_segments, "speaker_overrides", None),
                         default_speaker_preset=default_speaker_value,
                         default_emotion_weight=default_emotion_weight_value,
+                        tts_backend=tts_backend_value,
                         clearvoice_settings=clearvoice_settings,
                         # Pass cached paths for fast session storage
                         original_audio_source_path=cached_vocals_path,
@@ -14368,6 +14847,11 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
             print("⚠️ Merge-back preference is enabled but no backing track is stored for this session.")
 
         response_format_value = _normalize_translate_output_format()
+        resolved_tts_backend = _normalize_tts_backend(
+            payload.tts_backend or session.tts_backend,
+            SETTINGS.tts_backend,
+        )
+        session.tts_backend = resolved_tts_backend
 
         bitrate_value = payload.bitrate or session.bitrate or TRANSLATE_DEFAULT_BITRATE
         max_duration = _session_audio_duration_ms(session)
@@ -14555,6 +15039,7 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         backing_volume_percent=backing_volume_percent,
                         default_speaker_preset=session.default_speaker_preset,
                         default_emotion_weight=session.default_emotion_weight,
+                        tts_backend=resolved_tts_backend,
                         emit_status=emit_status,
                         return_unmixed_audio=merge_with_backing and _session_has_backing_audio(session),
                     )
@@ -14857,6 +15342,10 @@ async def api_translate_segment_preview(payload: SegmentPreviewRequest):
         backing_volume = session.backing_volume_percent or DEFAULT_GENERATED_VOLUME_PERCENT
         if payload.backing_volume_percent is not None:
             backing_volume = _coerce_volume_percent(payload.backing_volume_percent, backing_volume)
+        resolved_tts_backend = _normalize_tts_backend(
+            payload.tts_backend or session.tts_backend,
+            SETTINGS.tts_backend,
+        )
 
         audio_bytes, media_type, metadata = await _synthesize_translated_audio(
             _get_session_original_audio(session),
@@ -14876,6 +15365,7 @@ async def api_translate_segment_preview(payload: SegmentPreviewRequest):
             pad_to_original=False,
             default_speaker_preset=session.default_speaker_preset,
             default_emotion_weight=session.default_emotion_weight,
+            tts_backend=resolved_tts_backend,
         )
 
         metadata["preview"] = True
@@ -15348,6 +15838,7 @@ async def api_translate_output_snapshot(filename: str):
 async def api_translate_audio(
     request: Request,
     dest_language: Optional[str] = Form(None),
+    tts_backend: Optional[str] = Form(None),
     response_format: Optional[str] = Form(None),
     bitrate: Optional[str] = Form(None),
     audio: Optional[str] = Form(None),
@@ -15399,6 +15890,7 @@ async def api_translate_audio(
     try:
         payload: Optional[Dict[str, Any]] = None
         dest_language_value = dest_language
+        tts_backend_value = tts_backend
         audio_reference = audio
         downloaded_video_id_value = downloaded_video_id
         audio_mime_type_value = audio_mime_type
@@ -15455,6 +15947,7 @@ async def api_translate_audio(
             except Exception as exc:
                 return _status_error(f"Invalid translate request: {str(exc)}")
             dest_language_value = translate_req.dest_language
+            tts_backend_value = translate_req.tts_backend or tts_backend_value
             audio_reference = translate_req.audio or audio_reference
             downloaded_video_id_value = translate_req.downloaded_video_id or downloaded_video_id_value
             audio_mime_type_value = translate_req.audio_mime_type or audio_mime_type_value
@@ -15603,6 +16096,9 @@ async def api_translate_audio(
             return _status_error("Destination language (dest_language) is required.")
 
         response_format_value = _normalize_translate_output_format(response_format_value)
+        if not tts_backend_value and reuse_source_session is not None:
+            tts_backend_value = getattr(reuse_source_session, "tts_backend", None)
+        tts_backend_value = _normalize_tts_backend(tts_backend_value, SETTINGS.tts_backend)
         bitrate_value = bitrate_value or TRANSLATE_DEFAULT_BITRATE
         ignore_non_speech_flag = _coerce_to_bool(ignore_non_speech_value)
         preserve_silence_audio_flag = _coerce_to_bool(preserve_silence_audio_value)
@@ -15700,6 +16196,7 @@ async def api_translate_audio(
 
         request_summary = {
             "dest_language": dest_language_value,
+            "tts_backend": tts_backend_value,
             "response_format": response_format_value,
             "bitrate": bitrate_value,
             "enhancement": apply_enhancement,
@@ -15867,6 +16364,7 @@ async def api_translate_audio(
                         initial_speaker_overrides=getattr(reuse_session_for_translate, "speaker_overrides", None),
                         default_speaker_preset=default_speaker_value,
                         default_emotion_weight=default_emotion_weight_value,
+                        tts_backend=tts_backend_value,
                         clearvoice_settings=clearvoice_settings,
                         # Pass cached paths for fast session storage
                         original_audio_source_path=cached_vocals_path,
@@ -15909,6 +16407,7 @@ async def api_translate_audio(
                         backing_volume_percent=backing_volume_percent_value,
                         default_speaker_preset=session.default_speaker_preset,
                         default_emotion_weight=session.default_emotion_weight,
+                        tts_backend=tts_backend_value,
                         emit_status=emit_status,
                         return_unmixed_audio=merge_with_backing and backing_track_audio is not None,
                     )
@@ -16673,20 +17172,20 @@ async def speak(req: SpeakRequest):
         speaker_error = await _validate_speaker_preset_request(req.name)
         if speaker_error is not None:
             return speaker_error
-        
-        tts = tts_manager.get_tts()
-        
+
         # Generate speech
         output_path = os.path.join("outputs", f"speak_{uuid.uuid4().hex}.wav")
         
         # Check if emotion text is provided and not empty
         use_emotion_text = req.emotion_text and req.emotion_text.strip() != ""
         
-        result = await tts.infer(
+        result = await _synthesize_tts_to_file(
+            tts_backend=req.tts_backend,
             spk_audio_prompt="",
             text=req.text,
             output_path=output_path,
             speaker_preset=req.name,
+            language=req.language,
             use_emo_text=use_emotion_text,
             emo_text=req.emotion_text if use_emotion_text else None,
             emo_alpha=req.emotion_weight,
@@ -16711,6 +17210,8 @@ async def speak(req: SpeakRequest):
 
 def parse_clone_form(
     text: str = Form(...),
+    tts_backend: Optional[Literal["index", "confucius"]] = Form(None),
+    language: Optional[str] = Form(None),
     reference_audio: Optional[str] = Form(None),
     reference_text: Optional[str] = Form(None),
     pitch: Optional[Literal["very_low", "low", "moderate", "high", "very_high"]] = Form(None),
@@ -16731,7 +17232,8 @@ def parse_clone_form(
     speaker_effects: Optional[str] = Form(None),
 ):
     return CloneRequest(
-        text=text, reference_audio=reference_audio, reference_text=reference_text,
+        text=text, tts_backend=tts_backend, language=language,
+        reference_audio=reference_audio, reference_text=reference_text,
         pitch=pitch, speed=speed, temperature=temperature, top_k=top_k, top_p=top_p,
         repetition_penalty=repetition_penalty, max_tokens=max_tokens,
         length_threshold=length_threshold, window_size=window_size,
@@ -16759,18 +17261,18 @@ async def clone_voice(
         assert tmp_path is not None
         
         try:
-            tts = tts_manager.get_tts()
-            
             # Generate speech using reference audio
             output_path = os.path.join("outputs", f"clone_{uuid.uuid4().hex}.wav")
             
             # Check if emotion text is provided and not empty
             use_emotion_text = req.emotion_text and req.emotion_text.strip() != ""
             
-            result = await tts.infer(
+            result = await _synthesize_tts_to_file(
+                tts_backend=req.tts_backend,
                 spk_audio_prompt=tmp_path,
                 text=req.text,
                 output_path=output_path,
+                language=req.language,
                 use_emo_text=use_emotion_text,
                 emo_text=req.emotion_text if use_emotion_text else None,
                 emo_alpha=req.emotion_weight,
@@ -16803,11 +17305,15 @@ async def server_info():
         else:
             speakers_data = await speaker_api.list_speakers()
             roles = list(speakers_data["speakers"].keys()) if speakers_data["status"] == "success" else []
-        
+        confucius_status = await confucius_backend_manager.status()
+
         return JSONResponse(content={
             "success": True,
             "info": {
                 "model": "IndexTTS-vLLM-v2",
+                "tts_backend": SETTINGS.tts_backend,
+                "tts_backends": sorted(ALLOWED_TTS_BACKENDS),
+                "confucius": confucius_status,
                 "roles": roles,
                 "sample_rate": 22050,
                 "engine": "vLLM v2",
@@ -16838,12 +17344,49 @@ async def speak_stream(req: SpeakRequest):
         speaker_error = await _validate_speaker_preset_request(req.name)
         if speaker_error is not None:
             return speaker_error
-        
-        tts = tts_manager.get_tts()
-        
+
         # Check if emotion text is provided and not empty
         use_emotion_text = req.emotion_text and req.emotion_text.strip() != ""
-        
+        backend = _normalize_tts_backend(req.tts_backend, SETTINGS.tts_backend)
+
+        if backend == TTS_BACKEND_CONFUCIUS:
+            async def confucius_audio_stream_generator():
+                result_path = os.path.join("outputs", f"speak_stream_{uuid.uuid4().hex}.wav")
+                try:
+                    result = await _synthesize_tts_to_file(
+                        tts_backend=backend,
+                        spk_audio_prompt="",
+                        text=req.text,
+                        output_path=result_path,
+                        speaker_preset=req.name,
+                        language=req.language,
+                        use_emo_text=use_emotion_text,
+                        emo_text=req.emotion_text if use_emotion_text else None,
+                        emo_alpha=req.emotion_weight,
+                        speech_length=req.speech_length,
+                        diffusion_steps=req.diffusion_steps,
+                        max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
+                        verbose=SETTINGS.verbose,
+                    )
+                    await _apply_speaker_effects_to_file(result, req.speaker_effects)
+                    audio_bytes = await _read_generated_audio_bytes(result, req.response_format)
+                    yield _streaming_audio_frame(0, audio_bytes, True)
+                except Exception as e:
+                    error_msg = f"ERROR:{str(e)}\n".encode("utf-8")
+                    print(f"鉂?Confucius streaming fallback error: {e}")
+                    traceback.print_exc()
+                    yield error_msg
+                finally:
+                    await async_remove_file(result_path)
+
+            return StreamingResponse(
+                confucius_audio_stream_generator(),
+                media_type="application/octet-stream",
+                headers=STREAMING_RESPONSE_HEADERS,
+            )
+
+        tts = tts_manager.get_tts()
+
         async def audio_stream_generator():
             """Generator that yields audio chunks as they are produced"""
             try:
@@ -16905,12 +17448,50 @@ async def clone_voice_stream(
         if reference_error is not None:
             return reference_error
         assert tmp_path is not None
-        
-        tts = tts_manager.get_tts()
-        
+
         # Check if emotion text is provided and not empty
         use_emotion_text = req.emotion_text and req.emotion_text.strip() != ""
-        
+        backend = _normalize_tts_backend(req.tts_backend, SETTINGS.tts_backend)
+
+        if backend == TTS_BACKEND_CONFUCIUS:
+            async def confucius_audio_stream_generator():
+                result_path = os.path.join("outputs", f"clone_stream_{uuid.uuid4().hex}.wav")
+                try:
+                    result = await _synthesize_tts_to_file(
+                        tts_backend=backend,
+                        spk_audio_prompt=tmp_path or "",
+                        text=req.text,
+                        output_path=result_path,
+                        language=req.language,
+                        use_emo_text=use_emotion_text,
+                        emo_text=req.emotion_text if use_emotion_text else None,
+                        emo_alpha=req.emotion_weight,
+                        speech_length=req.speech_length,
+                        diffusion_steps=req.diffusion_steps,
+                        max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
+                        verbose=SETTINGS.verbose,
+                    )
+                    await _apply_speaker_effects_to_file(result, req.speaker_effects)
+                    audio_bytes = await _read_generated_audio_bytes(result, req.response_format)
+                    yield _streaming_audio_frame(0, audio_bytes, True)
+                except Exception as e:
+                    error_msg = f"ERROR:{str(e)}\n".encode("utf-8")
+                    print(f"鉂?Confucius clone streaming fallback error: {e}")
+                    traceback.print_exc()
+                    yield error_msg
+                finally:
+                    await async_remove_file(result_path)
+                    if tmp_path:
+                        await async_remove_file(tmp_path)
+
+            return StreamingResponse(
+                confucius_audio_stream_generator(),
+                media_type="application/octet-stream",
+                headers=STREAMING_RESPONSE_HEADERS,
+            )
+
+        tts = tts_manager.get_tts()
+
         async def audio_stream_generator():
             """Generator that yields audio chunks as they are produced"""
             try:

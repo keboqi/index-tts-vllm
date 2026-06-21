@@ -1844,6 +1844,35 @@
                                     </select>
                                 </div>
                             </div>
+                            <div class="form-row-2">
+                                <div class="form-group">
+                                    <label for="ttsBackend">TTS Backend:</label>
+                                    <select id="ttsBackend" name="tts_backend">
+                                        <option value="index" selected>IndexTTS</option>
+                                        <option value="confucius">Confucius4-TTS</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="ttsLanguage">Confucius Language:</label>
+                                    <select id="ttsLanguage" name="language">
+                                        <option value="auto" selected>Auto</option>
+                                        <option value="en">English</option>
+                                        <option value="zh">Chinese</option>
+                                        <option value="ja">Japanese</option>
+                                        <option value="ko">Korean</option>
+                                        <option value="de">German</option>
+                                        <option value="fr">French</option>
+                                        <option value="es">Spanish</option>
+                                        <option value="id">Indonesian</option>
+                                        <option value="it">Italian</option>
+                                        <option value="th">Thai</option>
+                                        <option value="pt">Portuguese</option>
+                                        <option value="ru">Russian</option>
+                                        <option value="ms">Malay</option>
+                                        <option value="vi">Vietnamese</option>
+                                    </select>
+                                </div>
+                            </div>
 
                             <div class="form-group">
                                 <label>Speaker Effects (optional):</label>
@@ -2467,6 +2496,15 @@
                                         <button type="button" class="step-toggle" aria-expanded="false">Expand</button>
                                     </div>
                                     <div class="step-body">
+                                        <div class="form-row-2" style="margin-bottom: 12px;">
+                                            <div class="form-group">
+                                                <label for="translateTtsBackend">TTS Backend:</label>
+                                                <select id="translateTtsBackend" name="tts_backend">
+                                                    <option value="index" selected>IndexTTS</option>
+                                                    <option value="confucius">Confucius4-TTS</option>
+                                                </select>
+                                            </div>
+                                        </div>
                                         <div class="form-row-4">
                                             <div class="form-group">
                                                 <label for="translateOutputFormat">Output Format:</label>
@@ -5055,6 +5093,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     const formData = new FormData(this);
                     const text = formData.get('text');
                     const speaker = formData.get('speaker');
+                    const ttsBackend = formData.get('tts_backend') || 'index';
+                    const ttsLanguage = formData.get('language') || 'auto';
                     const emotionText = document.getElementById('emotionText').value;
                     const emotionWeight = parseFloat(document.getElementById('emotionWeight').value);
                     const diffusionSteps = parseInt(document.getElementById('diffusionSteps').value);
@@ -5077,10 +5117,10 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         
                         if (streamingMode) {
                             // Streaming mode
-                            await handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime);
+                            await handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime, ttsBackend, ttsLanguage);
                         } else {
                             // Regular mode
-                            await handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime);
+                            await handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime, ttsBackend, ttsLanguage);
                         }
                     } catch (error) {
                         showStatus(`Network error: ${error.message}`, 'error');
@@ -5115,6 +5155,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             const translateAudioSeparatorEl = document.getElementById('translateAudioSeparator');
             const translateAudioSeparatorModelEl = document.getElementById('translateAudioSeparatorModel');
             const translateAudioSeparatorUseSoundfileEl = document.getElementById('translateAudioSeparatorUseSoundfile');
+            const translateTtsBackendEl = document.getElementById('translateTtsBackend');
             const translateMergeBackEl = document.getElementById('translateMergeBack');
             const translateMergeBackLabelEl = document.getElementById('translateMergeBackLabel');
             const translateCustomBackingInput = document.getElementById('translateCustomBackingFile');
@@ -5210,6 +5251,13 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     translateDestLanguageSelect.value = settings.dest_language;
                 }
                 if (
+                    translateTtsBackendEl &&
+                    typeof settings.tts_backend === 'string' &&
+                    selectHasOption(translateTtsBackendEl, settings.tts_backend)
+                ) {
+                    translateTtsBackendEl.value = settings.tts_backend;
+                }
+                if (
                     translateGeminiModel &&
                     typeof settings.gemini_model === 'string' &&
                     selectHasOption(translateGeminiModel, settings.gemini_model)
@@ -5296,6 +5344,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         : '',
                     gemini_api_key: translateGeminiApiKey ? translateGeminiApiKey.value : '',
                     dest_language: translateDestLanguageSelect ? translateDestLanguageSelect.value : '',
+                    tts_backend: translateTtsBackendEl ? translateTtsBackendEl.value : 'index',
                     ignore_non_speech: translateIgnoreNonSpeechEl
                         ? translateIgnoreNonSpeechEl.checked
                         : false,
@@ -5517,6 +5566,20 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 translateDefaultEmotionWeightInput.addEventListener('change', syncDefaultEmotionWeightDisplay);
                 syncDefaultEmotionWeightDisplay();
             }
+            function syncTranslateTtsBackendControls() {
+                const isConfucius = translateTtsBackendEl && translateTtsBackendEl.value === 'confucius';
+                if (translateDefaultEmotionWeightInput) {
+                    translateDefaultEmotionWeightInput.disabled = Boolean(isConfucius);
+                }
+                updateAdditionalSettingsSummary();
+            }
+            if (translateTtsBackendEl) {
+                translateTtsBackendEl.addEventListener('change', () => {
+                    saveTranslatePersistentSettings();
+                    syncTranslateTtsBackendControls();
+                });
+                syncTranslateTtsBackendControls();
+            }
             const NON_SPEECH_PLACEHOLDER = '{non_speech_instruction}';
             let autoManualSegmentsApplied = false;
             let translateChunkSessions = [];
@@ -5733,6 +5796,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     translatePreserveSilenceEl && translatePreserveSilenceEl.checked;
                 const outputFormatSelect = document.getElementById('translateOutputFormat');
                 renderStepSummary(translateAdditionalSettingsSummary, [
+                    { label: 'Backend', value: selectedOptionLabel(translateTtsBackendEl, 'IndexTTS') },
                     { label: 'Format', value: selectedOptionLabel(outputFormatSelect, 'MP3') },
                     {
                         label: 'Merge',
@@ -6345,6 +6409,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 const payload = {
                     chunk_session_ids: Array.from(translateChunkSelections),
                     dest_language: destLanguage,
+                    tts_backend: translateTtsBackendEl && translateTtsBackendEl.value ? translateTtsBackendEl.value : 'index',
                     response_format: selectedFormat,
                 };
                 if (translateGeminiModel && translateGeminiModel.value) {
@@ -6810,6 +6875,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 }
                 if (translateDestLanguageSelect && translateDestLanguageSelect.value.trim()) {
                     formData.append('dest_language', translateDestLanguageSelect.value.trim());
+                }
+                if (translateTtsBackendEl && translateTtsBackendEl.value) {
+                    formData.append('tts_backend', translateTtsBackendEl.value);
                 }
                 if (translateChunkMinInput && translateChunkMinInput.value) {
                     formData.append('chunk_min_minutes', translateChunkMinInput.value);
@@ -8599,6 +8667,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 if (!formData) {
                     return;
                 }
+                if (translateTtsBackendEl && translateTtsBackendEl.value) {
+                    formData.append('tts_backend', translateTtsBackendEl.value);
+                }
                 if (translateMinSpeechInput) {
                     const minValue = (translateMinSpeechInput.value || '').trim();
                     if (minValue) {
@@ -9839,6 +9910,13 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         translateDefaultSpeakerSelect.value = '';
                     }
                 }
+                if (translateTtsBackendEl && typeof metadata.tts_backend === 'string') {
+                    const metadataBackend = metadata.tts_backend.trim();
+                    if (metadataBackend && Array.from(translateTtsBackendEl.options || []).some(option => option.value === metadataBackend)) {
+                        translateTtsBackendEl.value = metadataBackend;
+                        syncTranslateTtsBackendControls();
+                    }
+                }
                 if (
                     translateDefaultEmotionWeightInput &&
                     typeof metadata.default_emotion_weight === 'number' &&
@@ -10223,6 +10301,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         session_id: currentTranslateSessionId,
                         segments: segmentsPayload,
                         response_format: selectedFormat,
+                        tts_backend: translateTtsBackendEl && translateTtsBackendEl.value ? translateTtsBackendEl.value : 'index',
                         merge_backing_track: translateMergeBackEl && translateMergeBackEl.checked ? true : false,
                     };
                     if (translateVolumeInput && translateVolumeInput.value) {
@@ -10769,15 +10848,17 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 }
             }
 
-            async function handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime) {
+            async function handleRegularRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime, ttsBackend, ttsLanguage) {
                     let response;
                     const voiceFiles = document.getElementById('voice_files').files;
                     
                     if (speaker) {
                         // Use /speak endpoint with speaker preset
                         const requestData = {
-                            text: text, 
+                            text: text,
                             name: speaker,  // API uses 'name' not 'speaker'
+                            tts_backend: ttsBackend,
+                            language: ttsLanguage,
                             emotion_text: emotionText || "",
                             emotion_weight: emotionWeight,
                             speech_length: parseInt(document.getElementById('speechLength').value) || 0,
@@ -10796,6 +10877,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         // Use /clone_voice endpoint with uploaded voice file
                         const cloneFormData = new FormData();
                         cloneFormData.append('text', text);
+                        cloneFormData.append('tts_backend', ttsBackend);
+                        cloneFormData.append('language', ttsLanguage);
                         cloneFormData.append('reference_audio_file', voiceFiles[0]);
                         cloneFormData.append('emotion_text', emotionText || "");
                         cloneFormData.append('emotion_weight', emotionWeight.toString());
@@ -10831,7 +10914,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         `;
                         // Show enhanced status message with emotion info
                         let statusMessage = `Speech generated in ${duration}s! 🚀`;
-                        if (emotionText && emotionText.trim()) {
+                        if (ttsBackend !== 'confucius' && emotionText && emotionText.trim()) {
                             statusMessage += ` 😊 Emotion: "${emotionText}" (${emotionWeight})`;
                         }
                         statusMessage += formatSpeakerEffectsStatus(speakerEffects);
@@ -10842,7 +10925,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     }
             }
 
-            async function handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime) {
+            async function handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime, ttsBackend, ttsLanguage) {
                 showStatus('⚡ Streaming: Waiting for first chunk...', 'success');
                 
                 // Get first chunk size setting
@@ -10861,6 +10944,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         body: JSON.stringify({
                             text: text,
                             name: speaker,  // API uses 'name' not 'speaker'
+                            tts_backend: ttsBackend,
+                            language: ttsLanguage,
                             emotion_text: emotionText || "",
                             emotion_weight: emotionWeight,
                             speech_length: parseInt(document.getElementById('speechLength').value) || 0,
@@ -10875,6 +10960,8 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     endpoint = '/clone_voice_stream';
                     const cloneFormData = new FormData();
                     cloneFormData.append('text', text);
+                    cloneFormData.append('tts_backend', ttsBackend);
+                    cloneFormData.append('language', ttsLanguage);
                     cloneFormData.append('reference_audio_file', voiceFiles[0]);
                     cloneFormData.append('emotion_text', emotionText || "");
                     cloneFormData.append('emotion_weight', emotionWeight.toString());
@@ -11091,7 +11178,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                             `;
                             
                             let statusMessage = `✅ Streaming complete! First chunk: ${firstChunkDuration}s, Total: ${totalGenTime}s (${chunkCount} chunks)`;
-                            if (emotionText && emotionText.trim()) {
+                            if (ttsBackend !== 'confucius' && emotionText && emotionText.trim()) {
                                 statusMessage += ` 😊 Emotion: "${emotionText}" (${emotionWeight})`;
                             }
                             statusMessage += formatSpeakerEffectsStatus(speakerEffects);
@@ -11122,6 +11209,22 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         }
                         streamingSettings.style.display = this.checked ? 'block' : 'none';
                     });
+                }
+                const ttsBackendEl = document.getElementById('ttsBackend');
+                const emotionTextEl = document.getElementById('emotionText');
+                const emotionWeightEl = document.getElementById('emotionWeight');
+                function updateTtsBackendControls() {
+                    const isConfucius = ttsBackendEl && ttsBackendEl.value === 'confucius';
+                    if (emotionTextEl) {
+                        emotionTextEl.disabled = Boolean(isConfucius);
+                    }
+                    if (emotionWeightEl) {
+                        emotionWeightEl.disabled = Boolean(isConfucius);
+                    }
+                }
+                if (ttsBackendEl) {
+                    ttsBackendEl.addEventListener('change', updateTtsBackendControls);
+                    updateTtsBackendControls();
                 }
                 const stableAudioForm = document.getElementById('stableAudioForm');
                 if (stableAudioForm) {

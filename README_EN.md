@@ -14,7 +14,8 @@ conda install -c conda-forge sox
 pip install whisperx
 pip install "nemo_toolkit[asr]"
 pip install json-repair
-git clone https://github.com/garyswansrs/index-tts-vllm
+git clone https://github.com/keboqi/index-tts-vllm
+git clone https://github.com/keboqi/Confucius4-TTS
 cd index-tts-vllm
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
@@ -36,8 +37,10 @@ pip install "numpy<2"
 sudo apt install ffmpeg
 hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
 export YTDLP_NODE_PATH="$(node -p 'process.execPath')"
-python fastapi_webui_v2.py --use_torch_compile
+python fastapi_webui_v2.py --use_torch_compile --confucius_repo_dir ../Confucius4-TTS
 ```
+
+`Confucius4-TTS` is optional and lazy-loaded. The default TTS backend remains IndexTTS; when the UI or API selects `tts_backend=confucius`, `fastapi_webui_v2.py` starts and manages the Confucius FastAPI service on demand.
 
 ```bash
 npx localtunnel --port 8000
@@ -183,7 +186,32 @@ python fastapi_webui_v2.py [OPTIONS]
 - `--is_fp16` (flag): Enable FP16 inference precision.
 - `--use_torch_compile` (flag): Enable `torch.compile` for faster model execution.
 - `--gpu_memory_utilization` (float): vLLM GPU memory utilization limit (default: `0.25`).
+- `--tts_backend` (`index` or `confucius`): Default synthesis backend. The server default is `index`.
+- `--confucius_repo_dir` (string): Path to a sibling `Confucius4-TTS` checkout used for lazy startup (default: `../Confucius4-TTS`).
+- `--confucius_host` / `--confucius_port`: Host and port for the managed Confucius FastAPI backend (default: `127.0.0.1:8001`).
+- `--confucius_start_command` (string): Optional custom command for starting Confucius instead of the built-in launcher.
+- `--confucius_start_timeout` / `--confucius_request_timeout`: Startup and synthesis request timeouts in seconds.
 - `--verbose` (flag): Enable verbose logging output in the console.
+
+### Confucius4-TTS Backend
+
+Clone `Confucius4-TTS` next to this repository:
+```bash
+cd ..
+git clone https://github.com/keboqi/Confucius4-TTS
+cd index-tts-vllm
+python fastapi_webui_v2.py --use_torch_compile --confucius_repo_dir ../Confucius4-TTS
+```
+
+No separate Confucius server command is required for the normal workflow. On the first Confucius request, `fastapi_webui_v2.py` starts the backend lazily and calls `Confucius4-TTS/fastapi_app.py` through `scripts/run_fastapi_uv.sh` on Linux. Use `--confucius_start_command` if your deployment needs a custom environment, for example:
+```bash
+python fastapi_webui_v2.py \
+  --tts_backend index \
+  --confucius_repo_dir ../Confucius4-TTS \
+  --confucius_start_command "bash scripts/run_fastapi_uv.sh"
+```
+
+The Confucius backend supports more target languages for speech generation and translate/edit workflows (`en`, `zh`, `ja`, `ko`, `de`, `fr`, `es`, `id`, `it`, `th`, `pt`, `ru`, `ms`, `vi`). When `tts_backend=confucius`, IndexTTS text-based emotion controls are ignored. Speaker presets are saved after enhancement/trimming so the processed reference audio can be reused as Confucius `prompt_wav`.
 
 ---
 
@@ -202,6 +230,8 @@ Synthesize speech from text using an existing speaker preset.
   - `emotion_weight` (float, optional): Intensity 0.0-1.0 (default: `0.6`).
   - `diffusion_steps` (int, optional): Quality steps (default: `10`).
   - `max_text_tokens_per_sentence` (int, optional): Text split threshold (default: `120`).
+  - `tts_backend` (`index` or `confucius`, optional): Override the server default backend.
+  - `language` (string, optional): Confucius language code/label; auto-detected when omitted.
 - **Response**: `audio/mpeg` binary audio data (MP3).
 
 #### 2. POST `/clone_voice`
@@ -210,6 +240,8 @@ Clone a voice using an uploaded reference audio file (zero-shot synthesis).
   - `text` (string, required): Text to synthesize.
   - `reference_audio_file` (file, required): Audio file containing the target voice.
   - `emotion_text`, `emotion_weight`, `diffusion_steps`, `max_text_tokens_per_sentence`: Optional settings.
+  - `tts_backend` (`index` or `confucius`, optional): Override the server default backend.
+  - `language` (string, optional): Confucius language code/label; auto-detected when omitted.
 - **Response**: `audio/mpeg` binary audio data (MP3).
 
 #### 3. POST `/speak_stream`
@@ -299,6 +331,7 @@ Translate a full speech audio file into another language.
   - `enhancement_model` (string, optional): MossFormer/FRCRN model choice.
   - `super_resolution_voice` (bool, optional): Enable 48kHz upsampling.
   - `merge_backing_track` (bool, optional): Merge backend instrumental track (default: `true`).
+  - `tts_backend` (`index` or `confucius`, optional): Use IndexTTS or Confucius4-TTS for generated speech.
   - `transcription_pipeline` (string, optional): 'gemini', 'whisperx', 'qwen_omnivad', or 'parakeet'.
   - `translation_llm_model` (string, optional): Translation LLM.
 - **Response**: `audio/mpeg` binary translated audio with `X-Translation-Segments` headers containing detailed segment metadata.
@@ -314,6 +347,7 @@ Synthesize final translated audio using modified segment metadata and speaker as
   - `session_id` (string, required): Session ID.
   - `segments` (array of objects, required): Edited segments with translation text, timings, and speaker assignments.
   - `speaker_overrides` (object, optional): Map of speaker IDs to presets.
+  - `tts_backend` (`index` or `confucius`, optional): Override the session/server backend for this generation.
 - **Response**: `text/event-stream` SSE progress events, culminating in `complete` with audio output URLs.
 
 #### 4. POST `/api/translate_segment_preview`
@@ -321,6 +355,7 @@ Quickly test-generate a single edited segment.
 - **Request Body (JSON)**:
   - `session_id` (string, required): Session ID.
   - `segment` (object, required): A single segment definition.
+  - `tts_backend` (`index` or `confucius`, optional): Override the session/server backend for the preview.
 - **Response**: JSON containing the temporary preview URL.
 
 #### 5. GET `/api/segment_preview/{session_id}/{segment_index}`
