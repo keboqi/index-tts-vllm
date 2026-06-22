@@ -189,6 +189,15 @@ _LANGUAGE_ALIASES = {
     "russian": "Russian",
     "it": "Italian",
     "italian": "Italian",
+    "id": "Indonesian",
+    "indonesian": "Indonesian",
+    "th": "Thai",
+    "thai": "Thai",
+    "ms": "Malay",
+    "malay": "Malay",
+    "vi": "Vietnamese",
+    "viet": "Vietnamese",
+    "vietnamese": "Vietnamese",
 }
 
 

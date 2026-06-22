@@ -232,6 +232,22 @@ def _env_int(name: str, default: int, *, min_value: int = 1, max_value: Optional
     return parsed
 
 
+def _env_float(name: str, default: float, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
+    """Parse float environment values with optional bounds."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if min_value is not None and parsed < min_value:
+        return min_value
+    if max_value is not None and parsed > max_value:
+        return max_value
+    return parsed
+
+
 def _env_ffmpeg_threads(name: str = "FFMPEG_THREADS") -> int:
     """Resolve FFmpeg worker threads; 0/auto lets FFmpeg choose."""
     cpu_threads = max(1, os.cpu_count() or 1)
@@ -278,6 +294,7 @@ class AppSettings:
     confucius_start_command: str = ""
     confucius_start_timeout: float = 900.0
     confucius_request_timeout: float = 600.0
+    confucius_vllm_gpu_memory_utilization: float = 0.2
 
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "AppSettings":
@@ -297,6 +314,9 @@ class AppSettings:
             confucius_start_command=str(getattr(args, "confucius_start_command", "")),
             confucius_start_timeout=float(getattr(args, "confucius_start_timeout", 900.0)),
             confucius_request_timeout=float(getattr(args, "confucius_request_timeout", 600.0)),
+            confucius_vllm_gpu_memory_utilization=float(
+                getattr(args, "confucius_vllm_gpu_memory_utilization", 0.2)
+            ),
         )
 
 # Global thread executor for blocking operations
@@ -2859,10 +2879,11 @@ def _gemini_cache_key(
 ) -> Tuple[str, str]:
     audio_hash = _compute_bytes_md5(audio_bytes)
     normalized_prompt = (prompt_text or "").strip()
+    normalized_dest_language = _normalize_translate_dest_language(dest_language) or dest_language
     meta_blob = "|".join(
         [
             model_name.strip().lower(),
-            dest_language.strip().lower(),
+            normalized_dest_language.strip().lower(),
             normalized_prompt,
         ]
     )
@@ -3510,6 +3531,12 @@ parser.add_argument("--confucius_port", type=int, default=8001, help="Port for t
 parser.add_argument("--confucius_start_command", type=str, default="", help="Optional command used to start Confucius4-TTS instead of the default launcher")
 parser.add_argument("--confucius_start_timeout", type=float, default=900.0, help="Seconds to wait for lazy Confucius4-TTS startup")
 parser.add_argument("--confucius_request_timeout", type=float, default=600.0, help="Seconds to wait for each Confucius4-TTS synthesis request")
+parser.add_argument(
+    "--confucius_vllm_gpu_memory_utilization",
+    type=float,
+    default=_env_float("CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION", 0.2, min_value=0.0, max_value=1.0),
+    help="Confucius4-TTS vLLM GPU memory utilization for managed startup",
+)
 
 # Parse args if run as script, otherwise use defaults
 try:
@@ -3532,6 +3559,12 @@ except SystemExit:
         confucius_start_command="",
         confucius_start_timeout=900.0,
         confucius_request_timeout=600.0,
+        confucius_vllm_gpu_memory_utilization=_env_float(
+            "CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION",
+            0.2,
+            min_value=0.0,
+            max_value=1.0,
+        ),
     )
 
 SETTINGS = AppSettings.from_namespace(cmd_args)
@@ -3758,6 +3791,9 @@ class ManagedConfuciusBackend:
         env["PORT"] = str(SETTINGS.confucius_port)
         env["CONFUCIUS_API_HOST"] = SETTINGS.confucius_host
         env["CONFUCIUS_API_PORT"] = str(SETTINGS.confucius_port)
+        confucius_gpu_util = str(SETTINGS.confucius_vllm_gpu_memory_utilization)
+        env["CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION"] = confucius_gpu_util
+        env["VLLM_GPU_MEMORY_UTILIZATION"] = confucius_gpu_util
 
         custom_command = (SETTINGS.confucius_start_command or "").strip()
         if custom_command:
@@ -5020,6 +5056,52 @@ async def _normalize_uploaded_audio(source_path: str) -> str:
 
 
 MAX_SAFE_BASE_FILENAME_LENGTH = 180
+SUPPORTED_TRANSLATE_DESTINATION_LANGUAGES: Tuple[Tuple[str, str], ...] = (
+    ("zh", "Chinese"),
+    ("en", "English"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("de", "German"),
+    ("fr", "French"),
+    ("es", "Spanish"),
+    ("id", "Indonesian"),
+    ("it", "Italian"),
+    ("th", "Thai"),
+    ("pt", "Portuguese"),
+    ("ru", "Russian"),
+    ("ms", "Malay"),
+    ("vi", "Vietnamese"),
+)
+TRANSLATE_LANGUAGE_LABEL_BY_CODE = {
+    code: label for code, label in SUPPORTED_TRANSLATE_DESTINATION_LANGUAGES
+}
+TRANSLATE_LANGUAGE_CODE_BY_LABEL = {
+    label.lower(): code for code, label in SUPPORTED_TRANSLATE_DESTINATION_LANGUAGES
+}
+TRANSLATE_DEST_LANGUAGE_ALIASES = {
+    "cn": "Chinese",
+    "mandarin": "Chinese",
+    "zh-cn": "Chinese",
+    "zh_cn": "Chinese",
+    "zh-tw": "Chinese",
+    "zh_tw": "Chinese",
+    "jp": "Japanese",
+    "kr": "Korean",
+    "deutsch": "German",
+    "francais": "French",
+    "français": "French",
+    "espanol": "Spanish",
+    "español": "Spanish",
+    "bahasa indonesia": "Indonesian",
+    "indonesia": "Indonesian",
+    "thai": "Thai",
+    "russian": "Russian",
+    "viet": "Vietnamese",
+}
+for _translate_lang_code, _translate_lang_label in SUPPORTED_TRANSLATE_DESTINATION_LANGUAGES:
+    TRANSLATE_DEST_LANGUAGE_ALIASES[_translate_lang_code] = _translate_lang_label
+    TRANSLATE_DEST_LANGUAGE_ALIASES[_translate_lang_label.lower()] = _translate_lang_label
+
 LANGUAGE_CODE_OVERRIDES = {
     "chinese": "chn",
     "zh": "chn",
@@ -5038,8 +5120,68 @@ LANGUAGE_CODE_OVERRIDES = {
     "de": "de",
     "french": "fr",
     "fr": "fr",
+    "indonesian": "id",
+    "id": "id",
+    "italian": "it",
+    "it": "it",
+    "thai": "th",
+    "th": "th",
+    "portuguese": "pt",
+    "pt": "pt",
+    "russian": "ru",
+    "ru": "ru",
+    "malay": "ms",
+    "ms": "ms",
+    "vietnamese": "vi",
+    "viet": "vi",
+    "vi": "vi",
+}
+SUBTITLE_LANGUAGE_CODE_OVERRIDES = {
+    "chinese": "zho",
+    "zh": "zho",
+    "chn": "zho",
+    "cnt": "zho",
+    "english": "eng",
+    "en": "eng",
+    "spanish": "spa",
+    "es": "spa",
+    "japanese": "jpn",
+    "ja": "jpn",
+    "jp": "jpn",
+    "korean": "kor",
+    "ko": "kor",
+    "kr": "kor",
+    "german": "deu",
+    "de": "deu",
+    "french": "fra",
+    "fr": "fra",
+    "indonesian": "ind",
+    "id": "ind",
+    "italian": "ita",
+    "it": "ita",
+    "thai": "tha",
+    "th": "tha",
+    "portuguese": "por",
+    "pt": "por",
+    "russian": "rus",
+    "ru": "rus",
+    "malay": "msa",
+    "ms": "msa",
+    "vietnamese": "vie",
+    "viet": "vie",
+    "vi": "vie",
 }
 DEFAULT_BASE_FILENAME = "translated_audio"
+
+
+def _normalize_translate_dest_language(label: Optional[str]) -> str:
+    raw = (label or "").strip()
+    if not raw:
+        return ""
+    normalized = raw.lower().replace("_", "-")
+    if " - " in normalized:
+        normalized = normalized.split(" - ", 1)[0].strip()
+    return TRANSLATE_DEST_LANGUAGE_ALIASES.get(normalized, raw)
 
 
 def _sanitize_base_filename(raw_name: Optional[str]) -> Optional[str]:
@@ -5097,7 +5239,8 @@ def _normalize_base_filename(
 def _language_code_from_label(label: Optional[str]) -> str:
     if not label:
         return "translated"
-    normalized = label.strip().lower()
+    normalized_label = _normalize_translate_dest_language(label)
+    normalized = normalized_label.strip().lower()
     if not normalized:
         return "translated"
     override = LANGUAGE_CODE_OVERRIDES.get(normalized)
@@ -5109,6 +5252,40 @@ def _language_code_from_label(label: Optional[str]) -> str:
     if len(compact) <= 3:
         return compact
     return compact[:3]
+
+
+def _subtitle_language_code_from_label(label: Optional[str]) -> str:
+    if not label:
+        return "und"
+    normalized_label = _normalize_translate_dest_language(label)
+    normalized = normalized_label.strip().lower()
+    if not normalized or normalized in {"original", "source"}:
+        return "und"
+    override = SUBTITLE_LANGUAGE_CODE_OVERRIDES.get(normalized)
+    if override:
+        return override
+    parenthesized = re.search(r"\(([^)]+)\)", normalized)
+    if parenthesized:
+        nested = _subtitle_language_code_from_label(parenthesized.group(1))
+        if nested != "und":
+            return nested
+    for token in re.split(r"[^a-z0-9]+", normalized):
+        if not token or token in {"translated", "translation", "subtitle", "subtitles"}:
+            continue
+        override = SUBTITLE_LANGUAGE_CODE_OVERRIDES.get(token)
+        if override:
+            return override
+    return "und"
+
+
+def _subtitle_label_from_filename(filename: str) -> str:
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    tokens = [token for token in re.split(r"[_\-.]+", stem.lower()) if token]
+    for token in reversed(tokens):
+        label = TRANSLATE_DEST_LANGUAGE_ALIASES.get(token)
+        if label:
+            return f"Translated ({label})"
+    return "Translated"
 
 
 def _compose_output_stem(
@@ -6950,7 +7127,10 @@ def _extract_text_fields(entry: Dict[str, Any], dest_language: str) -> Tuple[Opt
         "source_language",
         "target_language",
     }
-    lower_dest = dest_language.lower() if dest_language else ""
+    normalized_dest = _normalize_translate_dest_language(dest_language)
+    lower_dest = normalized_dest.lower() if normalized_dest else ""
+    dest_code = _language_code_from_label(normalized_dest)
+    confucius_dest_code = TRANSLATE_LANGUAGE_CODE_BY_LABEL.get(lower_dest)
     translation_candidates = [
         "translated_text",
         "translation",
@@ -6969,6 +7149,9 @@ def _extract_text_fields(entry: Dict[str, Any], dest_language: str) -> Tuple[Opt
             lower_dest.replace("-", "_"),
             lower_dest.replace(" ", "_"),
         ])
+    for code_candidate in (dest_code, confucius_dest_code):
+        if code_candidate and code_candidate not in {"translated", lower_dest}:
+            translation_candidates.append(code_candidate)
     source_candidates = [
         "source_text",
         "source",
@@ -9415,7 +9598,7 @@ def _replace_video_audio_sync(
         cmd += ["-c:s", "mov_text"]
         for subtitle_index, (_embedded_path, embedded_label) in enumerate(embedded_subtitles):
             label = embedded_label or f"Subtitle {subtitle_index + 1}"
-            language = "eng" if label.lower() == "translated" else "und"
+            language = _subtitle_language_code_from_label(label)
             cmd += [
                 f"-metadata:s:s:{subtitle_index}",
                 f"title={label}",
@@ -9461,7 +9644,10 @@ def _embedded_subtitle_label(filename: str) -> str:
     if "original" in lower_name:
         return "Original"
     if "translated" in lower_name:
-        return "Translated"
+        return _subtitle_label_from_filename(filename)
+    derived_language_label = _subtitle_label_from_filename(filename)
+    if derived_language_label != "Translated":
+        return derived_language_label
     return os.path.splitext(filename)[0] or "Subtitle"
 
 
@@ -10992,7 +11178,14 @@ class TranslateRequest(BaseModel):
         default=None,
         description="Filename/id of a video downloaded through the WebUI video downloader.",
     )
-    dest_language: str = Field(..., description="Target language for translation, e.g., 'English'.")
+    dest_language: str = Field(
+        ...,
+        description=(
+            "Target language for translation, e.g., 'English', 'Japanese', "
+            "'Portuguese', 'Vietnamese'. Known language codes such as 'en', 'ja', "
+            "'pt', and 'vi' are accepted and normalized."
+        ),
+    )
     tts_backend: Optional[Literal["index", "confucius"]] = Field(
         default=None,
         description="TTS backend for synthesis. Defaults to server --tts_backend.",
@@ -12811,7 +13004,7 @@ async def api_translate_split_audio(
         if audio_file is None and not audio_reference_value and not downloaded_video_id_value:
             return _status_error("Source audio is required for chunk splitting.")
 
-        dest_language_value = (dest_language or "").strip() or "unspecified"
+        dest_language_value = _normalize_translate_dest_language(dest_language) or "unspecified"
         tts_backend_value = _normalize_tts_backend(tts_backend_value, SETTINGS.tts_backend)
         apply_super_resolution = preprocess_options.apply_super_resolution
         apply_enhancement = preprocess_options.apply_enhancement
@@ -14452,7 +14645,7 @@ async def api_translate_segments(
         if srt_segments_from_upload:
             segments_override_value = srt_segments_from_upload
 
-        dest_language_value = (dest_language_value or "").strip()
+        dest_language_value = _normalize_translate_dest_language(dest_language_value)
         if not dest_language_value:
             return _status_error("Destination language (dest_language) is required.")
 
@@ -15585,7 +15778,8 @@ async def api_translate_upload_transcriptions(
             content={"status": "error", "message": "batch_id is required."},
         )
 
-    if not dest_language or not dest_language.strip():
+    dest_language_value = _normalize_translate_dest_language(dest_language)
+    if not dest_language_value:
         return JSONResponse(
             status_code=400,
             content={"status": "error", "message": "dest_language is required."},
@@ -15623,7 +15817,7 @@ async def api_translate_upload_transcriptions(
     ignore_non_speech_flag = ignore_non_speech if ignore_non_speech is not None else False
     prompt_text = _resolve_final_prompt(
         prompt_override=(prompt or "").strip(),
-        dest_language=dest_language.strip(),
+        dest_language=dest_language_value,
         translate_enabled=translate_enabled_flag,
         ignore_non_speech_flag=ignore_non_speech_flag,
     )
@@ -15696,7 +15890,7 @@ async def api_translate_upload_transcriptions(
                 # Compute the cache key matching how Gemini cache would be created
                 audio_hash, cache_key = _gemini_cache_key(
                     audio_bytes,
-                    dest_language=dest_language.strip(),
+                    dest_language=dest_language_value,
                     prompt_text=prompt_text,
                     model_name=model_name,
                 )
@@ -15707,7 +15901,7 @@ async def api_translate_upload_transcriptions(
                     "version": GEMINI_CACHE_VERSION,
                     "created_at": time.time(),
                     "audio_md5": audio_hash,
-                    "dest_language": dest_language.strip(),
+                    "dest_language": dest_language_value,
                     "model": model_name,
                     "prompt_hash": hashlib.md5(prompt_text.encode("utf-8")).hexdigest(),
                     "segments": segments,
@@ -15765,7 +15959,7 @@ async def api_translate_upload_transcriptions(
             "updated_count": updated_count,
             "errors": errors,
             "batch_id": batch_id,
-            "dest_language": dest_language.strip(),
+            "dest_language": dest_language_value,
             "gemini_model": model_name,
             "translate_enabled": translate_enabled_flag,
             "ignore_non_speech": ignore_non_speech_flag,
@@ -16091,7 +16285,7 @@ async def api_translate_audio(
         if reuse_session_error is not None:
             return reuse_session_error
 
-        dest_language_value = (dest_language_value or "").strip()
+        dest_language_value = _normalize_translate_dest_language(dest_language_value)
         if not dest_language_value:
             return _status_error("Destination language (dest_language) is required.")
 
@@ -17326,6 +17520,10 @@ async def server_info():
                 "parakeet_available": is_parakeet_available(),
                 "translation_llm_default": DEFAULT_TRANSLATION_LLM_MODEL,
                 "translation_llm_models": list(ALLOWED_TRANSLATION_LLM_MODELS),
+                "translate_destination_languages": [
+                    {"code": code, "label": label}
+                    for code, label in SUPPORTED_TRANSLATE_DESTINATION_LANGUAGES
+                ],
                 "stable_audio_available": stable_audio3_manager.status().get("available", False),
                 "stable_audio_default": STABLE_AUDIO3_DEFAULT_VARIANT,
                 "stable_audio_checkpoints": STABLE_AUDIO3_CHECKPOINT_DIR,

@@ -5200,6 +5200,34 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             const translateAdditionalSettingsSummary = document.getElementById('translateAdditionalSettingsSummary');
             const DEFAULT_EMOTION_WEIGHT = 0.6;
             const TRANSLATE_SETTINGS_STORAGE_KEY = 'indexTts.translateSettings.v1';
+            const TRANSLATE_DESTINATION_LANGUAGES_BY_BACKEND = Object.freeze({
+                index: Object.freeze([
+                    ['', 'Select...'],
+                    ['English', 'English'],
+                    ['Chinese', 'Chinese'],
+                ]),
+                confucius: Object.freeze([
+                    ['', 'Select...'],
+                    ['Chinese', 'Chinese'],
+                    ['English', 'English'],
+                    ['Japanese', 'Japanese'],
+                    ['Korean', 'Korean'],
+                    ['German', 'German'],
+                    ['French', 'French'],
+                    ['Spanish', 'Spanish'],
+                    ['Indonesian', 'Indonesian'],
+                    ['Italian', 'Italian'],
+                    ['Thai', 'Thai'],
+                    ['Portuguese', 'Portuguese'],
+                    ['Russian', 'Russian'],
+                    ['Malay', 'Malay'],
+                    ['Vietnamese', 'Vietnamese'],
+                ]),
+            });
+            const DEFAULT_TRANSLATE_DESTINATION_BY_BACKEND = Object.freeze({
+                index: 'Chinese',
+                confucius: 'Chinese',
+            });
 
             function readTranslatePersistentSettings() {
                 try {
@@ -5234,6 +5262,38 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 return Array.from(selectEl.options || []).some(option => option.value === value);
             }
 
+            function getTranslateTtsBackendKey() {
+                return translateTtsBackendEl && translateTtsBackendEl.value === 'confucius'
+                    ? 'confucius'
+                    : 'index';
+            }
+
+            function syncTranslateDestinationLanguageOptions(preferredValue = '') {
+                if (!translateDestLanguageSelect) {
+                    return;
+                }
+                const backendKey = getTranslateTtsBackendKey();
+                const options =
+                    TRANSLATE_DESTINATION_LANGUAGES_BY_BACKEND[backendKey] ||
+                    TRANSLATE_DESTINATION_LANGUAGES_BY_BACKEND.index;
+                const selectedValue = (preferredValue || translateDestLanguageSelect.value || '').trim();
+                const fallbackValue = DEFAULT_TRANSLATE_DESTINATION_BY_BACKEND[backendKey] || '';
+
+                translateDestLanguageSelect.textContent = '';
+                options.forEach(([value, label]) => {
+                    const option = document.createElement('option');
+                    option.value = value;
+                    option.textContent = label;
+                    translateDestLanguageSelect.appendChild(option);
+                });
+
+                if (selectedValue && selectHasOption(translateDestLanguageSelect, selectedValue)) {
+                    translateDestLanguageSelect.value = selectedValue;
+                } else if (fallbackValue && selectHasOption(translateDestLanguageSelect, fallbackValue)) {
+                    translateDestLanguageSelect.value = fallbackValue;
+                }
+            }
+
             function applyTranslatePersistentSettings() {
                 const settings = readTranslatePersistentSettings();
                 if (
@@ -5244,19 +5304,15 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     translateTranscriptionPipeline.value = settings.transcription_pipeline;
                 }
                 if (
-                    translateDestLanguageSelect &&
-                    typeof settings.dest_language === 'string' &&
-                    selectHasOption(translateDestLanguageSelect, settings.dest_language)
-                ) {
-                    translateDestLanguageSelect.value = settings.dest_language;
-                }
-                if (
                     translateTtsBackendEl &&
                     typeof settings.tts_backend === 'string' &&
                     selectHasOption(translateTtsBackendEl, settings.tts_backend)
                 ) {
                     translateTtsBackendEl.value = settings.tts_backend;
                 }
+                syncTranslateDestinationLanguageOptions(
+                    typeof settings.dest_language === 'string' ? settings.dest_language : ''
+                );
                 if (
                     translateGeminiModel &&
                     typeof settings.gemini_model === 'string' &&
@@ -5568,15 +5624,19 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
             }
             function syncTranslateTtsBackendControls() {
                 const isConfucius = translateTtsBackendEl && translateTtsBackendEl.value === 'confucius';
+                syncTranslateDestinationLanguageOptions();
                 if (translateDefaultEmotionWeightInput) {
                     translateDefaultEmotionWeightInput.disabled = Boolean(isConfucius);
                 }
+                updateAiConfigSummary();
                 updateAdditionalSettingsSummary();
             }
             if (translateTtsBackendEl) {
                 translateTtsBackendEl.addEventListener('change', () => {
-                    saveTranslatePersistentSettings();
                     syncTranslateTtsBackendControls();
+                    saveTranslatePersistentSettings();
+                    refreshPromptTemplates();
+                    updateFfmpegCommands();
                 });
                 syncTranslateTtsBackendControls();
             }
@@ -6740,6 +6800,56 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 de: 'de',
                 french: 'fr',
                 fr: 'fr',
+                indonesian: 'id',
+                id: 'id',
+                italian: 'it',
+                it: 'it',
+                thai: 'th',
+                th: 'th',
+                portuguese: 'pt',
+                pt: 'pt',
+                russian: 'ru',
+                ru: 'ru',
+                malay: 'ms',
+                ms: 'ms',
+                vietnamese: 'vi',
+                viet: 'vi',
+                vi: 'vi',
+            };
+            const SUBTITLE_LANGUAGE_CODE_OVERRIDES = {
+                chinese: 'zho',
+                chn: 'zho',
+                cnt: 'zho',
+                zh: 'zho',
+                english: 'eng',
+                en: 'eng',
+                spanish: 'spa',
+                es: 'spa',
+                japanese: 'jpn',
+                jp: 'jpn',
+                ja: 'jpn',
+                korean: 'kor',
+                kr: 'kor',
+                ko: 'kor',
+                german: 'deu',
+                de: 'deu',
+                french: 'fra',
+                fr: 'fra',
+                indonesian: 'ind',
+                id: 'ind',
+                italian: 'ita',
+                it: 'ita',
+                thai: 'tha',
+                th: 'tha',
+                portuguese: 'por',
+                pt: 'por',
+                russian: 'rus',
+                ru: 'rus',
+                malay: 'msa',
+                ms: 'msa',
+                vietnamese: 'vie',
+                viet: 'vie',
+                vi: 'vie',
             };
 
             function normalizeBaseFilenameInput(value) {
@@ -6783,6 +6893,21 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 return compact.length <= 3 ? compact : compact.slice(0, 3);
             }
 
+            function getSubtitleLanguageCode(labelOrCode) {
+                if (!labelOrCode) {
+                    return 'und';
+                }
+                const lower = labelOrCode.trim().toLowerCase();
+                if (!lower || lower === 'original' || lower === 'source') {
+                    return 'und';
+                }
+                if (SUBTITLE_LANGUAGE_CODE_OVERRIDES[lower]) {
+                    return SUBTITLE_LANGUAGE_CODE_OVERRIDES[lower];
+                }
+                const compact = lower.replace(/[^a-z0-9]+/g, '');
+                return SUBTITLE_LANGUAGE_CODE_OVERRIDES[compact] || 'und';
+            }
+
             function updateFfmpegCommands(options = {}) {
                 if (!ffmpegPanel || !ffmpegExtractCmd || !ffmpegReplaceCmd || !ffmpegSubtitleCmd) {
                     return;
@@ -6822,6 +6947,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     translateLanguageCodeHint ||
                     getLanguageCodeForFilename(languageLabel);
                 const languageCode = preferredCode || 'translated';
+                const subtitleLanguageCode = getSubtitleLanguageCode(languageCode);
                 if (options.languageCode) {
                     translateLanguageCodeHint = options.languageCode;
                 }
@@ -6849,7 +6975,7 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                     ffmpegSubtitleOriginalCmd.textContent = `ffmpeg -filter_threads 0 -filter_complex_threads 0 -i ${baseMp4} -vf ${originalSubtitleFilter} -c:v libx264 -preset veryfast -crf 18 -threads:v 0 -c:a copy ${originalSrtBurned}`;
                 }
                 if (ffmpegEmbedSubtitleCmd) {
-                    ffmpegEmbedSubtitleCmd.textContent = `ffmpeg -i ${translatedMp4} -i "${translatedSrtFilename}" -i "${originalSrtFilename}" -map 0:v:0 -map 0:a? -map 1:0 -map 2:0 -c:v copy -c:a copy -c:s mov_text -metadata:s:s:0 title=Translated -metadata:s:s:0 handler_name=Translated -metadata:s:s:0 language=eng -disposition:s:0 default -metadata:s:s:1 title=Original -metadata:s:s:1 handler_name=Original -metadata:s:s:1 language=und -disposition:s:1 0 -movflags +faststart "${normalizedBase}_${languageCode}_subtracks.mp4"`;
+                    ffmpegEmbedSubtitleCmd.textContent = `ffmpeg -i ${translatedMp4} -i "${translatedSrtFilename}" -i "${originalSrtFilename}" -map 0:v:0 -map 0:a? -map 1:0 -map 2:0 -c:v copy -c:a copy -c:s mov_text -metadata:s:s:0 title=Translated -metadata:s:s:0 handler_name=Translated -metadata:s:s:0 language=${subtitleLanguageCode} -disposition:s:0 default -metadata:s:s:1 title=Original -metadata:s:s:1 handler_name=Original -metadata:s:s:1 language=und -disposition:s:1 0 -movflags +faststart "${normalizedBase}_${languageCode}_subtracks.mp4"`;
                 }
             }
 
@@ -9916,6 +10042,10 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         translateTtsBackendEl.value = metadataBackend;
                         syncTranslateTtsBackendControls();
                     }
+                }
+                if (translateDestLanguageSelect && typeof metadata.dest_language === 'string') {
+                    syncTranslateDestinationLanguageOptions(metadata.dest_language.trim());
+                    updateAiConfigSummary();
                 }
                 if (
                     translateDefaultEmotionWeightInput &&

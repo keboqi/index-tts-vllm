@@ -742,6 +742,11 @@ _LANGUAGE_CODE_ALIASES = {
     "italian": "it",
     "portuguese": "pt",
     "russian": "ru",
+    "indonesian": "id",
+    "thai": "th",
+    "malay": "ms",
+    "vietnamese": "vi",
+    "viet": "vi",
     "arabic": "ar",
     "hindi": "hi",
 }
