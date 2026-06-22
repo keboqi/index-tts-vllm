@@ -55,6 +55,7 @@ import re
 import shutil
 import subprocess
 import shlex
+import signal
 import urllib.request
 import urllib.error
 import hashlib
@@ -292,8 +293,14 @@ class AppSettings:
     confucius_host: str = "127.0.0.1"
     confucius_port: int = 8001
     confucius_start_command: str = ""
+    confucius_start_shell: bool = True
+    confucius_detach_process: bool = True
+    confucius_attach_stdio: bool = False
+    confucius_log_dir: str = ""
     confucius_start_timeout: float = 900.0
     confucius_request_timeout: float = 600.0
+    confucius_keepalive_interval: float = 60.0
+    confucius_unhealthy_grace: float = 30.0
     confucius_vllm_gpu_memory_utilization: float = 0.2
 
     @classmethod
@@ -312,8 +319,14 @@ class AppSettings:
             confucius_host=str(getattr(args, "confucius_host", "127.0.0.1")),
             confucius_port=int(getattr(args, "confucius_port", 8001)),
             confucius_start_command=str(getattr(args, "confucius_start_command", "")),
+            confucius_start_shell=bool(getattr(args, "confucius_start_shell", True)),
+            confucius_detach_process=bool(getattr(args, "confucius_detach_process", True)),
+            confucius_attach_stdio=bool(getattr(args, "confucius_attach_stdio", False)),
+            confucius_log_dir=str(getattr(args, "confucius_log_dir", "")),
             confucius_start_timeout=float(getattr(args, "confucius_start_timeout", 900.0)),
             confucius_request_timeout=float(getattr(args, "confucius_request_timeout", 600.0)),
+            confucius_keepalive_interval=float(getattr(args, "confucius_keepalive_interval", 60.0)),
+            confucius_unhealthy_grace=float(getattr(args, "confucius_unhealthy_grace", 30.0)),
             confucius_vllm_gpu_memory_utilization=float(
                 getattr(args, "confucius_vllm_gpu_memory_utilization", 0.2)
             ),
@@ -3529,8 +3542,44 @@ parser.add_argument("--confucius_repo_dir", type=str, default="../Confucius4-TTS
 parser.add_argument("--confucius_host", type=str, default="127.0.0.1", help="Host for the managed Confucius4-TTS FastAPI backend")
 parser.add_argument("--confucius_port", type=int, default=8001, help="Port for the managed Confucius4-TTS FastAPI backend")
 parser.add_argument("--confucius_start_command", type=str, default="", help="Optional command used to start Confucius4-TTS instead of the default launcher")
+parser.add_argument(
+    "--confucius_start_shell",
+    action=argparse.BooleanOptionalAction,
+    default=_env_flag("CONFUCIUS_START_SHELL", True),
+    help="Run --confucius_start_command through the platform shell for terminal-compatible syntax",
+)
+parser.add_argument(
+    "--confucius_detach_process",
+    action=argparse.BooleanOptionalAction,
+    default=_env_flag("CONFUCIUS_DETACH_PROCESS", True),
+    help="Start the managed Confucius4-TTS backend in a separate process group/session",
+)
+parser.add_argument(
+    "--confucius_attach_stdio",
+    action=argparse.BooleanOptionalAction,
+    default=_env_flag("CONFUCIUS_ATTACH_STDIO", False),
+    help="Let the managed Confucius4-TTS backend inherit WebUI stdio instead of writing to a log file",
+)
+parser.add_argument(
+    "--confucius_log_dir",
+    type=str,
+    default=os.environ.get("CONFUCIUS_LOG_DIR", ""),
+    help="Directory for managed Confucius4-TTS stdout/stderr logs; defaults to outputs/confucius_backend_logs",
+)
 parser.add_argument("--confucius_start_timeout", type=float, default=900.0, help="Seconds to wait for lazy Confucius4-TTS startup")
 parser.add_argument("--confucius_request_timeout", type=float, default=600.0, help="Seconds to wait for each Confucius4-TTS synthesis request")
+parser.add_argument(
+    "--confucius_keepalive_interval",
+    type=float,
+    default=_env_float("CONFUCIUS_KEEPALIVE_INTERVAL", 60.0, min_value=0.0),
+    help="Seconds between Confucius4-TTS keepalive health checks; set 0 to disable",
+)
+parser.add_argument(
+    "--confucius_unhealthy_grace",
+    type=float,
+    default=_env_float("CONFUCIUS_UNHEALTHY_GRACE", 30.0, min_value=1.0),
+    help="Seconds since last healthy Confucius4-TTS check before an unresponsive managed backend is restarted",
+)
 parser.add_argument(
     "--confucius_vllm_gpu_memory_utilization",
     type=float,
@@ -3557,8 +3606,22 @@ except SystemExit:
         confucius_host="127.0.0.1",
         confucius_port=8001,
         confucius_start_command="",
+        confucius_start_shell=_env_flag("CONFUCIUS_START_SHELL", True),
+        confucius_detach_process=_env_flag("CONFUCIUS_DETACH_PROCESS", True),
+        confucius_attach_stdio=_env_flag("CONFUCIUS_ATTACH_STDIO", False),
+        confucius_log_dir=os.environ.get("CONFUCIUS_LOG_DIR", ""),
         confucius_start_timeout=900.0,
         confucius_request_timeout=600.0,
+        confucius_keepalive_interval=_env_float(
+            "CONFUCIUS_KEEPALIVE_INTERVAL",
+            60.0,
+            min_value=0.0,
+        ),
+        confucius_unhealthy_grace=_env_float(
+            "CONFUCIUS_UNHEALTHY_GRACE",
+            30.0,
+            min_value=1.0,
+        ),
         confucius_vllm_gpu_memory_utilization=_env_float(
             "CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION",
             0.2,
@@ -3733,6 +3796,15 @@ def _resolve_confucius_repo_dir() -> Path:
     return repo_dir.resolve()
 
 
+def _resolve_confucius_log_dir() -> Path:
+    configured = (SETTINGS.confucius_log_dir or "").strip()
+    log_dir = Path(configured).expanduser() if configured else ROOT_OUTPUT_DIR / "confucius_backend_logs"
+    if not log_dir.is_absolute():
+        log_dir = APP_DIR / log_dir
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir.resolve()
+
+
 def _http_json_get_sync(url: str, timeout: float) -> Dict[str, Any]:
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -3767,14 +3839,49 @@ class ManagedConfuciusBackend:
     def __init__(self) -> None:
         self._process: Optional[subprocess.Popen] = None
         self._started_process = False
+        self._want_running = False
+        self._started_at: Optional[float] = None
+        self._last_ready_at: Optional[float] = None
+        self._last_health: Optional[Dict[str, Any]] = None
+        self._keepalive_task: Optional[asyncio.Task] = None
+        self._log_file_handle: Optional[Any] = None
+        self._log_path: Optional[Path] = None
+        self._last_exit_code: Optional[int] = None
+        self._last_exit_at: Optional[float] = None
+        self._last_start_command: List[str] = []
+        self._active_requests = 0
         self._lock = asyncio.Lock()
 
     @property
     def base_url(self) -> str:
         return _confucius_base_url()
 
+    def _poll_process(self) -> Optional[int]:
+        if self._process is None:
+            return None
+        returncode = self._process.poll()
+        if returncode is not None:
+            if self._last_exit_at is None or self._last_exit_code != returncode:
+                self._last_exit_code = returncode
+                self._last_exit_at = time.monotonic()
+        return returncode
+
     def _process_running(self) -> bool:
-        return self._process is not None and self._process.poll() is None
+        return self._process is not None and self._poll_process() is None
+
+    def _keepalive_interval(self) -> float:
+        return max(0.0, float(SETTINGS.confucius_keepalive_interval or 0.0))
+
+    def _unhealthy_grace(self) -> float:
+        return max(1.0, float(SETTINGS.confucius_unhealthy_grace or 30.0))
+
+    def _should_keep_running(self) -> bool:
+        return self._want_running or SETTINGS.tts_backend == TTS_BACKEND_CONFUCIUS
+
+    def _record_health(self, health: Optional[Dict[str, Any]]) -> None:
+        self._last_health = health
+        if health and health.get("model_loaded"):
+            self._last_ready_at = time.monotonic()
 
     def _health_sync(self, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
         try:
@@ -3783,7 +3890,9 @@ class ManagedConfuciusBackend:
             return None
 
     async def health(self, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
-        return await _run_blocking(self._health_sync, timeout)
+        health = await _run_blocking(self._health_sync, timeout)
+        self._record_health(health)
+        return health
 
     def _build_start_command(self, repo_dir: Path) -> Tuple[List[str], Dict[str, str]]:
         env = os.environ.copy()
@@ -3795,8 +3904,28 @@ class ManagedConfuciusBackend:
         env["CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION"] = confucius_gpu_util
         env["VLLM_GPU_MEMORY_UTILIZATION"] = confucius_gpu_util
 
+        env["PYTHONUNBUFFERED"] = "1"
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+
         custom_command = (SETTINGS.confucius_start_command or "").strip()
         if custom_command:
+            if SETTINGS.confucius_start_shell:
+                if os.name == "nt":
+                    powershell = shutil.which("powershell") or shutil.which("pwsh")
+                    if powershell:
+                        return [
+                            powershell,
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-Command",
+                            custom_command,
+                        ], env
+                    return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", custom_command], env
+                bash = shutil.which("bash")
+                if bash:
+                    return [bash, "-lc", custom_command], env
+                return ["/bin/sh", "-c", custom_command], env
             return shlex.split(custom_command, posix=os.name != "nt"), env
 
         launcher = repo_dir / "scripts" / "run_fastapi_uv.sh"
@@ -3812,9 +3941,103 @@ class ManagedConfuciusBackend:
             str(SETTINGS.confucius_port),
         ], env
 
+    def _close_log_handle(self) -> None:
+        handle = self._log_file_handle
+        self._log_file_handle = None
+        if handle is None:
+            return
+        try:
+            handle.flush()
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+    def _open_log_handle(self, command: List[str], repo_dir: Path) -> Optional[Any]:
+        if SETTINGS.confucius_attach_stdio:
+            self._close_log_handle()
+            self._log_path = None
+            return None
+
+        self._close_log_handle()
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        log_path = _resolve_confucius_log_dir() / f"confucius_backend_{timestamp}_{uuid.uuid4().hex[:8]}.log"
+        handle = open(log_path, "ab", buffering=0)
+        header = (
+            f"\n\n=== Confucius4-TTS managed backend start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+            f"cwd: {repo_dir}\n"
+            f"command: {' '.join(shlex.quote(str(part)) for part in command)}\n\n"
+        )
+        handle.write(header.encode("utf-8", errors="replace"))
+        self._log_file_handle = handle
+        self._log_path = log_path
+        return handle
+
+    def _popen_kwargs(self, log_handle: Optional[Any]) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        if log_handle is not None:
+            kwargs["stdout"] = log_handle
+            kwargs["stderr"] = subprocess.STDOUT
+
+        if SETTINGS.confucius_detach_process:
+            if os.name == "nt":
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            else:
+                kwargs["start_new_session"] = True
+        return kwargs
+
+    def _terminate_process_tree(self, process: subprocess.Popen, *, kill: bool = False) -> None:
+        if SETTINGS.confucius_detach_process and os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL if kill else signal.SIGTERM)
+                return
+            except ProcessLookupError:
+                return
+            except Exception as exc:
+                print(f"[Confucius4-TTS] Failed to signal process group {process.pid}: {exc}")
+
+        if os.name == "nt" and SETTINGS.confucius_detach_process and not kill:
+            try:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+                return
+            except Exception:
+                pass
+
+        if kill:
+            process.kill()
+        else:
+            process.terminate()
+
+    def _read_log_tail_sync(self, max_bytes: int = 4096) -> str:
+        if not self._log_path or not self._log_path.exists():
+            return ""
+        try:
+            with open(self._log_path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - max_bytes))
+                return fh.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
+    def _exit_diagnostics(self, exit_code: Optional[int]) -> str:
+        parts = [f"exit code {exit_code}"]
+        if self._log_path:
+            parts.append(f"log: {self._log_path}")
+        tail = self._read_log_tail_sync()
+        if tail:
+            parts.append(f"last log tail:\n{tail}")
+        return "; ".join(parts)
+
     def _start_sync(self) -> None:
         if self._process_running():
             return
+        self._want_running = True
         repo_dir = _resolve_confucius_repo_dir()
         app_path = repo_dir / "fastapi_app.py"
         if not app_path.exists():
@@ -3827,14 +4050,74 @@ class ManagedConfuciusBackend:
             f"[Confucius4-TTS] Lazy starting managed backend on {self.base_url} "
             f"from {repo_dir}..."
         )
-        self._process = subprocess.Popen(command, cwd=str(repo_dir), env=env)
+        self._last_start_command = command
+        log_handle = self._open_log_handle(command, repo_dir)
+        if log_handle is not None:
+            print(f"[Confucius4-TTS] Managed backend logs: {self._log_path}")
+        self._process = subprocess.Popen(
+            command,
+            cwd=str(repo_dir),
+            env=env,
+            **self._popen_kwargs(log_handle),
+        )
         self._started_process = True
+        self._started_at = time.monotonic()
+        self._last_health = None
+        self._last_exit_code = None
+        self._last_exit_at = None
+
+    def _stop_sync(self, reason: str = "") -> None:
+        process = self._process
+        if process is None:
+            self._started_process = False
+            self._started_at = None
+            self._last_health = None
+            self._last_ready_at = None
+            return
+
+        if self._started_process and process.poll() is None:
+            reason_text = f" ({reason})" if reason else ""
+            print(f"[Confucius4-TTS] Stopping managed backend{reason_text}...")
+            self._terminate_process_tree(process)
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self._terminate_process_tree(process, kill=True)
+                process.wait()
+        else:
+            self._poll_process()
+
+        self._process = None
+        self._started_process = False
+        self._started_at = None
+        self._last_health = None
+        self._last_ready_at = None
+        self._close_log_handle()
+
+    async def _restart_locked(self, reason: str) -> None:
+        print(f"[Confucius4-TTS] Restarting managed backend: {reason}")
+        await _run_blocking(self._stop_sync, reason)
+        await _run_blocking(self._start_sync)
+
+    async def restart(self, reason: str) -> None:
+        async with self._lock:
+            await self._restart_locked(reason)
 
     async def ensure_ready(self) -> Dict[str, Any]:
         async with self._lock:
+            self._want_running = True
             health = await self.health(timeout=1.0)
             if health and health.get("model_loaded"):
                 return health
+
+            restart_attempted = False
+            if self._process_running() and self._last_ready_at is not None:
+                last_ready_age = time.monotonic() - self._last_ready_at
+                if last_ready_age >= self._unhealthy_grace():
+                    await self._restart_locked(
+                        f"health check failed after {last_ready_age:.0f}s since last ready"
+                    )
+                    restart_attempted = True
 
             if not self._process_running():
                 await _run_blocking(self._start_sync)
@@ -3848,16 +4131,75 @@ class ManagedConfuciusBackend:
                     print("[Confucius4-TTS] Managed backend is ready.")
                     return last_health
                 if self._process is not None and self._process.poll() is not None:
-                    raise RuntimeError(
-                        f"Confucius4-TTS backend exited during startup "
-                        f"(exit code {self._process.returncode})."
+                    exit_code = self._process.returncode
+                    if restart_attempted:
+                        raise RuntimeError(
+                            f"Confucius4-TTS backend exited during startup "
+                            f"({self._exit_diagnostics(exit_code)})."
+                        )
+                    await self._restart_locked(
+                        f"backend exited during startup ({self._exit_diagnostics(exit_code)})"
                     )
+                    restart_attempted = True
+                    continue
                 await asyncio.sleep(2.0)
 
             raise RuntimeError(
                 f"Timed out waiting {timeout:.0f}s for Confucius4-TTS to become ready. "
                 f"Last health: {last_health}"
             )
+
+    async def _keepalive_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._keepalive_interval())
+            try:
+                if not self._should_keep_running() or self._active_requests > 0:
+                    continue
+
+                health = await self.health(timeout=2.0)
+                if health and health.get("model_loaded"):
+                    continue
+
+                if not self._process_running():
+                    print("[Confucius4-TTS] Keepalive found backend stopped; starting it again.")
+                    await self.ensure_ready()
+                    continue
+
+                if self._last_ready_at is None:
+                    continue
+
+                unhealthy_for = time.monotonic() - self._last_ready_at
+                if unhealthy_for >= self._unhealthy_grace():
+                    await self.restart(
+                        f"keepalive health checks failed for {unhealthy_for:.0f}s"
+                    )
+                    await self.ensure_ready()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[Confucius4-TTS] Keepalive check failed: {exc}")
+                traceback.print_exc()
+
+    def start_keepalive(self) -> None:
+        interval = self._keepalive_interval()
+        if interval <= 0:
+            print("[Confucius4-TTS] Keepalive disabled.")
+            return
+        if self._keepalive_task is not None and not self._keepalive_task.done():
+            return
+        print(f"[Confucius4-TTS] Keepalive enabled every {interval:.0f}s.")
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
+    async def stop_keepalive(self) -> None:
+        task = self._keepalive_task
+        self._keepalive_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     def _resolve_prompt_path(self, prompt_wav: Optional[str]) -> Optional[str]:
         if not prompt_wav:
@@ -3879,7 +4221,12 @@ class ManagedConfuciusBackend:
         max_text_tokens_per_sentence: int = 80,
         verbose: bool = False,
     ) -> str:
-        await self.ensure_ready()
+        self._active_requests += 1
+        try:
+            await self.ensure_ready()
+        finally:
+            self._active_requests = max(0, self._active_requests - 1)
+
         lang = _resolve_confucius_language(language, text)
         payload: Dict[str, Any] = {
             "text": text,
@@ -3895,14 +4242,49 @@ class ManagedConfuciusBackend:
         if speech_length and int(speech_length) > 0:
             payload["target_duration_seconds"] = max(0.0, int(speech_length) / 1000.0)
 
-        audio_bytes = await _run_blocking(
-            _http_json_audio_post_sync,
-            f"{self.base_url}/v1/tts/audio",
-            payload,
-            max(1.0, float(SETTINGS.confucius_request_timeout)),
-        )
+        request_timeout = max(1.0, float(SETTINGS.confucius_request_timeout))
+        self._active_requests += 1
+        try:
+            try:
+                audio_bytes = await _run_blocking(
+                    _http_json_audio_post_sync,
+                    f"{self.base_url}/v1/tts/audio",
+                    payload,
+                    request_timeout,
+                )
+            except Exception as exc:
+                if not self._is_retryable_synthesis_error(exc):
+                    raise
+                print(f"[Confucius4-TTS] Synthesis request failed, restarting once: {exc}")
+                await self.restart("synthesis request failed")
+                await self.ensure_ready()
+                audio_bytes = await _run_blocking(
+                    _http_json_audio_post_sync,
+                    f"{self.base_url}/v1/tts/audio",
+                    payload,
+                    request_timeout,
+                )
+        finally:
+            self._active_requests = max(0, self._active_requests - 1)
+
         await async_write_file(output_path, audio_bytes)
         return output_path
+
+    @staticmethod
+    def _is_retryable_synthesis_error(exc: Exception) -> bool:
+        message = str(exc)
+        if re.search(r"Confucius4-TTS HTTP 4\d\d:", message):
+            return False
+        return isinstance(
+            exc,
+            (
+                urllib.error.URLError,
+                TimeoutError,
+                ConnectionError,
+                OSError,
+                RuntimeError,
+            ),
+        )
 
     async def status(self) -> Dict[str, Any]:
         health = await self.health(timeout=1.0)
@@ -3915,20 +4297,32 @@ class ManagedConfuciusBackend:
             "managed_process_running": self._process_running(),
             "healthy": bool(health and health.get("model_loaded")),
             "health": health,
+            "want_running": self._should_keep_running(),
+            "active_requests": self._active_requests,
+            "keepalive_interval": self._keepalive_interval(),
+            "unhealthy_grace": self._unhealthy_grace(),
+            "detach_process": SETTINGS.confucius_detach_process,
+            "attach_stdio": SETTINGS.confucius_attach_stdio,
+            "start_shell": SETTINGS.confucius_start_shell,
+            "managed_log_path": str(self._log_path) if self._log_path else None,
+            "last_exit_code": self._last_exit_code,
+            "last_exit_seconds_ago": (
+                time.monotonic() - self._last_exit_at
+                if self._last_exit_at is not None
+                else None
+            ),
+            "last_start_command": self._last_start_command,
+            "last_ready_seconds_ago": (
+                time.monotonic() - self._last_ready_at
+                if self._last_ready_at is not None
+                else None
+            ),
         }
 
     async def shutdown(self) -> None:
-        if not self._started_process or not self._process_running():
-            return
-        process = self._process
-        assert process is not None
-        print("[Confucius4-TTS] Stopping managed backend...")
-        process.terminate()
-        try:
-            await _run_blocking(process.wait, 15)
-        except Exception:
-            process.kill()
-            await _run_blocking(process.wait)
+        self._want_running = False
+        await self.stop_keepalive()
+        await _run_blocking(self._stop_sync, "application shutdown")
 
 
 confucius_backend_manager = ManagedConfuciusBackend()
@@ -11776,7 +12170,9 @@ async def lifespan(app: FastAPI):
         await warmup_model()
     else:
         print("⏭️ Skipping warmup (--use_torch_compile not enabled)")
-    
+
+    confucius_backend_manager.start_keepalive()
+
     yield
     # Shutdown (if needed)
     print("🔄 Shutting down IndexTTS vLLM v2...")

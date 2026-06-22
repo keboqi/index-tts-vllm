@@ -3,11 +3,13 @@ import os
 import asyncio
 import json
 import socket
+import shlex
 import subprocess
 import time
 import urllib.error
 import urllib.request
 import uuid
+from pathlib import Path
 from typing import List, Dict, Optional
 
 # Use CUDA 13.0 for RTX Pro 6000 Blackwell.
@@ -15,6 +17,19 @@ cuda_version = "13.0.0"
 flavor = "devel" 
 operating_sys = "ubuntu24.04"
 tag = f"{cuda_version}-{flavor}-{operating_sys}"
+
+INDEXTTS_REPO_URL = "https://github.com/keboqi/index-tts-vllm.git"
+CONFUCIUS_REPO_URL = "https://github.com/keboqi/Confucius4-TTS.git"
+CONFUCIUS_IMAGE_DIR = "/app/Confucius4-TTS"
+CONFUCIUS_APP_SUBDIR = "Confucius4-TTS"
+CONFUCIUS_VENV_DIR = "/opt/confucius4tts-venv"
+CONFUCIUS_PYTHON = f"{CONFUCIUS_VENV_DIR}/bin/python"
+CONFUCIUS_MODEL_REPO_ID = "netease-youdao/Confucius4-TTS"
+CONFUCIUS_W2V_REPO_ID = "facebook/w2v-bert-2.0"
+CONFUCIUS_BIGVGAN_REPO_ID = "nvidia/bigvgan_v2_22khz_80band_256x"
+CONFUCIUS_CAMPPLUS_REPO_ID = "funasr/campplus"
+CONFUCIUS_CAMPPLUS_FILENAME = "campplus_cn_common.bin"
+CONFUCIUS_FASTAPI_CONFIG = "config/inference_config.modal.yaml"
 
 # Create Modal image for IndexTTS v2 with vLLM optimization
 image = (
@@ -48,10 +63,12 @@ image = (
 
         # Cache directories for faster subsequent runs
         "HF_HOME": "/persistent_cache/huggingface",
-        "TORCH_HOME": "/persistent_cache/torch", 
+        "HUGGINGFACE_HUB_CACHE": "/persistent_cache/huggingface/hub",
+        "TORCH_HOME": "/persistent_cache/torch",
         "TRANSFORMERS_CACHE": "/persistent_cache/transformers",
         "CUDA_CACHE_PATH": "/persistent_cache/cuda_cache",
         "VLLM_CACHE": "/persistent_cache/vllm_cache",
+        "TRITON_CACHE_DIR": "/persistent_cache/triton",
         "VLLM_SERVER_DEV_MODE": "1",
         "TORCHINDUCTOR_COMPILE_THREADS": "1",
         "TORCH_NCCL_ENABLE_MONITORING": "0",
@@ -70,10 +87,21 @@ image = (
         "json-repair"
     )
     .run_commands(
-        "git clone https://github.com/garyswansrs/index-tts-vllm.git /app/index-tts-vllm"
+        f"git clone {INDEXTTS_REPO_URL} /app/index-tts-vllm"
     )
     .run_commands(
         "cd /app/index-tts-vllm && pip install -r requirements.txt"
+    )
+    .run_commands(
+        f"git clone {CONFUCIUS_REPO_URL} {CONFUCIUS_IMAGE_DIR}"
+    )
+    .run_commands(
+        f"python -m venv {CONFUCIUS_VENV_DIR}",
+        f"{CONFUCIUS_PYTHON} -m pip install --upgrade pip setuptools wheel",
+        f"cd {CONFUCIUS_IMAGE_DIR} && {CONFUCIUS_PYTHON} -m pip install -r requirements.txt",
+        f"cd {CONFUCIUS_IMAGE_DIR} && {CONFUCIUS_PYTHON} -m pip install --force-reinstall -r requirements-cu128.txt",
+        f"cd {CONFUCIUS_IMAGE_DIR} && {CONFUCIUS_PYTHON} -m pip install -r requirements-vllm.txt",
+        f"{CONFUCIUS_PYTHON} -m pip install \"numpy<2\" \"torchcodec==0.9.*\"",
     )
     .run_commands(
         # The PyPI stable-audio-tools wheel is too old for Stable Audio 3
@@ -118,14 +146,109 @@ cache_storage = modal.Volume.from_name("indextts-v2-cache", create_if_missing=Tr
 # Configuration
 PERSISTENT_APP_DIR = "/persistent_app"
 PERSISTENT_CACHE_DIR = "/persistent_cache"
+CONFUCIUS_PERSISTENT_REPO_DIR = f"{PERSISTENT_APP_DIR}/{CONFUCIUS_APP_SUBDIR}"
 VLLM_PORT = 8000
+CONFUCIUS_PORT = 8001
 SNAPSHOT_STARTUP_TIMEOUT = 1800
 SNAPSHOT_REQUEST_TIMEOUT = 900
 INTERNAL_TOKEN_ENV = "INDEXTTS_INTERNAL_TOKEN"
+DEFAULT_TTS_BACKEND = "index"
 GPU_MEMORY_UTILIZATION = 0.15
 QWENEMO_GPU_MEMORY_UTILIZATION = 0.05
+CONFUCIUS_GPU_MEMORY_UTILIZATION = 0.20
+CONFUCIUS_STARTUP_TIMEOUT = 1200
+CONFUCIUS_REQUEST_TIMEOUT = 900
 
 STABLE_AUDIO3_VARIANTS = ("medium", "small-music", "small-sfx")
+
+
+def _ensure_confucius_vllm_patch_compatibility(confucius_repo_path: Path) -> Dict[str, object]:
+    """Keep the persistent Confucius checkout compatible with current vLLM."""
+    patch_path = confucius_repo_path / "confuciustts" / "llm" / "vllm_patch.py"
+    status: Dict[str, object] = {
+        "success": False,
+        "changed": False,
+        "path": str(patch_path),
+        "message": "",
+    }
+    if not patch_path.exists():
+        status["message"] = f"Confucius vLLM patch file not found: {patch_path}"
+        return status
+
+    old_signature = """    def _prepare_inputs_with_confucius_positions(
+        self,
+        scheduler_output,
+        num_scheduled_tokens,
+        *args,
+        **kwargs,
+    ):
+        result = current_prepare(
+            self,
+            scheduler_output,
+            num_scheduled_tokens,
+            *args,
+            **kwargs,
+        )
+"""
+    new_signature = """    def _prepare_inputs_with_confucius_positions(
+        self,
+        scheduler_output,
+        *args,
+        **kwargs,
+    ):
+        result = current_prepare(
+            self,
+            scheduler_output,
+            *args,
+            **kwargs,
+        )
+"""
+    compatibility_marker = "        num_scheduled_tokens = None\n        if args:\n"
+    req_indices_line = "        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)\n"
+    compatibility_block = """        num_scheduled_tokens = None
+        if args:
+            candidate = args[0]
+            if isinstance(candidate, np.ndarray):
+                num_scheduled_tokens = candidate
+        if num_scheduled_tokens is None and isinstance(result, tuple) and len(result) >= 4:
+            candidate = result[3]
+            if isinstance(candidate, np.ndarray):
+                num_scheduled_tokens = candidate
+        if num_scheduled_tokens is None:
+            req_ids_for_tokens = list(self.input_batch.req_ids[:num_reqs])
+            num_scheduled_tokens = np.array(
+                [scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids_for_tokens],
+                dtype=np.int32,
+            )
+
+"""
+
+    text = patch_path.read_text(encoding="utf-8")
+    updated_text = text
+    changed = False
+
+    if old_signature in updated_text:
+        updated_text = updated_text.replace(old_signature, new_signature, 1)
+        changed = True
+    elif "        num_scheduled_tokens,\n        *args,\n" in updated_text:
+        status["message"] = "Confucius vLLM wrapper signature did not match the expected patch shape"
+        return status
+
+    if compatibility_marker not in updated_text:
+        if req_indices_line not in updated_text:
+            status["message"] = "Confucius vLLM patch insertion point was not found"
+            return status
+        updated_text = updated_text.replace(req_indices_line, compatibility_block + req_indices_line, 1)
+        changed = True
+
+    if changed:
+        patch_path.write_text(updated_text, encoding="utf-8")
+        status["changed"] = True
+        status["message"] = "Confucius vLLM patch compatibility update applied"
+    else:
+        status["message"] = "Confucius vLLM patch is already compatible"
+    status["success"] = True
+    return status
 
 @app.function(
     image=image,
@@ -135,15 +258,16 @@ STABLE_AUDIO3_VARIANTS = ("medium", "small-music", "small-sfx")
         PERSISTENT_CACHE_DIR: cache_storage
     },
     cpu=4.0,
-    memory=8192
+    memory=32768
 )
 def prepare_model():
     """
     CPU function to:
-    1. Copy the entire /app/index-tts-vllm to persistent storage
-    2. Update the application with latest code from git (git pull origin)
-    3. Download the main model repo into the persistent checkpoints folder
-       (includes IndexTTS v2, Qwen3-TTS Voice Design, and Stable Audio 3)
+    1. Copy IndexTTS and Confucius4-TTS code into persistent storage
+    2. Update both applications from their integration remotes
+    3. Download IndexTTS, Qwen3 Voice Design, Stable Audio 3, and
+       Confucius4-TTS assets into persistent storage/cache
+    4. Convert the Confucius T2S checkpoint into a vLLM-loadable directory
     
     This is a one-time setup that creates a fully self-contained persistent app.
     """
@@ -156,6 +280,8 @@ def prepare_model():
     # Step 1: Copy the entire application to persistent storage
     persistent_app_path = Path(PERSISTENT_APP_DIR)
     source_app_path = Path("/app/index-tts-vllm")
+    confucius_source_path = Path(CONFUCIUS_IMAGE_DIR)
+    confucius_persistent_path = persistent_app_path / CONFUCIUS_APP_SUBDIR
     
     if not persistent_app_path.exists() or len(list(persistent_app_path.iterdir())) == 0:
         print("📂 Copying application to persistent storage...")
@@ -177,6 +303,22 @@ def prepare_model():
     else:
         print("✅ Application already exists in persistent storage")
     
+    if not confucius_persistent_path.exists() or len(list(confucius_persistent_path.iterdir())) == 0:
+        print(f"Copying Confucius4-TTS app to persistent storage: {confucius_persistent_path}")
+        confucius_persistent_path.mkdir(parents=True, exist_ok=True)
+        for item in confucius_source_path.iterdir():
+            dest_item = confucius_persistent_path / item.name
+            if item.is_dir():
+                if dest_item.exists():
+                    shutil.rmtree(dest_item)
+                shutil.copytree(item, dest_item)
+                print(f"   Copied Confucius directory: {item.name}")
+            else:
+                shutil.copy2(item, dest_item)
+                print(f"   Copied Confucius file: {item.name}")
+    else:
+        print(f"Confucius4-TTS already exists in persistent storage: {confucius_persistent_path}")
+
     # Step 2: Update the application with latest code from git (force override local changes)
     print("\n📥 Step 2: Updating application from git repository (force override)...")
     repo_update_status = {
@@ -187,6 +329,12 @@ def prepare_model():
     try:
         # Change to persistent app directory
         os.chdir(str(persistent_app_path))
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", INDEXTTS_REPO_URL],
+            capture_output=True,
+            text=True,
+            cwd=str(persistent_app_path),
+        )
         print(f"   📁 Changed to directory: {persistent_app_path}")
         
         # Step 2a: Fetch latest from all remotes
@@ -242,6 +390,86 @@ def prepare_model():
         print("   Continuing with existing code...")
         repo_update_status["message"] = f"Git update exception: {str(e)}"
     
+    confucius_repo_update_status = {
+        "success": False,
+        "message": "",
+        "output": "",
+        "repo": str(confucius_persistent_path),
+        "remote": CONFUCIUS_REPO_URL,
+    }
+    try:
+        if not (confucius_persistent_path / ".git").exists():
+            confucius_repo_update_status["message"] = (
+                f"Skipped git update because {confucius_persistent_path} has no .git directory"
+            )
+        else:
+            subprocess.run(
+                ["git", "remote", "set-url", "origin", CONFUCIUS_REPO_URL],
+                capture_output=True,
+                text=True,
+                cwd=str(confucius_persistent_path),
+            )
+            fetch_result = subprocess.run(
+                ["git", "fetch", "origin"],
+                capture_output=True,
+                text=True,
+                cwd=str(confucius_persistent_path),
+            )
+            if fetch_result.returncode != 0:
+                confucius_repo_update_status["message"] = (
+                    f"Confucius git fetch failed: {fetch_result.stderr.strip()}"
+                )
+                confucius_repo_update_status["output"] = fetch_result.stderr.strip()
+            else:
+                branch_result = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(confucius_persistent_path),
+                )
+                current_branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "main"
+                if not current_branch or current_branch == "HEAD":
+                    current_branch = "main"
+                origin_ref = f"origin/{current_branch}"
+                reset_result = subprocess.run(
+                    ["git", "reset", "--hard", origin_ref],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(confucius_persistent_path),
+                )
+                if reset_result.returncode == 0:
+                    confucius_repo_update_status["success"] = True
+                    confucius_repo_update_status["message"] = f"Confucius repository updated to {origin_ref}"
+                    confucius_repo_update_status["output"] = reset_result.stdout.strip()
+                else:
+                    confucius_repo_update_status["message"] = (
+                        f"Confucius git reset failed: {reset_result.stderr.strip()}"
+                    )
+                    confucius_repo_update_status["output"] = (
+                        reset_result.stderr.strip() or reset_result.stdout.strip()
+                    )
+    except Exception as exc:
+        confucius_repo_update_status["message"] = f"Confucius git update exception: {exc}"
+    print(confucius_repo_update_status["message"])
+
+    try:
+        confucius_vllm_patch_status = _ensure_confucius_vllm_patch_compatibility(
+            confucius_persistent_path
+        )
+    except Exception as exc:
+        confucius_vllm_patch_status = {
+            "success": False,
+            "changed": False,
+            "path": str(
+                confucius_persistent_path
+                / "confuciustts"
+                / "llm"
+                / "vllm_patch.py"
+            ),
+            "message": f"Confucius vLLM patch compatibility update failed: {exc}",
+        }
+    print(confucius_vllm_patch_status["message"])
+
     # Step 3: Download model repo directly into persistent checkpoints folder
     checkpoints_dir = persistent_app_path / "checkpoints"
     checkpoints_dir.mkdir(exist_ok=True)
@@ -300,6 +528,149 @@ print("Model download completed!")
             status = "ready" if config_path.exists() and ckpt_ready else "missing"
             print(f"      {key}: {path} ({status})")
 
+        confucius_checkpoints_dir = confucius_persistent_path / "checkpoints"
+        confucius_pretrained_dir = confucius_persistent_path / "pretrained"
+        confucius_outputs_dir = confucius_persistent_path / "outputs" / "api"
+        confucius_checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        confucius_pretrained_dir.mkdir(parents=True, exist_ok=True)
+        confucius_outputs_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"Downloading Confucius4-TTS assets to: {confucius_persistent_path}")
+        confucius_download_code = f"""
+from pathlib import Path
+from huggingface_hub import hf_hub_download, snapshot_download
+
+checkpoints = Path({str(confucius_checkpoints_dir)!r})
+pretrained = Path({str(confucius_pretrained_dir)!r})
+checkpoints.mkdir(parents=True, exist_ok=True)
+pretrained.mkdir(parents=True, exist_ok=True)
+
+model_files = [
+    "t2s_model.safetensors",
+    "s2a_model.pt",
+    "wav2vec2bert_stats.pt",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+]
+for filename in model_files:
+    print("Downloading Confucius model file: " + filename)
+    hf_hub_download(
+        repo_id={CONFUCIUS_MODEL_REPO_ID!r},
+        filename=filename,
+        local_dir=str(checkpoints),
+        local_dir_use_symlinks=False,
+    )
+
+print("Downloading Wav2Vec2-BERT speaker/semantic model...")
+snapshot_download(
+    repo_id={CONFUCIUS_W2V_REPO_ID!r},
+    local_dir=str(pretrained / "w2v-bert-2.0"),
+    local_dir_use_symlinks=False,
+)
+
+print("Downloading BigVGAN vocoder...")
+snapshot_download(
+    repo_id={CONFUCIUS_BIGVGAN_REPO_ID!r},
+    local_dir=str(pretrained / "bigvgan_v2_22khz_80band_256x"),
+    local_dir_use_symlinks=False,
+)
+
+print("Downloading CAMPPlus speaker encoder...")
+hf_hub_download(
+    repo_id={CONFUCIUS_CAMPPLUS_REPO_ID!r},
+    filename={CONFUCIUS_CAMPPLUS_FILENAME!r},
+    local_dir=str(pretrained / "campplus"),
+    local_dir_use_symlinks=False,
+)
+print("Confucius asset download completed.")
+"""
+        confucius_download_result = subprocess.run(
+            ["python", "-c", confucius_download_code],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(confucius_persistent_path),
+        )
+        if confucius_download_result.stdout.strip():
+            print(confucius_download_result.stdout.strip())
+        if confucius_download_result.stderr.strip():
+            print(confucius_download_result.stderr.strip())
+
+        confucius_base_config = confucius_persistent_path / "config" / "inference_config.yaml"
+        confucius_modal_config = confucius_persistent_path / CONFUCIUS_FASTAPI_CONFIG
+        config_text = confucius_base_config.read_text(encoding="utf-8")
+        config_text = config_text.replace(
+            "  w2v_bert_path: facebook/w2v-bert-2.0",
+            "  w2v_bert_path: ./pretrained/w2v-bert-2.0",
+        )
+        config_text = config_text.replace(
+            "  vocoder_path: nvidia/bigvgan_v2_22khz_80band_256x",
+            "  vocoder_path: ./pretrained/bigvgan_v2_22khz_80band_256x",
+        )
+        confucius_modal_config.write_text(config_text, encoding="utf-8")
+        print(f"Wrote Confucius Modal config: {confucius_modal_config}")
+
+        confucius_vllm_dir = confucius_checkpoints_dir / "t2s-vllm"
+        confucius_vllm_ready = (
+            (confucius_vllm_dir / "model.safetensors").exists()
+            and (confucius_vllm_dir / "config.json").exists()
+        )
+        if confucius_vllm_ready:
+            print(f"Confucius vLLM directory already ready: {confucius_vllm_dir}")
+        else:
+            confucius_python = Path(CONFUCIUS_PYTHON)
+            if not confucius_python.exists():
+                raise FileNotFoundError(f"Confucius image venv Python not found: {confucius_python}")
+
+            convert_cmd = [
+                str(confucius_python),
+                "tools/convert_t2s_vllm.py",
+                "--config",
+                str(confucius_modal_config),
+                "--output",
+                str(confucius_vllm_dir),
+            ]
+            local_t2s_checkpoint = confucius_checkpoints_dir / "t2s_model.safetensors"
+            if local_t2s_checkpoint.exists():
+                convert_cmd.extend(["--checkpoint", str(local_t2s_checkpoint)])
+
+            convert_env = dict(os.environ)
+            convert_env["PYTHONPATH"] = str(confucius_persistent_path)
+            convert_env.setdefault("HF_HOME", f"{PERSISTENT_CACHE_DIR}/huggingface")
+            convert_env.setdefault("TORCH_HOME", f"{PERSISTENT_CACHE_DIR}/torch")
+            print(f"Converting Confucius T2S model for vLLM: {' '.join(convert_cmd)}")
+            convert_result = subprocess.run(
+                convert_cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=str(confucius_persistent_path),
+                env=convert_env,
+            )
+            if convert_result.stdout.strip():
+                print(convert_result.stdout.strip())
+            if convert_result.stderr.strip():
+                print(convert_result.stderr.strip())
+
+        confucius_vllm_ready = (
+            (confucius_vllm_dir / "model.safetensors").exists()
+            and (confucius_vllm_dir / "config.json").exists()
+        )
+        confucius_ready = (
+            (confucius_persistent_path / "fastapi_app.py").exists()
+            and confucius_modal_config.exists()
+            and confucius_vllm_ready
+            and (confucius_persistent_path / "resources" / "voice.mp3").exists()
+        )
+        print(f"Confucius4-TTS readiness: {confucius_ready}")
+        print(f"  repo: {confucius_persistent_path}")
+        print(f"  config: {confucius_modal_config}")
+        print(f"  checkpoints: {confucius_checkpoints_dir}")
+        print(f"  pretrained: {confucius_pretrained_dir}")
+        print(f"  vLLM: {confucius_vllm_dir} ({'ready' if confucius_vllm_ready else 'missing'})")
+
         # Step 5: List complete application structure for verification
         print("\n📋 Persistent application structure:")
         def show_tree(path, prefix="", max_depth=3, current_depth=0):
@@ -337,7 +708,19 @@ print("Model download completed!")
                 and ((path / "model.safetensors").exists() or (path / "model.ckpt").exists())
                 for key, path in stable_audio_dirs.items()
             },
-            "repo_update": repo_update_status
+            "repo_update": repo_update_status,
+            "confucius_repo_update": confucius_repo_update_status,
+            "confucius_vllm_patch": confucius_vllm_patch_status,
+            "confucius": {
+                "repo_dir": str(confucius_persistent_path),
+                "config": str(confucius_modal_config),
+                "checkpoints_dir": str(confucius_checkpoints_dir),
+                "pretrained_dir": str(confucius_pretrained_dir),
+                "outputs_dir": str(confucius_outputs_dir),
+                "vllm_dir": str(confucius_vllm_dir),
+                "ready": confucius_ready,
+                "vllm_ready": confucius_vllm_ready,
+            },
         }
         
     except subprocess.CalledProcessError as e:
@@ -348,7 +731,9 @@ print("Model download completed!")
             "message": error_msg,
             "stdout": e.stdout,
             "stderr": e.stderr,
-            "repo_update": repo_update_status
+            "repo_update": repo_update_status,
+            "confucius_repo_update": confucius_repo_update_status,
+            "confucius_vllm_patch": locals().get("confucius_vllm_patch_status"),
         }
     except Exception as e:
         error_msg = f"Model preparation failed: {str(e)}"
@@ -356,7 +741,9 @@ print("Model download completed!")
         return {
             "status": "error",
             "message": error_msg,
-            "repo_update": repo_update_status
+            "repo_update": repo_update_status,
+            "confucius_repo_update": confucius_repo_update_status,
+            "confucius_vllm_patch": locals().get("confucius_vllm_patch_status"),
         }
 
 
@@ -391,7 +778,9 @@ def clear_cache():
         "/persistent_cache/transformers",
         "/persistent_cache/cuda_cache",
         "/persistent_cache/vllm_cache",
-        "/persistent_cache/torch_compile_cache"  # torch.compile artifacts
+        "/persistent_cache/torch_compile_cache",  # torch.compile artifacts
+        "/persistent_cache/confucius",
+        "/persistent_cache/triton",
     ]
     
     # Clear app-specific caches (but keep the app and models)
@@ -402,7 +791,8 @@ def clear_cache():
             persistent_app_path / "speaker_presets",
             persistent_app_path / "emotion_cache",
             persistent_app_path / "emb_cache",
-            persistent_app_path / "outputs"
+            persistent_app_path / "outputs",
+            persistent_app_path / CONFUCIUS_APP_SUBDIR / "outputs",
         ]
     
     # Calculate total cache size before clearing
@@ -536,11 +926,13 @@ def legacy_serve_without_snapshot():
     # 1.1: Set cache environment variables (before any Python imports that use them)
     cache_env_vars = {
         "HF_HOME": "/persistent_cache/huggingface",
+        "HUGGINGFACE_HUB_CACHE": "/persistent_cache/huggingface/hub",
         "TORCH_HOME": "/persistent_cache/torch",
         "TRANSFORMERS_CACHE": "/persistent_cache/transformers",
         "CUDA_CACHE_PATH": "/persistent_cache/cuda_cache",
         "VLLM_CACHE": "/persistent_cache/vllm_cache",
         "TORCHINDUCTOR_CACHE_DIR": "/persistent_cache/torch_compile_cache",
+        "TRITON_CACHE_DIR": "/persistent_cache/triton",
         "XDG_CACHE_HOME": "/persistent_cache",
         "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
         "TORCHINDUCTOR_AUTOGRAD_CACHE": "1",
@@ -558,7 +950,9 @@ def legacy_serve_without_snapshot():
         "/persistent_cache/transformers",
         "/persistent_cache/cuda_cache",
         "/persistent_cache/vllm_cache",
-        "/persistent_cache/torch_compile_cache"
+        "/persistent_cache/torch_compile_cache",
+        "/persistent_cache/confucius",
+        "/persistent_cache/triton",
     ]
     
     print("\n   Creating cache directories:")
@@ -655,6 +1049,22 @@ def legacy_serve_without_snapshot():
         str(GPU_MEMORY_UTILIZATION),
         "--qwenemo_gpu_memory_utilization",
         str(QWENEMO_GPU_MEMORY_UTILIZATION),
+        "--tts_backend",
+        DEFAULT_TTS_BACKEND,
+        "--confucius_repo_dir",
+        str(persistent_app_path / CONFUCIUS_APP_SUBDIR),
+        "--confucius_host",
+        "127.0.0.1",
+        "--confucius_port",
+        str(CONFUCIUS_PORT),
+        "--confucius_start_command",
+        _build_confucius_start_command(persistent_app_path / CONFUCIUS_APP_SUBDIR),
+        "--confucius_start_timeout",
+        str(CONFUCIUS_STARTUP_TIMEOUT),
+        "--confucius_request_timeout",
+        str(CONFUCIUS_REQUEST_TIMEOUT),
+        "--confucius_vllm_gpu_memory_utilization",
+        str(CONFUCIUS_GPU_MEMORY_UTILIZATION),
     ]
     
     print(f"   Command: {' '.join(cmd)}")
@@ -723,6 +1133,57 @@ def _wait_ready(proc: subprocess.Popen, *, timeout_seconds: int) -> None:
     )
 
 
+def _build_confucius_start_command(confucius_repo_path: Path) -> str:
+    confucius_config_path = confucius_repo_path / CONFUCIUS_FASTAPI_CONFIG
+    confucius_vllm_dir = confucius_repo_path / "checkpoints" / "t2s-vllm"
+    confucius_output_dir = confucius_repo_path / "outputs" / "api"
+    confucius_compile_cache_dir = (
+        Path(PERSISTENT_CACHE_DIR) / "confucius" / "torchinductor"
+    )
+    confucius_warmup_voice = confucius_repo_path / "resources" / "voice.mp3"
+
+    parts = [
+        "env",
+        f"PYTHONPATH={confucius_repo_path}{os.pathsep}{PERSISTENT_APP_DIR}",
+        CONFUCIUS_PYTHON,
+        "-u",
+        "fastapi_app.py",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(CONFUCIUS_PORT),
+        "--config",
+        str(confucius_config_path),
+        "--vllm-model-dir",
+        str(confucius_vllm_dir),
+        "--vllm-gpu-memory-utilization",
+        str(CONFUCIUS_GPU_MEMORY_UTILIZATION),
+        "--vllm-attention-backend",
+        "FLASHINFER",
+        "--vllm-prefix-mode",
+        "auto",
+        "--vllm-latent-mode",
+        "auto",
+        "--output-dir",
+        str(confucius_output_dir),
+        "--compile-cache-dir",
+        str(confucius_compile_cache_dir),
+        "--warmup",
+        "--warmup-mode",
+        "background",
+        "--warmup-prompt-wav",
+        str(confucius_warmup_voice),
+        "--compile-s2a",
+        "--gpu-stage-concurrency",
+        "1",
+        "--postprocess-concurrency",
+        "2",
+        "--inference-workers",
+        "1",
+    ]
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
 def _configure_persistent_runtime():
     from pathlib import Path
 
@@ -730,11 +1191,13 @@ def _configure_persistent_runtime():
 
     cache_env_vars = {
         "HF_HOME": "/persistent_cache/huggingface",
+        "HUGGINGFACE_HUB_CACHE": "/persistent_cache/huggingface/hub",
         "TORCH_HOME": "/persistent_cache/torch",
         "TRANSFORMERS_CACHE": "/persistent_cache/transformers",
         "CUDA_CACHE_PATH": "/persistent_cache/cuda_cache",
         "VLLM_CACHE": "/persistent_cache/vllm_cache",
         "TORCHINDUCTOR_CACHE_DIR": "/persistent_cache/torch_compile_cache",
+        "TRITON_CACHE_DIR": "/persistent_cache/triton",
         "XDG_CACHE_HOME": "/persistent_cache",
         "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
         "TORCHINDUCTOR_AUTOGRAD_CACHE": "1",
@@ -758,6 +1221,8 @@ def _configure_persistent_runtime():
         "/persistent_cache/cuda_cache",
         "/persistent_cache/vllm_cache",
         "/persistent_cache/torch_compile_cache",
+        "/persistent_cache/confucius",
+        "/persistent_cache/triton",
     ]
     for cache_dir in cache_dirs:
         os.makedirs(cache_dir, exist_ok=True)
@@ -809,6 +1274,78 @@ def _configure_persistent_runtime():
     print(f"Stable Audio 3 root: {stable_audio_root}")
     print(f"Stable Audio 3 readiness: {stable_audio_ready}")
 
+    confucius_repo_path = persistent_app_path / CONFUCIUS_APP_SUBDIR
+    confucius_config_path = confucius_repo_path / CONFUCIUS_FASTAPI_CONFIG
+    confucius_vllm_dir = confucius_repo_path / "checkpoints" / "t2s-vllm"
+    confucius_output_dir = confucius_repo_path / "outputs" / "api"
+    confucius_compile_cache_dir = Path(PERSISTENT_CACHE_DIR) / "confucius" / "torchinductor"
+    confucius_profile_dir = confucius_repo_path / "outputs" / "profiles"
+    confucius_warmup_voice = confucius_repo_path / "resources" / "voice.mp3"
+
+    required_confucius_paths = {
+        "repo": confucius_repo_path,
+        "fastapi_app": confucius_repo_path / "fastapi_app.py",
+        "config": confucius_config_path,
+        "vllm_model": confucius_vllm_dir / "model.safetensors",
+        "vllm_config": confucius_vllm_dir / "config.json",
+        "venv_python": Path(CONFUCIUS_PYTHON),
+    }
+    missing_confucius_paths = [
+        f"{name}: {path}"
+        for name, path in required_confucius_paths.items()
+        if not path.exists()
+    ]
+    if missing_confucius_paths:
+        raise FileNotFoundError(
+            "Confucius4-TTS persistent setup is incomplete. Run prepare_model first. "
+            + "; ".join(missing_confucius_paths)
+        )
+
+    for path in (
+        confucius_output_dir,
+        confucius_compile_cache_dir,
+        confucius_profile_dir,
+        Path(PERSISTENT_CACHE_DIR) / "triton",
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+    confucius_env_vars = {
+        "CONFUCIUS_TTS_CONFIG": str(confucius_config_path),
+        "CONFUCIUS_T2S_VLLM_DIR": str(confucius_vllm_dir),
+        "CONFUCIUS_API_OUTPUT_DIR": str(confucius_output_dir),
+        "CONFUCIUS_COMPILE_CACHE_DIR": str(confucius_compile_cache_dir),
+        "CONFUCIUS_PROFILE_DIR": str(confucius_profile_dir),
+        "CONFUCIUS_WARMUP_PROMPT_WAV": str(confucius_warmup_voice),
+        "CONFUCIUS_WARMUP": "1",
+        "CONFUCIUS_WARMUP_MODE": "background",
+        "CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION": str(CONFUCIUS_GPU_MEMORY_UTILIZATION),
+        "CONFUCIUS_VLLM_ATTENTION_BACKEND": "FLASHINFER",
+        "CONFUCIUS_VLLM_PREFIX_MODE": "auto",
+        "CONFUCIUS_VLLM_LATENT_MODE": "auto",
+        "CONFUCIUS_USE_TORCH_COMPILE": "1",
+        "CONFUCIUS_GPU_STAGE_CONCURRENCY": "1",
+        "CONFUCIUS_POSTPROCESS_CONCURRENCY": "2",
+        "CONFUCIUS_API_INFERENCE_WORKERS": "1",
+        "CONFUCIUS_REFERENCE_CACHE_SIZE": "100",
+    }
+    print("Configuring Confucius4-TTS runtime environment:")
+    for key, value in confucius_env_vars.items():
+        os.environ[key] = value
+        print(f"  {key}={value}")
+
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    pythonpath_parts = [str(persistent_app_path)]
+    if existing_pythonpath:
+        confucius_pythonpath = str(confucius_repo_path).rstrip(os.sep)
+        for part in existing_pythonpath.split(os.pathsep):
+            part = part.strip()
+            if not part or part in pythonpath_parts:
+                continue
+            if part.rstrip(os.sep) == confucius_pythonpath:
+                continue
+            pythonpath_parts.append(part)
+    os.environ["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+
     if not os.environ.get(INTERNAL_TOKEN_ENV):
         os.environ[INTERNAL_TOKEN_ENV] = uuid.uuid4().hex
 
@@ -858,6 +1395,22 @@ class IndexTTSVllmServer:
             str(GPU_MEMORY_UTILIZATION),
             "--qwenemo_gpu_memory_utilization",
             str(QWENEMO_GPU_MEMORY_UTILIZATION),
+            "--tts_backend",
+            DEFAULT_TTS_BACKEND,
+            "--confucius_repo_dir",
+            str(persistent_app_path / CONFUCIUS_APP_SUBDIR),
+            "--confucius_host",
+            "127.0.0.1",
+            "--confucius_port",
+            str(CONFUCIUS_PORT),
+            "--confucius_start_command",
+            _build_confucius_start_command(persistent_app_path / CONFUCIUS_APP_SUBDIR),
+            "--confucius_start_timeout",
+            str(CONFUCIUS_STARTUP_TIMEOUT),
+            "--confucius_request_timeout",
+            str(CONFUCIUS_REQUEST_TIMEOUT),
+            "--confucius_vllm_gpu_memory_utilization",
+            str(CONFUCIUS_GPU_MEMORY_UTILIZATION),
             "--use_torch_compile",
         ]
         print(f"Starting FastAPI server: {' '.join(cmd)}")
