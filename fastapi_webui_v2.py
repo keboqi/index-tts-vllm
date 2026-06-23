@@ -566,6 +566,13 @@ AUDIO_GENERATION_MARGIN_MS = 20
 TRANSLATION_TTS_CONCURRENCY = 100
 MIN_SPEECH_DURATION_MS = 3000
 MAX_MERGE_INTERVAL_MS = 0
+CONFUCIUS_RECOVERY_RETRY_ATTEMPTS = _env_int("CONFUCIUS_RECOVERY_RETRY_ATTEMPTS", 8, min_value=1, max_value=50)
+CONFUCIUS_RECOVERY_RETRY_DELAY_SECONDS = _env_float(
+    "CONFUCIUS_RECOVERY_RETRY_DELAY_SECONDS",
+    2.0,
+    min_value=0.1,
+    max_value=30.0,
+)
 DEFAULT_GENERATED_VOLUME_PERCENT = 100.0
 MIN_GENERATED_VOLUME_PERCENT = 10.0
 MAX_GENERATED_VOLUME_PERCENT = 300.0
@@ -4111,7 +4118,7 @@ class ManagedConfuciusBackend:
                 return health
 
             restart_attempted = False
-            if self._process_running() and self._last_ready_at is not None:
+            if self._process_running() and health is None and self._last_ready_at is not None:
                 last_ready_age = time.monotonic() - self._last_ready_at
                 if last_ready_age >= self._unhealthy_grace():
                     await self._restart_locked(
@@ -4158,6 +4165,8 @@ class ManagedConfuciusBackend:
 
                 health = await self.health(timeout=2.0)
                 if health and health.get("model_loaded"):
+                    continue
+                if health is not None:
                     continue
 
                 if not self._process_running():
@@ -4209,6 +4218,69 @@ class ManagedConfuciusBackend:
             path = APP_DIR / path
         return str(path.resolve())
 
+    async def _post_audio_once(self, payload: Dict[str, Any], request_timeout: float) -> bytes:
+        return await _run_blocking(
+            _http_json_audio_post_sync,
+            f"{self.base_url}/v1/tts/audio",
+            payload,
+            request_timeout,
+        )
+
+    async def _wait_after_transient_synthesis_error(self, exc: Exception, attempt: int) -> None:
+        delay = min(
+            max(0.1, float(CONFUCIUS_RECOVERY_RETRY_DELAY_SECONDS or 2.0)) * attempt,
+            15.0,
+        )
+        print(
+            "[Confucius4-TTS] Backend is loading/reloading; "
+            f"waiting {delay:.1f}s before retry {attempt + 1}: {exc}"
+        )
+        await asyncio.sleep(delay)
+        if not self._process_running():
+            try:
+                await self.ensure_ready()
+            except Exception as ready_exc:
+                print(f"[Confucius4-TTS] Readiness check during recovery failed: {ready_exc}")
+            return
+        health = await self.health(timeout=2.0)
+        if health and health.get("model_loaded"):
+            print("[Confucius4-TTS] Backend reports ready after recovery wait.")
+
+    async def _post_audio_with_recovery(
+        self,
+        payload: Dict[str, Any],
+        request_timeout: float,
+    ) -> bytes:
+        max_attempts = max(1, int(CONFUCIUS_RECOVERY_RETRY_ATTEMPTS or 1))
+        last_exc: Optional[Exception] = None
+        transport_restart_done = False
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await self._post_audio_once(payload, request_timeout)
+            except Exception as exc:
+                last_exc = exc
+                if self._is_transient_loading_error(exc):
+                    if attempt >= max_attempts:
+                        break
+                    await self._wait_after_transient_synthesis_error(exc, attempt)
+                    continue
+                if not self._is_retryable_synthesis_error(exc):
+                    raise
+                if attempt >= max_attempts:
+                    break
+                if not transport_restart_done:
+                    print(f"[Confucius4-TTS] Synthesis transport failed, restarting once: {exc}")
+                    await self.restart("synthesis transport failed")
+                    await self.ensure_ready()
+                    transport_restart_done = True
+                    continue
+                await asyncio.sleep(min(1.0 * attempt, 5.0))
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Confucius4-TTS synthesis failed without an exception.")
+
     async def synthesize_to_file(
         self,
         *,
@@ -4224,51 +4296,46 @@ class ManagedConfuciusBackend:
         self._active_requests += 1
         try:
             await self.ensure_ready()
-        finally:
-            self._active_requests = max(0, self._active_requests - 1)
 
-        lang = _resolve_confucius_language(language, text)
-        payload: Dict[str, Any] = {
-            "text": text,
-            "lang": lang,
-            "output_format": "wav",
-            "diffusion_steps": max(1, int(diffusion_steps or 10)),
-            "max_text_tokens": max(1, int(max_text_tokens_per_sentence or 80)),
-            "verbose": bool(verbose),
-        }
-        resolved_prompt = self._resolve_prompt_path(prompt_wav)
-        if resolved_prompt:
-            payload["prompt_wav"] = resolved_prompt
-        if speech_length and int(speech_length) > 0:
-            payload["target_duration_seconds"] = max(0.0, int(speech_length) / 1000.0)
+            lang = _resolve_confucius_language(language, text)
+            payload: Dict[str, Any] = {
+                "text": text,
+                "lang": lang,
+                "output_format": "wav",
+                "diffusion_steps": max(1, int(diffusion_steps or 10)),
+                "max_text_tokens": max(1, int(max_text_tokens_per_sentence or 80)),
+                "verbose": bool(verbose),
+            }
+            resolved_prompt = self._resolve_prompt_path(prompt_wav)
+            if resolved_prompt:
+                payload["prompt_wav"] = resolved_prompt
+            if speech_length and int(speech_length) > 0:
+                payload["target_duration_seconds"] = max(0.0, int(speech_length) / 1000.0)
 
-        request_timeout = max(1.0, float(SETTINGS.confucius_request_timeout))
-        self._active_requests += 1
-        try:
-            try:
-                audio_bytes = await _run_blocking(
-                    _http_json_audio_post_sync,
-                    f"{self.base_url}/v1/tts/audio",
-                    payload,
-                    request_timeout,
-                )
-            except Exception as exc:
-                if not self._is_retryable_synthesis_error(exc):
-                    raise
-                print(f"[Confucius4-TTS] Synthesis request failed, restarting once: {exc}")
-                await self.restart("synthesis request failed")
-                await self.ensure_ready()
-                audio_bytes = await _run_blocking(
-                    _http_json_audio_post_sync,
-                    f"{self.base_url}/v1/tts/audio",
-                    payload,
-                    request_timeout,
-                )
+            request_timeout = max(1.0, float(SETTINGS.confucius_request_timeout))
+            audio_bytes = await self._post_audio_with_recovery(payload, request_timeout)
         finally:
             self._active_requests = max(0, self._active_requests - 1)
 
         await async_write_file(output_path, audio_bytes)
         return output_path
+
+    @staticmethod
+    def _is_transient_loading_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        if "confucius4-tts http 503:" not in message:
+            return False
+        transient_markers = (
+            "model is not loaded",
+            "tts model is not loaded",
+            "vllm backend is not loaded",
+            "engine is dead",
+            "enginedeaderror",
+            "loading",
+            "reloading",
+            "reload",
+        )
+        return any(marker in message for marker in transient_markers)
 
     @staticmethod
     def _is_retryable_synthesis_error(exc: Exception) -> bool:
@@ -4299,6 +4366,7 @@ class ManagedConfuciusBackend:
             "health": health,
             "want_running": self._should_keep_running(),
             "active_requests": self._active_requests,
+            "recovery_retry_attempts": max(1, int(CONFUCIUS_RECOVERY_RETRY_ATTEMPTS or 1)),
             "keepalive_interval": self._keepalive_interval(),
             "unhealthy_grace": self._unhealthy_grace(),
             "detach_process": SETTINGS.confucius_detach_process,
