@@ -5,8 +5,9 @@ Provides interface for Voice Design feature with Speaker Preset integration.
 
 from typing import Optional, Dict, Any
 import os
-import tempfile
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -45,18 +46,25 @@ class Qwen3VoiceDesignManager:
         "German", "French", "Russian", "Portuguese", "Spanish", "Italian"
     ]
     
-    def __init__(self, config: Qwen3TTSConfig, preset_manager=None):
+    def __init__(self, config: Qwen3TTSConfig, preset_manager=None, reference_dir: Optional[Path] = None):
         """
         Initialize Voice Design Manager.
         
         Args:
             config: Qwen3TTS configuration
             preset_manager: SpeakerPresetManager instance for saving voices as presets
+            reference_dir: Directory used for durable raw reference audio files
         """
         self.config = config
         self.preset_manager = preset_manager
+        self.reference_dir = Path(reference_dir or (Path("speaker_presets") / "references"))
         self._voice_design_model = None
         self._last_generated: Optional[DesignedVoiceResult] = None
+
+    @staticmethod
+    def _safe_reference_basename(name: str) -> str:
+        safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in name).strip("_")
+        return safe_name or "voice_design"
         
     @property
     def voice_design_model(self):
@@ -149,11 +157,11 @@ class Qwen3VoiceDesignManager:
         if result is None:
             raise ValueError("No voice design result available to save. Generate one first.")
         
-        # Create temporary file with the audio
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            sf.write(tmp.name, result.audio_waveform, result.sample_rate)
-            temp_path = tmp.name
-        
+        self.reference_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = self._safe_reference_basename(preset_name)
+        durable_audio_path = self.reference_dir / f"{safe_name}_{uuid.uuid4().hex[:8]}.wav"
+        sf.write(str(durable_audio_path), result.audio_waveform, result.sample_rate)
+
         try:
             # Use preset manager to create the preset from the audio file
             preset_description = description or f"Voice Design: {result.voice_description[:100]}"
@@ -161,12 +169,21 @@ class Qwen3VoiceDesignManager:
             # Call SpeakerPresetManager.add_speaker_preset()
             success = self.preset_manager.add_speaker_preset(
                 preset_name=preset_name,
-                audio_path=temp_path,
+                audio_path=str(durable_audio_path),
                 description=preset_description,
             )
             
             if not success:
                 raise ValueError(f"Failed to add preset '{preset_name}' to speaker preset manager")
+
+            presets = getattr(self.preset_manager, "presets", None)
+            if isinstance(presets, dict):
+                preset_entry = presets.get(preset_name)
+                if isinstance(preset_entry, dict) and preset_entry.get("audio_path") != str(durable_audio_path):
+                    preset_entry["audio_path"] = str(durable_audio_path)
+                    save_presets = getattr(self.preset_manager, "_save_presets", None)
+                    if callable(save_presets):
+                        save_presets()
             
             print(f"[Qwen3-TTS] Saved preset '{preset_name}' from voice design")
             
@@ -175,11 +192,12 @@ class Qwen3VoiceDesignManager:
                 "preset_name": preset_name,
                 "description": preset_description,
                 "source": "voice_design",
+                "audio_path": str(durable_audio_path),
             }
-        finally:
-            # Clean up temp file
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+        except Exception:
+            if os.path.exists(durable_audio_path):
+                os.remove(durable_audio_path)
+            raise
     
     def _build_gen_kwargs(self, **kwargs) -> Dict[str, Any]:
         """Build generation kwargs with defaults from config."""

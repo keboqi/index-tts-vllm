@@ -4292,6 +4292,7 @@ class ManagedConfuciusBackend:
         diffusion_steps: int = 10,
         max_text_tokens_per_sentence: int = 80,
         verbose: bool = False,
+        cache_prompt_audio: bool = True,
     ) -> str:
         self._active_requests += 1
         try:
@@ -4305,6 +4306,7 @@ class ManagedConfuciusBackend:
                 "diffusion_steps": max(1, int(diffusion_steps or 10)),
                 "max_text_tokens": max(1, int(max_text_tokens_per_sentence or 80)),
                 "verbose": bool(verbose),
+                "cache_prompt_audio": bool(cache_prompt_audio),
             }
             resolved_prompt = self._resolve_prompt_path(prompt_wav)
             if resolved_prompt:
@@ -10543,6 +10545,7 @@ async def _synthesize_translated_audio(
                     speaker_preset=preset_name,
                     emo_audio_prompt=emo_prompt_value,
                     emo_alpha=resolved_emotion_weight,
+                    cache_prompt_audio=not bool(spk_prompt_value),
                 )
             generated_audio = AudioSegment.from_file(inference_path)
             if abs(resolved_volume_percent - DEFAULT_GENERATED_VOLUME_PERCENT) >= 0.01:
@@ -11595,6 +11598,7 @@ async def _synthesize_tts_to_file(
     emo_alpha: float = DEFAULT_EMOTION_WEIGHT,
     use_emo_text: bool = False,
     emo_text: Optional[str] = None,
+    cache_prompt_audio: bool = True,
 ) -> str:
     backend = _normalize_tts_backend(tts_backend, SETTINGS.tts_backend)
     if backend == TTS_BACKEND_INDEX:
@@ -11630,6 +11634,7 @@ async def _synthesize_tts_to_file(
         diffusion_steps=diffusion_steps,
         max_text_tokens_per_sentence=max_text_tokens_per_sentence,
         verbose=verbose,
+        cache_prompt_audio=cache_prompt_audio,
     )
 
 
@@ -17574,7 +17579,8 @@ def get_voice_design_manager() -> Qwen3VoiceDesignManager:
         preset_manager = tts_instance.speaker_manager if tts_instance and tts_instance.is_ready() else None
         _voice_design_manager = Qwen3VoiceDesignManager(
             config=config,
-            preset_manager=preset_manager
+            preset_manager=preset_manager,
+            reference_dir=APP_DIR / SPEAKER_REFERENCE_DIR,
         )
     
     # Check if preset_manager was None during init but is now available
@@ -17661,6 +17667,14 @@ async def save_designed_voice_to_preset(request: SaveDesignedVoiceRequest):
                 description=request.description,
             )
         )
+
+        if isinstance(result, dict) and result.get("success") and result.get("audio_path"):
+            preview_result = await _create_speaker_preview_mp3(
+                str(result["audio_path"]),
+                request.preset_name,
+            )
+            if preview_result:
+                result["preview_url"] = _speaker_preview_url(request.preset_name)
         
         return result
     except ValueError as e:
