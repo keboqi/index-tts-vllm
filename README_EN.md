@@ -185,6 +185,7 @@ python fastapi_webui_v2.py [OPTIONS]
 - `--model_dir` (string): Path to model checkpoints directory (default: `checkpoints`).
 - `--is_fp16` (flag): Enable FP16 inference precision.
 - `--use_torch_compile` (flag): Enable `torch.compile` for faster model execution.
+- `--nvfp4` (flag): Selectively pack both TTS backends' DiT attention/FFN linears as native Blackwell NVFP4. This forces BF16 and `torch.compile` for the diffusion estimator.
 - `--gpu_memory_utilization` (float): vLLM GPU memory utilization limit (default: `0.25`).
 - `--tts_backend` (`index` or `confucius`): Default synthesis backend. The server default is `index`.
 - `--confucius_repo_dir` (string): Path to a sibling `Confucius4-TTS` checkout used for lazy startup (default: `../Confucius4-TTS`).
@@ -212,6 +213,20 @@ python fastapi_webui_v2.py \
 ```
 
 The Confucius backend supports more target languages for speech generation and translate/edit workflows (`en`, `zh`, `ja`, `ko`, `de`, `fr`, `es`, `id`, `it`, `th`, `pt`, `ru`, `ms`, `vi`). When `tts_backend=confucius`, IndexTTS text-based emotion controls are ignored. Speaker presets are saved after enhancement/trimming so the processed reference audio can be reused as Confucius `prompt_wav`.
+
+For experimental NVFP4 inference on an RTX PRO 6000 Blackwell, install the
+optional packages and start the server with one flag:
+
+```bash
+pip install -r requirements-nvfp4.txt
+python fastapi_webui_v2.py --nvfp4 --confucius_repo_dir ../Confucius4-TTS
+```
+
+The original checkpoints are not modified. NVFP4 conversion happens at startup
+and currently targets only the transformer attention and feed-forward linears;
+conditioning, normalization, output, attention softmax, and WaveNet operations remain
+BF16. Benchmark against BF16 because the 512-wide DiTs may be too small to
+recover dynamic activation-quantization overhead.
 
 ---
 

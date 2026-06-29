@@ -110,7 +110,15 @@ def _vllm_sleep_mode_enabled() -> bool:
 
 class IndexTTS2:
     def __init__(
-        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.15, qwenemo_gpu_memory_utilization=0.05, use_torch_compile=False
+        self,
+        model_dir="checkpoints",
+        is_fp16=False,
+        device=None,
+        use_cuda_kernel=None,
+        gpu_memory_utilization=0.15,
+        qwenemo_gpu_memory_utilization=0.05,
+        use_torch_compile=False,
+        nvfp4=False,
     ):
         """
         Args:
@@ -121,6 +129,8 @@ class IndexTTS2:
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device (default: None, which enables it automatically on CUDA).
             qwenemo_gpu_memory_utilization (float): GPU memory utilization for QwenEmotion vLLM engine (default: 0.05).
             use_torch_compile (bool): whether to use torch.compile for s2mel acceleration (default: False). Uses fullgraph=True with torch.split to avoid dynamic slicing issues.
+            nvfp4 (bool): selectively quantize S2Mel DiT attention/FFN linears to
+                native Blackwell NVFP4. Forces BF16 autocast and torch.compile.
         """
         if device is not None:
             self.device = device
@@ -143,9 +153,10 @@ class IndexTTS2:
         cfg_path = os.path.join(model_dir, "config.yaml")
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
-        self.dtype = torch.float16 if self.is_fp16 else None
+        self.nvfp4 = bool(nvfp4)
+        self.dtype = torch.bfloat16 if self.nvfp4 else (torch.float16 if self.is_fp16 else None)
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
-        self.use_torch_compile = use_torch_compile
+        self.use_torch_compile = bool(use_torch_compile or self.nvfp4)
 
         # =============================================================
         # vLLM ENGINE INITIALIZATION
@@ -272,6 +283,16 @@ class IndexTTS2:
             is_distributed=False,
         )
         self.s2mel = s2mel.to(self.device)
+        self.nvfp4_layers = ()
+        if self.nvfp4:
+            from indextts.s2mel.nvfp4 import enable_dit_nvfp4
+
+            print(">> Enabling selective NVFP4 for S2Mel DiT attention/FFN linears...")
+            self.nvfp4_layers = enable_dit_nvfp4(
+                self.s2mel.models['cfm'].estimator,
+                self.device,
+            )
+            print(f">> NVFP4 packed {len(self.nvfp4_layers)} S2Mel DiT linear layers")
         # Enable concurrent processing by increasing max_batch_size
         # The original max_batch_size=1 was the bottleneck preventing concurrency
         concurrent_batch_size = getattr(self.cfg, 'concurrent_batch_size', 100)  # Default to 100 concurrent requests

@@ -1065,6 +1065,11 @@ def legacy_serve_without_snapshot():
         str(CONFUCIUS_REQUEST_TIMEOUT),
         "--confucius_vllm_gpu_memory_utilization",
         str(CONFUCIUS_GPU_MEMORY_UTILIZATION),
+        "--confucius_attach_stdio",
+        "--confucius_keepalive_interval",
+        "60",
+        "--confucius_unhealthy_grace",
+        "30",
     ]
     
     print(f"   Command: {' '.join(cmd)}")
@@ -1411,6 +1416,11 @@ class IndexTTSVllmServer:
             str(CONFUCIUS_REQUEST_TIMEOUT),
             "--confucius_vllm_gpu_memory_utilization",
             str(CONFUCIUS_GPU_MEMORY_UTILIZATION),
+            "--confucius_attach_stdio",
+            "--confucius_keepalive_interval",
+            "60",
+            "--confucius_unhealthy_grace",
+            "30",
             "--use_torch_compile",
         ]
         print(f"Starting FastAPI server: {' '.join(cmd)}")
