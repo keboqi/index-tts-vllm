@@ -1,4 +1,0 @@
-# Optional native Blackwell NVFP4 path used by --nvfp4.
-# Install into a PyTorch/TorchAO-compatible environment.
-torchao==0.16.0
-mslk

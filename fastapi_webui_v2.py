@@ -286,7 +286,6 @@ class AppSettings:
     model_dir: str = "checkpoints"
     is_fp16: bool = False
     use_torch_compile: bool = False
-    nvfp4: bool = False
     gpu_memory_utilization: float = 0.15
     qwenemo_gpu_memory_utilization: float = 0.05
     tts_backend: str = TTS_BACKEND_INDEX
@@ -313,7 +312,6 @@ class AppSettings:
             model_dir=str(args.model_dir),
             is_fp16=bool(args.is_fp16),
             use_torch_compile=bool(args.use_torch_compile),
-            nvfp4=bool(getattr(args, "nvfp4", False)),
             gpu_memory_utilization=float(args.gpu_memory_utilization),
             qwenemo_gpu_memory_utilization=float(args.qwenemo_gpu_memory_utilization),
             tts_backend=_normalize_tts_backend(getattr(args, "tts_backend", TTS_BACKEND_INDEX)),
@@ -3544,12 +3542,6 @@ parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the
 parser.add_argument("--model_dir", type=str, default="checkpoints", help="Model checkpoints directory")
 parser.add_argument("--is_fp16", action="store_true", default=False, help="Fp16 infer")
 parser.add_argument("--use_torch_compile", action="store_true", default=False, help="use torch compile")
-parser.add_argument(
-    "--nvfp4",
-    action="store_true",
-    default=_env_flag("TTS_NVFP4", False),
-    help="Selectively quantize Index S2Mel and managed Confucius S2A DiT linears to Blackwell NVFP4",
-)
 parser.add_argument("--gpu_memory_utilization", type=float, default=0.15, help="GPU memory utilization")
 parser.add_argument("--qwenemo_gpu_memory_utilization", type=float, default=0.05, help="QwenEmotion GPU memory utilization")
 parser.add_argument("--tts_backend", type=str, default=TTS_BACKEND_INDEX, choices=sorted(ALLOWED_TTS_BACKENDS), help="Default TTS backend: index or confucius")
@@ -3614,7 +3606,6 @@ except SystemExit:
         model_dir="checkpoints",
         is_fp16=False,
         use_torch_compile=False,
-        nvfp4=_env_flag("TTS_NVFP4", False),
         gpu_memory_utilization=0.15,
         qwenemo_gpu_memory_utilization=0.05,
         tts_backend=TTS_BACKEND_INDEX,
@@ -3919,7 +3910,6 @@ class ManagedConfuciusBackend:
         confucius_gpu_util = str(SETTINGS.confucius_vllm_gpu_memory_utilization)
         env["CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION"] = confucius_gpu_util
         env["VLLM_GPU_MEMORY_UTILIZATION"] = confucius_gpu_util
-        env["CONFUCIUS_NVFP4"] = "1" if SETTINGS.nvfp4 else "0"
 
         env["PYTHONUNBUFFERED"] = "1"
         env.setdefault("PYTHONIOENCODING", "utf-8")
@@ -11230,7 +11220,6 @@ class TTSManager:
                     model_dir=SETTINGS.model_dir,
                     is_fp16=SETTINGS.is_fp16,
                     use_torch_compile=SETTINGS.use_torch_compile,
-                    nvfp4=SETTINGS.nvfp4,
                     gpu_memory_utilization=SETTINGS.gpu_memory_utilization,
                     qwenemo_gpu_memory_utilization=SETTINGS.qwenemo_gpu_memory_utilization
                 )
@@ -18230,7 +18219,6 @@ if __name__ == "__main__":
     print(f"📁 Model directory: {SETTINGS.model_dir}")
     print(f"🔧 GPU memory utilization: {SETTINGS.gpu_memory_utilization}")
     print(f"🎯 FP16 mode: {SETTINGS.is_fp16}")
-    print(f"🧮 NVFP4 DiT mode: {SETTINGS.nvfp4}")
     print(f"🌐 Server will start on {SETTINGS.host}:{SETTINGS.port}")
     print(f"🎯 Concurrent capacity: 100 requests")
     print(f"⚡ Single worker process for optimal GPU utilization")
