@@ -63,6 +63,7 @@ import zipfile
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import copy
+import gc
 from dataclasses import dataclass, field, replace
 
 # yt_dlp is imported lazily via _ensure_yt_dlp() to prevent its compat_utils
@@ -301,7 +302,7 @@ class AppSettings:
     confucius_request_timeout: float = 600.0
     confucius_keepalive_interval: float = 60.0
     confucius_unhealthy_grace: float = 30.0
-    confucius_vllm_gpu_memory_utilization: float = 0.2
+    confucius_vllm_gpu_memory_utilization: float = 0.15
 
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "AppSettings":
@@ -328,7 +329,7 @@ class AppSettings:
             confucius_keepalive_interval=float(getattr(args, "confucius_keepalive_interval", 60.0)),
             confucius_unhealthy_grace=float(getattr(args, "confucius_unhealthy_grace", 30.0)),
             confucius_vllm_gpu_memory_utilization=float(
-                getattr(args, "confucius_vllm_gpu_memory_utilization", 0.2)
+                getattr(args, "confucius_vllm_gpu_memory_utilization", 0.15)
             ),
         )
 
@@ -3590,7 +3591,7 @@ parser.add_argument(
 parser.add_argument(
     "--confucius_vllm_gpu_memory_utilization",
     type=float,
-    default=_env_float("CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION", 0.2, min_value=0.0, max_value=1.0),
+    default=_env_float("CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION", 0.15, min_value=0.0, max_value=1.0),
     help="Confucius4-TTS vLLM GPU memory utilization for managed startup",
 )
 
@@ -3695,6 +3696,122 @@ if not _APP_MODEL_DIR.is_absolute():
     _APP_MODEL_DIR = APP_DIR / _APP_MODEL_DIR
 STABLE_AUDIO3_CHECKPOINT_DIR = str((_APP_MODEL_DIR / "stable-audio-3").resolve())
 stable_audio3_manager = StableAudio3Manager(STABLE_AUDIO3_CHECKPOINT_DIR)
+
+# Serializes explicit model teardown with other manager operations.  Individual
+# inference backends retain their own generation locks as well.
+_model_manager_lock = asyncio.Lock()
+
+
+def _cuda_memory_summary() -> Dict[str, Any]:
+    """Return process-independent CUDA memory totals for the Models UI."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return {"available": False, "total_mb": 0, "used_mb": 0, "free_mb": 0}
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        mib = 1024 * 1024
+        return {
+            "available": True,
+            "total_mb": round(total_bytes / mib),
+            "used_mb": round((total_bytes - free_bytes) / mib),
+            "free_mb": round(free_bytes / mib),
+        }
+    except Exception as exc:
+        return {"available": False, "total_mb": 0, "used_mb": 0, "free_mb": 0, "error": str(exc)}
+
+
+def _release_cuda_cache() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _loaded_model_inventory() -> List[Dict[str, Any]]:
+    """Snapshot all lazily loaded models that can be reclaimed independently."""
+    models: List[Dict[str, Any]] = []
+    if tts_manager.is_ready():
+        vllm_state = tts_manager.vllm_status()
+        models.extend([
+            {
+                "key": "indextts_vllm",
+                "name": "IndexTTS vLLM",
+                "kind": "Core TTS",
+                "state": "sleeping" if vllm_state["indextts_vllm_sleeping"] else "loaded",
+            },
+            {
+                "key": "emotion_vllm",
+                "name": "Qwen Emotion vLLM",
+                "kind": "Emotion",
+                "state": "sleeping" if vllm_state["emotion_vllm_sleeping"] else "loaded",
+            },
+        ])
+    if confucius_backend_manager._process_running():
+        models.append({
+            "key": "confucius_vllm",
+            "name": "ConfuciusTTS vLLM",
+            "kind": "TTS Backend",
+            "state": "sleeping" if confucius_backend_manager._vllm_sleeping else "loaded",
+        })
+    for key in stable_audio3_manager.status().get("loaded_models", []):
+        models.append({"key": f"stable_audio:{key}", "name": f"Stable Audio 3 ({key})", "kind": "Stable Audio", "state": "loaded"})
+    if _voice_design_manager is not None and _voice_design_manager.is_model_loaded():
+        models.append({"key": "voice_design", "name": "Qwen3-TTS Voice Design", "kind": "Voice Design", "state": "loaded"})
+    if _enhancement_model is not None:
+        label = _current_enhancement_model_name or DEFAULT_ENHANCEMENT_MODEL
+        models.append({"key": "clearvoice_enhancement", "name": f"ClearVoice Enhancement ({label})", "kind": "ClearVoice", "state": "loaded"})
+    if _super_res_model is not None:
+        models.append({"key": "clearvoice_super_resolution", "name": "ClearVoice Super Resolution", "kind": "ClearVoice", "state": "loaded"})
+    if _audio_separator is not None:
+        label = _audio_separator_model_name or DEFAULT_AUDIO_SEPARATOR_MODEL
+        models.append({"key": "audio_separator", "name": f"Audio Separator ({label})", "kind": "Separation", "state": "loaded"})
+    return models
+
+
+def _unload_optional_model_sync(model_key: str) -> List[str]:
+    """Unload one optional model (or all), dropping every owning reference."""
+    global _voice_design_manager
+    global _enhancement_model, _super_res_model, _current_enhancement_model_name
+    global _audio_separator, _audio_separator_model_name
+    global _audio_separator_output_format, _audio_separator_use_soundfile
+
+    requested = (model_key or "").strip()
+    unload_all = requested == "all"
+    removed: List[str] = []
+
+    if unload_all or requested.startswith("stable_audio:"):
+        variant = None if unload_all else requested.split(":", 1)[1]
+        removed.extend(f"stable_audio:{key}" for key in stable_audio3_manager.unload(variant))
+
+    if (unload_all or requested == "voice_design") and _voice_design_manager is not None:
+        if _voice_design_manager.is_model_loaded():
+            _voice_design_manager._voice_design_model = None
+            _voice_design_manager.clear_last_generated()
+            removed.append("voice_design")
+
+    if (unload_all or requested == "clearvoice_enhancement") and _enhancement_model is not None:
+        _enhancement_model = None
+        _current_enhancement_model_name = None
+        removed.append("clearvoice_enhancement")
+
+    if (unload_all or requested == "clearvoice_super_resolution") and _super_res_model is not None:
+        _super_res_model = None
+        removed.append("clearvoice_super_resolution")
+
+    if (unload_all or requested == "audio_separator") and _audio_separator is not None:
+        _audio_separator = None
+        _audio_separator_model_name = None
+        _audio_separator_output_format = None
+        _audio_separator_use_soundfile = None
+        removed.append("audio_separator")
+
+    _release_cuda_cache()
+    return removed
 GEMINI_CACHE_DIR = str((ROOT_OUTPUT_DIR / "gemini_cache").resolve())
 os.makedirs(GEMINI_CACHE_DIR, exist_ok=True)
 SPLIT_AUDIO_CACHE_DIR = str((ROOT_OUTPUT_DIR / "split_audio_cache").resolve())
@@ -3857,6 +3974,7 @@ class ManagedConfuciusBackend:
         self._last_exit_at: Optional[float] = None
         self._last_start_command: List[str] = []
         self._active_requests = 0
+        self._vllm_sleeping = False
         self._lock = asyncio.Lock()
 
     @property
@@ -4115,6 +4233,7 @@ class ManagedConfuciusBackend:
             self._want_running = True
             health = await self.health(timeout=1.0)
             if health and health.get("model_loaded"):
+                self._vllm_sleeping = bool(health.get("vllm_sleeping", False))
                 return health
 
             restart_attempted = False
@@ -4357,6 +4476,8 @@ class ManagedConfuciusBackend:
 
     async def status(self) -> Dict[str, Any]:
         health = await self.health(timeout=1.0)
+        if health is not None:
+            self._vllm_sleeping = bool(health.get("vllm_sleeping", False))
         return {
             "backend": TTS_BACKEND_CONFUCIUS,
             "lazy": True,
@@ -4365,6 +4486,7 @@ class ManagedConfuciusBackend:
             "managed_pid": self._process.pid if self._process_running() else None,
             "managed_process_running": self._process_running(),
             "healthy": bool(health and health.get("model_loaded")),
+            "vllm_sleeping": self._vllm_sleeping,
             "health": health,
             "want_running": self._should_keep_running(),
             "active_requests": self._active_requests,
@@ -4388,6 +4510,29 @@ class ManagedConfuciusBackend:
                 else None
             ),
         }
+
+    async def sleep_vllm(self) -> None:
+        """Ask the live Confucius service to release its vLLM GPU allocation."""
+        if self._active_requests > 0:
+            raise RuntimeError("ConfuciusTTS has active requests and cannot sleep yet")
+        await _run_blocking(
+            _http_json_post_sync,
+            f"{self.base_url}/v1/models/sleep",
+            {},
+            30.0,
+        )
+        self._vllm_sleeping = True
+
+    async def wake_vllm(self) -> None:
+        """Wake the live Confucius vLLM engine without restarting its process."""
+        await self.ensure_ready()
+        await _run_blocking(
+            _http_json_post_sync,
+            f"{self.base_url}/v1/models/wake",
+            {},
+            max(30.0, float(SETTINGS.confucius_start_timeout)),
+        )
+        self._vllm_sleeping = False
 
     async def shutdown(self) -> None:
         self._want_running = False
@@ -11185,6 +11330,9 @@ class TTSManager:
     def __init__(self):
         self.tts = None
         self.speaker_manager = None
+        self._indextts_vllm_sleeping = False
+        self._emotion_vllm_sleeping = False
+        self._vllm_state_lock = asyncio.Lock()
         
     @classmethod
     def get_instance(cls):
@@ -11254,13 +11402,58 @@ class TTSManager:
         if not hasattr(tts, "sleep_vllm"):
             raise RuntimeError("IndexTTS2 does not expose vLLM sleep hooks")
         await tts.sleep_vllm(level=level)
+        self._indextts_vllm_sleeping = True
+        self._emotion_vllm_sleeping = True
+
+    async def sleep_engine(self, engine: str, level: int = 1) -> None:
+        """Sleep an individual vLLM engine and retain CPU state for fast wake."""
+        tts = self.get_tts()
+        async with self._vllm_state_lock:
+            if engine == "indextts_vllm" and not self._indextts_vllm_sleeping:
+                await tts.sleep_indextts_vllm(level=level)
+                self._indextts_vllm_sleeping = True
+            elif engine == "emotion_vllm" and not self._emotion_vllm_sleeping:
+                await tts.sleep_emotion_vllm(level=level)
+                self._emotion_vllm_sleeping = True
+
+    async def ensure_awake(self) -> None:
+        """Wake any manually slept vLLM engines before IndexTTS inference."""
+        if not (self._indextts_vllm_sleeping or self._emotion_vllm_sleeping):
+            return
+        tts = self.get_tts()
+        async with self._vllm_state_lock:
+            if self._indextts_vllm_sleeping:
+                await tts.wake_indextts_vllm()
+                self._indextts_vllm_sleeping = False
+            if self._emotion_vllm_sleeping:
+                await tts.wake_emotion_vllm()
+                self._emotion_vllm_sleeping = False
+
+    async def wake_engine(self, engine: str) -> None:
+        """Wake one vLLM engine from the Model Manager."""
+        tts = self.get_tts()
+        async with self._vllm_state_lock:
+            if engine == "indextts_vllm" and self._indextts_vllm_sleeping:
+                await tts.wake_indextts_vllm()
+                self._indextts_vllm_sleeping = False
+            elif engine == "emotion_vllm" and self._emotion_vllm_sleeping:
+                await tts.wake_emotion_vllm()
+                self._emotion_vllm_sleeping = False
 
     async def wake_from_snapshot(self):
         tts = self.get_tts()
         if not hasattr(tts, "wake_vllm"):
             raise RuntimeError("IndexTTS2 does not expose vLLM wake hooks")
         await tts.wake_vllm()
+        self._indextts_vllm_sleeping = False
+        self._emotion_vllm_sleeping = False
         self.refresh_post_snapshot_state()
+
+    def vllm_status(self) -> Dict[str, bool]:
+        return {
+            "indextts_vllm_sleeping": self._indextts_vllm_sleeping,
+            "emotion_vllm_sleeping": self._emotion_vllm_sleeping,
+        }
 
     def refresh_post_snapshot_state(self):
         if self.tts is not None and hasattr(self.tts, "clear_runtime_caches"):
@@ -11602,6 +11795,7 @@ async def _synthesize_tts_to_file(
 ) -> str:
     backend = _normalize_tts_backend(tts_backend, SETTINGS.tts_backend)
     if backend == TTS_BACKEND_INDEX:
+        await tts_manager.ensure_awake()
         tts = tts_manager.get_tts()
         return await tts.infer(
             spk_audio_prompt=spk_audio_prompt,
@@ -12141,6 +12335,7 @@ async def warmup_model():
     """Run warmup inferences to fully preload the model"""
     try:
         print("🔥 Running model warmup (2 inferences for full load)...")
+        await tts_manager.ensure_awake()
         tts = tts_manager.get_tts()
         
         # First warmup inference
@@ -12565,6 +12760,93 @@ async def api_stable_audio_unload(request: Request):
             payload = {}
     removed = await _run_blocking(stable_audio3_manager.unload, payload.get("variant_key"))
     return JSONResponse(content={"status": "success", "unloaded": removed})
+
+
+@app.get("/api/models/status")
+async def api_models_status():
+    """List reclaimable models and current device-level VRAM usage."""
+    if confucius_backend_manager._process_running():
+        await confucius_backend_manager.status()
+    return JSONResponse(
+        content={
+            "status": "success",
+            "gpu": _cuda_memory_summary(),
+            "models": _loaded_model_inventory(),
+            "core_model": {
+                "name": "IndexTTS2 vLLM",
+                "loaded": tts_manager.is_ready(),
+                "reclaimable": True,
+                "note": "Its vLLM engines can sleep and wake automatically before inference.",
+            },
+        }
+    )
+
+
+@app.post("/api/models/unload")
+async def api_models_unload(request: Request):
+    """Unload one optional GPU model, or all optional models."""
+    payload: Dict[str, Any] = {}
+    if _request_has_json_body(request):
+        try:
+            raw_payload = await request.json()
+            if isinstance(raw_payload, dict):
+                payload = raw_payload
+        except Exception:
+            payload = {}
+    model_key = str(payload.get("model_key") or "").strip()
+    if not model_key:
+        raise HTTPException(status_code=400, detail="model_key is required")
+
+    valid_keys = {item["key"] for item in _loaded_model_inventory()}
+    if model_key != "all" and model_key not in valid_keys:
+        raise HTTPException(status_code=404, detail=f"Model is not loaded: {model_key}")
+
+    async with _model_manager_lock:
+        removed: List[str] = []
+        if model_key in {"all", "indextts_vllm"}:
+            await tts_manager.sleep_engine("indextts_vllm", level=1)
+            removed.append("indextts_vllm")
+        if model_key in {"all", "emotion_vllm"}:
+            await tts_manager.sleep_engine("emotion_vllm", level=1)
+            removed.append("emotion_vllm")
+        if model_key in {"all", "confucius_vllm"} and confucius_backend_manager._process_running():
+            await confucius_backend_manager.sleep_vllm()
+            removed.append("confucius_vllm")
+        if model_key == "all" or model_key not in {"indextts_vllm", "emotion_vllm", "confucius_vllm"}:
+            removed.extend(await _run_blocking(_unload_optional_model_sync, model_key))
+    return JSONResponse(
+        content={
+            "status": "success",
+            "unloaded": removed,
+            "gpu": _cuda_memory_summary(),
+            "models": _loaded_model_inventory(),
+        }
+    )
+
+
+@app.post("/api/models/wake")
+async def api_models_wake(request: Request):
+    """Wake a sleeping vLLM engine without rebuilding its model process."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    model_key = str(payload.get("model_key") or "").strip() if isinstance(payload, dict) else ""
+    if model_key not in {"indextts_vllm", "emotion_vllm", "confucius_vllm"}:
+        raise HTTPException(status_code=400, detail="Unknown or non-sleepable model")
+    async with _model_manager_lock:
+        if model_key in {"indextts_vllm", "emotion_vllm"}:
+            await tts_manager.wake_engine(model_key)
+        else:
+            await confucius_backend_manager.wake_vllm()
+    return JSONResponse(
+        content={
+            "status": "success",
+            "woken": [model_key],
+            "gpu": _cuda_memory_summary(),
+            "models": _loaded_model_inventory(),
+        }
+    )
 
 
 @app.post("/api/stable-audio/generate")
@@ -18061,6 +18343,7 @@ async def speak_stream(req: SpeakRequest):
                 headers=STREAMING_RESPONSE_HEADERS,
             )
 
+        await tts_manager.ensure_awake()
         tts = tts_manager.get_tts()
 
         async def audio_stream_generator():
@@ -18166,6 +18449,7 @@ async def clone_voice_stream(
                 headers=STREAMING_RESPONSE_HEADERS,
             )
 
+        await tts_manager.ensure_awake()
         tts = tts_manager.get_tts()
 
         async def audio_stream_generator():

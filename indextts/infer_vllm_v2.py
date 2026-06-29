@@ -100,7 +100,7 @@ import hashlib
 
 
 def _vllm_sleep_mode_enabled() -> bool:
-    return os.environ.get("INDEXTTS_ENABLE_VLLM_SLEEP_MODE", "0").lower() in (
+    return os.environ.get("INDEXTTS_ENABLE_VLLM_SLEEP_MODE", "1").lower() in (
         "1",
         "true",
         "yes",
@@ -372,6 +372,26 @@ class IndexTTS2:
             await self.qwen_emo.sleep(level=level)
         if hasattr(self, "indextts_vllm") and self.indextts_vllm is not None:
             await self.indextts_vllm.sleep(level=level)
+
+    async def sleep_indextts_vllm(self, level: int = 1):
+        """Release the main IndexTTS vLLM engine's GPU allocation."""
+        level = 1 if level < 1 else min(level, 2)
+        if hasattr(self, "indextts_vllm") and self.indextts_vllm is not None:
+            await self.indextts_vllm.sleep(level=level)
+
+    async def sleep_emotion_vllm(self, level: int = 1):
+        """Release the Qwen emotion vLLM engine's GPU allocation."""
+        level = 1 if level < 1 else min(level, 2)
+        if hasattr(self, "qwen_emo") and self.qwen_emo is not None:
+            await self.qwen_emo.sleep(level=level)
+
+    async def wake_indextts_vllm(self):
+        if hasattr(self, "indextts_vllm") and self.indextts_vllm is not None:
+            await self.indextts_vllm.wake_up()
+
+    async def wake_emotion_vllm(self):
+        if hasattr(self, "qwen_emo") and self.qwen_emo is not None:
+            await self.qwen_emo.wake_up()
 
     async def wake_vllm(self):
         """Wake vLLM engines after Modal restores a memory snapshot."""

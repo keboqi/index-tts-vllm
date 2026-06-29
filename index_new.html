@@ -1788,6 +1788,18 @@
                             <span class="hero-card-feature">💾 Save to Presets</span>
                         </div>
                     </div>
+                    <div class="hero-card" data-tab="models" role="button" tabindex="0">
+                        <div class="hero-card-header">
+                            <span class="icon">🧠</span>
+                            <strong>Model Manager</strong>
+                        </div>
+                        <div class="hero-card-features">
+                            <span class="hero-card-feature highlight">GPU Memory</span>
+                            <span class="hero-card-feature">Loaded Models</span>
+                            <span class="hero-card-feature">Unload Selected</span>
+                            <span class="hero-card-feature">Free VRAM</span>
+                        </div>
+                    </div>
                     <div class="hero-card" data-tab="api" role="button" tabindex="0">
                         <div class="hero-card-header">
                             <span class="icon">📚</span>
@@ -2813,6 +2825,23 @@
                     </div>
                 </div>
 
+                <!-- Model Manager Tab -->
+                <div id="models" class="tab-content">
+                    <div class="form-section">
+                        <h3>🧠 Model Manager</h3>
+                        <p style="color: var(--text-secondary); margin-bottom: 16px;">
+                            Sleep vLLM engines or unload optional models that are not in use to reclaim VRAM. Sleeping engines wake automatically on their next request.
+                        </p>
+                        <div id="modelManagerGpu" style="padding: 14px; margin-bottom: 16px; background: var(--surface-muted); border: 1px solid var(--border); border-radius: 10px;">Loading GPU status…</div>
+                        <div id="modelManagerList" style="display: grid; gap: 10px; margin-bottom: 16px;"></div>
+                        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                            <button type="button" class="btn btn-secondary" data-action="models-refresh">Refresh</button>
+                            <button type="button" class="btn btn-danger" data-action="models-unload-all">Unload All Optional Models</button>
+                        </div>
+                        <div id="modelManagerStatus" class="status" style="margin-top: 12px;"></div>
+                    </div>
+                </div>
+
                 <!-- API Documentation Tab -->
                 <div id="api" class="tab-content">
                     <div class="api-docs">
@@ -3634,9 +3663,82 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 STABLE_AUDIO_STATUS: '/api/stable-audio/status',
                 STABLE_AUDIO_MODELS: '/api/stable-audio/models',
                 STABLE_AUDIO_GENERATE: '/api/stable-audio/generate',
+                MODELS_STATUS: '/api/models/status',
+                MODELS_UNLOAD: '/api/models/unload',
+                MODELS_WAKE: '/api/models/wake',
             });
 
             /* ---------- Helpers (HTTP, UI binding) ---------- */
+
+            function renderModelManager(data) {
+                const gpuEl = document.getElementById('modelManagerGpu');
+                const listEl = document.getElementById('modelManagerList');
+                if (!gpuEl || !listEl) return;
+                const gpu = data.gpu || {};
+                if (gpu.available) {
+                    const pct = gpu.total_mb ? Math.round(gpu.used_mb / gpu.total_mb * 100) : 0;
+                    gpuEl.innerHTML = `<strong>GPU Memory: ${pct}% used</strong><br><span style="color: var(--text-secondary)">${Number(gpu.used_mb).toLocaleString()} MiB used / ${Number(gpu.total_mb).toLocaleString()} MiB total · ${Number(gpu.free_mb).toLocaleString()} MiB free</span>`;
+                } else {
+                    gpuEl.textContent = 'CUDA GPU memory information is unavailable.';
+                }
+                const models = Array.isArray(data.models) ? data.models : [];
+                const rows = models.map(model => `
+                    <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px; border:1px solid var(--border); border-radius:10px; background:var(--surface-muted);">
+                        <div><strong>${escapeHtml(model.name)}</strong><br><small style="color:var(--text-secondary)">${escapeHtml(model.kind || 'Optional model')} · ${escapeHtml(model.state || 'loaded')}</small></div>
+                        ${model.state === 'sleeping'
+                            ? `<button type="button" class="btn btn-secondary" data-action="models-wake" data-model-key="${escapeHtml(model.key)}">Wake</button>`
+                            : `<button type="button" class="btn btn-danger" data-action="models-unload" data-model-key="${escapeHtml(model.key)}">${model.key.endsWith('_vllm') ? 'Sleep' : 'Unload'}</button>`}
+                    </div>`);
+                listEl.innerHTML = rows.join('');
+            }
+
+            async function loadModelManager(showStatus = false) {
+                const statusEl = document.getElementById('modelManagerStatus');
+                try {
+                    const response = await fetch(ENDPOINTS.MODELS_STATUS);
+                    if (!response.ok) throw new Error(await parseHttpError(response, 'Failed to load model status'));
+                    renderModelManager(await response.json());
+                    if (showStatus && statusEl) statusEl.textContent = 'Model status refreshed.';
+                } catch (error) {
+                    if (statusEl) statusEl.textContent = `Error: ${error.message}`;
+                }
+            }
+
+            async function unloadManagedModel(modelKey) {
+                const statusEl = document.getElementById('modelManagerStatus');
+                if (statusEl) statusEl.textContent = 'Unloading model and releasing VRAM…';
+                try {
+                    const response = await fetch(ENDPOINTS.MODELS_UNLOAD, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({model_key: modelKey}),
+                    });
+                    if (!response.ok) throw new Error(await parseHttpError(response, 'Failed to unload model'));
+                    const data = await response.json();
+                    renderModelManager(data);
+                    if (statusEl) statusEl.textContent = data.unloaded.length ? `Unloaded: ${data.unloaded.join(', ')}` : 'No loaded models matched.';
+                } catch (error) {
+                    if (statusEl) statusEl.textContent = `Error: ${error.message}`;
+                }
+            }
+
+            async function wakeManagedModel(modelKey) {
+                const statusEl = document.getElementById('modelManagerStatus');
+                if (statusEl) statusEl.textContent = 'Waking model…';
+                try {
+                    const response = await fetch(ENDPOINTS.MODELS_WAKE, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({model_key: modelKey}),
+                    });
+                    if (!response.ok) throw new Error(await parseHttpError(response, 'Failed to wake model'));
+                    const data = await response.json();
+                    renderModelManager(data);
+                    if (statusEl) statusEl.textContent = `Woke: ${data.woken.join(', ')}`;
+                } catch (error) {
+                    if (statusEl) statusEl.textContent = `Error: ${error.message}`;
+                }
+            }
 
             async function parseHttpError(response, fallbackMessage) {
                 let detail = fallbackMessage || 'Request failed';
@@ -3745,6 +3847,22 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                         loadStableAudioModels(true);
                         return;
                     }
+                    if (action === 'models-refresh') {
+                        loadModelManager(true);
+                        return;
+                    }
+                    if (action === 'models-unload-all') {
+                        unloadManagedModel('all');
+                        return;
+                    }
+                    if (action === 'models-unload') {
+                        unloadManagedModel(actionEl.dataset.modelKey || '');
+                        return;
+                    }
+                    if (action === 'models-wake') {
+                        wakeManagedModel(actionEl.dataset.modelKey || '');
+                        return;
+                    }
                     if (action === 'delete-speaker') {
                         const raw = actionEl.dataset.speakerName;
                         if (raw !== undefined && raw !== '') {
@@ -3808,6 +3926,9 @@ requests.post("http://localhost:8080/api/design-voice/save-preset", json={
                 }
                 if (tabName === 'stable-audio') {
                     loadStableAudioModels();
+                }
+                if (tabName === 'models') {
+                    loadModelManager();
                 }
                 
                 if (content && window.matchMedia('(max-width: 1024px)').matches) {
