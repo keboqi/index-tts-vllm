@@ -185,7 +185,8 @@ python fastapi_webui_v2.py [OPTIONS]
 - `--model_dir` (string): Path to model checkpoints directory (default: `checkpoints`).
 - `--is_fp16` (flag): Override the default CUDA BF16 inference path with FP16.
 - `--use_torch_compile` (flag): Enable `torch.compile` for faster BF16 model execution on supported CUDA GPUs.
-- `--gpu_memory_utilization` (float): vLLM GPU memory utilization limit (default: `0.25`).
+- `--gpu_memory_utilization` (float): IndexTTS2 vLLM GPU memory utilization limit (default: `0.15`).
+- `--qwenemo_gpu_memory_utilization` (float): QwenEmotion vLLM GPU memory utilization limit (default: `0.05`).
 - `--tts_backend` (`index` or `confucius`): Default synthesis backend. The server default is `index`.
 - `--confucius_repo_dir` (string): Path to a sibling `Confucius4-TTS` checkout used for lazy startup (default: `../Confucius4-TTS`).
 - `--confucius_host` / `--confucius_port`: Host and port for the managed Confucius FastAPI backend (default: `127.0.0.1:8001`).

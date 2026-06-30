@@ -7,6 +7,7 @@ import traceback
 from typing import List
 import asyncio
 import uuid
+from collections import OrderedDict
 
 import librosa
 import numpy as np
@@ -352,13 +353,16 @@ class IndexTTS2:
         self.mel_fn = lambda x: mel_spectrogram(x, **mel_fn_args)
 
         # 缓存参考音频：
-        self.cache_spk_cond = None
-        self.cache_s2mel_style = None
-        self.cache_s2mel_prompt = None
-        self.cache_spk_audio_prompt = None
-        self.cache_emo_cond = None
-        self.cache_emo_audio_prompt = None
-        self.cache_mel = None
+        # Content-addressed and bounded to keep GPU-resident conditioning data
+        # predictable. In-flight tasks provide per-key single-flight behavior.
+        try:
+            conditioning_cache_size = int(os.environ.get("INDEXTTS_CONDITIONING_CACHE_SIZE", "8"))
+        except ValueError:
+            conditioning_cache_size = 8
+        self._conditioning_cache_max_entries = max(1, min(conditioning_cache_size, 64))
+        self._conditioning_cache = OrderedDict()
+        self._conditioning_inflight = {}
+        self._conditioning_cache_guard = asyncio.Lock()
 
         self.speaker_dict = {}
         
@@ -402,13 +406,13 @@ class IndexTTS2:
 
     def clear_runtime_caches(self):
         """Drop request-specific warmup caches while keeping model state loaded."""
-        self.cache_spk_cond = None
-        self.cache_s2mel_style = None
-        self.cache_s2mel_prompt = None
-        self.cache_spk_audio_prompt = None
-        self.cache_emo_cond = None
-        self.cache_emo_audio_prompt = None
-        self.cache_mel = None
+        self._conditioning_cache.clear()
+        for task in self._conditioning_inflight.values():
+            task.cancel()
+        self._conditioning_inflight.clear()
+        preset_manager = getattr(self, "preset_manager", None)
+        if preset_manager is not None:
+            preset_manager.clear_memory_cache()
 
     def _init_emb_cache(self):
         """Initialize the get_emb cache system"""
@@ -665,8 +669,127 @@ class IndexTTS2:
                 wav_cpu = wav.cpu()  # Move to CPU before returning
                 
         return sent_idx, wav_cpu, sentence_stats
-    
-    async def _prepare_inference(self, spk_audio_prompt, text, emo_audio_prompt, emo_alpha, 
+
+    @staticmethod
+    def _hash_reference_file_sync(reference_path):
+        digest = hashlib.sha256()
+        with open(reference_path, "rb") as reference_file:
+            for chunk in iter(lambda: reference_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    async def _reference_cache_key(self, kind, reference_path):
+        if not reference_path:
+            raise ValueError("Reference audio path is required")
+        digest = await asyncio.to_thread(self._hash_reference_file_sync, reference_path)
+        return f"{kind}:{digest}"
+
+    async def _get_or_create_conditioning(self, cache_key, factory):
+        """Return one cached value and coalesce concurrent builds for a key."""
+        async with self._conditioning_cache_guard:
+            cached = self._conditioning_cache.get(cache_key)
+            if cached is not None:
+                self._conditioning_cache.move_to_end(cache_key)
+                return cached
+
+            task = self._conditioning_inflight.get(cache_key)
+            owns_task = task is None
+            if owns_task:
+                task = asyncio.create_task(factory())
+                self._conditioning_inflight[cache_key] = task
+
+        try:
+            if owns_task:
+                value = await task
+            else:
+                value = await asyncio.shield(task)
+        except BaseException:
+            if owns_task:
+                async with self._conditioning_cache_guard:
+                    self._conditioning_inflight.pop(cache_key, None)
+            raise
+
+        if owns_task:
+            async with self._conditioning_cache_guard:
+                self._conditioning_inflight.pop(cache_key, None)
+                self._conditioning_cache[cache_key] = value
+                self._conditioning_cache.move_to_end(cache_key)
+                while len(self._conditioning_cache) > self._conditioning_cache_max_entries:
+                    evicted_key, _ = self._conditioning_cache.popitem(last=False)
+                    preset_manager = getattr(self, "preset_manager", None)
+                    if evicted_key.startswith("preset:") and preset_manager is not None:
+                        preset_manager.unload_speaker(evicted_key.split(":", 1)[1])
+        return value
+
+    async def _load_preset_conditioning(self, preset_name):
+        preset_data = await asyncio.to_thread(
+            self.preset_manager.get_speaker_preset,
+            preset_name,
+        )
+        if preset_data is None:
+            raise KeyError(preset_name)
+        return preset_data
+
+    @staticmethod
+    def _load_reference_waveforms_sync(reference_path):
+        audio, sample_rate = librosa.load(reference_path)
+        audio = torch.tensor(audio).unsqueeze(0)
+        audio_22k = torchaudio.transforms.Resample(sample_rate, 22050)(audio)
+        audio_16k = torchaudio.transforms.Resample(sample_rate, 16000)(audio)
+        return audio_22k, audio_16k
+
+    async def _build_speaker_conditioning(self, reference_path):
+        audio_22k, audio_16k = await asyncio.to_thread(
+            self._load_reference_waveforms_sync,
+            reference_path,
+        )
+        inputs = await asyncio.to_thread(
+            self.extract_features,
+            audio_16k,
+            sampling_rate=16000,
+            return_tensors="pt",
+        )
+        input_features = inputs["input_features"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+        spk_cond_emb = self.get_emb(input_features, attention_mask)
+
+        _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+        ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
+        ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+        feat = torchaudio.compliance.kaldi.fbank(
+            audio_16k.to(ref_mel.device),
+            num_mel_bins=80,
+            dither=0,
+            sample_frequency=16000,
+        )
+        feat = feat - feat.mean(dim=0, keepdim=True)
+        style = self.campplus_model(feat.unsqueeze(0))
+        prompt_condition = self.s2mel.models['length_regulator'](
+            S_ref,
+            ylens=ref_target_lengths,
+            n_quantizers=3,
+            f0=None,
+        )[0]
+        return {
+            "spk_cond_emb": spk_cond_emb,
+            "style": style,
+            "prompt_condition": prompt_condition,
+            "ref_mel": ref_mel,
+        }
+
+    async def _build_emotion_conditioning(self, reference_path):
+        emotion_audio, _ = await asyncio.to_thread(librosa.load, reference_path, sr=16000)
+        emotion_inputs = await asyncio.to_thread(
+            self.extract_features,
+            emotion_audio,
+            sampling_rate=16000,
+            return_tensors="pt",
+        )
+        emotion_features = emotion_inputs["input_features"].to(self.device)
+        emotion_mask = emotion_inputs["attention_mask"].to(self.device)
+        return self.get_emb(emotion_features, emotion_mask)
+
+    async def _prepare_inference(self, spk_audio_prompt, text, emo_audio_prompt, emo_alpha,
                                  emo_vector, use_emo_text, emo_text, use_random,
                                  max_text_tokens_per_sentence, speaker_preset, verbose,
                                  first_chunk_max_tokens=None):
@@ -693,7 +816,13 @@ class IndexTTS2:
         use_preset_data = False
         if speaker_preset is not None:
             if hasattr(self, 'preset_manager') and self.preset_manager:
-                preset_data = self.preset_manager.get_speaker_preset(speaker_preset)
+                try:
+                    preset_data = await self._get_or_create_conditioning(
+                        f"preset:{speaker_preset}",
+                        lambda: self._load_preset_conditioning(speaker_preset),
+                    )
+                except KeyError:
+                    preset_data = None
                 if preset_data:
                     if verbose:
                         print(f">> Using speaker preset: {speaker_preset}")
@@ -724,44 +853,15 @@ class IndexTTS2:
         
         # Normal audio processing (either no preset specified or preset not found)
         if not use_preset_data:
-            if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
-                audio, sr = librosa.load(spk_audio_prompt)
-                audio = torch.tensor(audio).unsqueeze(0)
-                audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
-                audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
-
-                inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
-                input_features = inputs["input_features"]
-                attention_mask = inputs["attention_mask"]
-                input_features = input_features.to(self.device)
-                attention_mask = attention_mask.to(self.device)
-                spk_cond_emb = self.get_emb(input_features, attention_mask)
-
-                _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
-                ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
-                ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
-                feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
-                                                         num_mel_bins=80,
-                                                         dither=0,
-                                                         sample_frequency=16000)
-                feat = feat - feat.mean(dim=0, keepdim=True)
-                style = self.campplus_model(feat.unsqueeze(0))
-
-                prompt_condition = self.s2mel.models['length_regulator'](S_ref,
-                                                                         ylens=ref_target_lengths,
-                                                                         n_quantizers=3,
-                                                                         f0=None)[0]
-
-                self.cache_spk_cond = spk_cond_emb
-                self.cache_s2mel_style = style
-                self.cache_s2mel_prompt = prompt_condition
-                self.cache_spk_audio_prompt = spk_audio_prompt
-                self.cache_mel = ref_mel
-            else:
-                style = self.cache_s2mel_style
-                prompt_condition = self.cache_s2mel_prompt
-                spk_cond_emb = self.cache_spk_cond
-                ref_mel = self.cache_mel
+            speaker_cache_key = await self._reference_cache_key("speaker", spk_audio_prompt)
+            speaker_conditioning = await self._get_or_create_conditioning(
+                speaker_cache_key,
+                lambda: self._build_speaker_conditioning(spk_audio_prompt),
+            )
+            spk_cond_emb = speaker_conditioning["spk_cond_emb"]
+            style = speaker_conditioning["style"]
+            prompt_condition = speaker_conditioning["prompt_condition"]
+            ref_mel = speaker_conditioning["ref_mel"]
 
         # Handle emotion vector
         emovec_mat = None
@@ -788,32 +888,25 @@ class IndexTTS2:
             else:
                 emo_cond_emb = spk_cond_emb if 'spk_cond_emb' in locals() else None
         else:
-            if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
-                if not emo_audio_prompt or emo_audio_prompt.strip() == "":
-                    if 'spk_cond_emb' in locals():
-                        emo_cond_emb = spk_cond_emb
-                        if verbose:
-                            # Note: emo_cond_emb = spk_cond_emb provides voice characteristics
-                            # Actual emotion comes from emovec_mat when text-based emotion is used
-                            if emo_vector is not None:
-                                print(">> Using speaker voice with text-based emotion control")
-                            else:
-                                print(">> Using speaker embedding for emotion (no emotion override)")
-                    else:
-                        raise ValueError("No valid emotion audio prompt and no speaker embedding available")
+            if not emo_audio_prompt or emo_audio_prompt.strip() == "":
+                if 'spk_cond_emb' in locals():
+                    emo_cond_emb = spk_cond_emb
+                    if verbose:
+                        if emo_vector is not None:
+                            print(">> Using speaker voice with text-based emotion control")
+                        else:
+                            print(">> Using speaker embedding for emotion (no emotion override)")
                 else:
-                    emo_audio, _ = librosa.load(emo_audio_prompt, sr=16000)
-                    emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
-                    emo_input_features = emo_inputs["input_features"]
-                    emo_attention_mask = emo_inputs["attention_mask"]
-                    emo_input_features = emo_input_features.to(self.device)
-                    emo_attention_mask = emo_attention_mask.to(self.device)
-                    emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
-
-                    self.cache_emo_cond = emo_cond_emb
-                    self.cache_emo_audio_prompt = emo_audio_prompt
+                    raise ValueError("No valid emotion audio prompt and no speaker embedding available")
+            elif not use_preset_data and emo_audio_prompt == spk_audio_prompt:
+                # Speaker and emotion embeddings use the same 16 kHz feature path.
+                emo_cond_emb = spk_cond_emb
             else:
-                emo_cond_emb = self.cache_emo_cond
+                emotion_cache_key = await self._reference_cache_key("emotion", emo_audio_prompt)
+                emo_cond_emb = await self._get_or_create_conditioning(
+                    emotion_cache_key,
+                    lambda: self._build_emotion_conditioning(emo_audio_prompt),
+                )
 
         # Tokenize and split sentences
         text_tokens_list = self.tokenizer.tokenize(text)
@@ -984,12 +1077,14 @@ class IndexTTS2:
         wav = wav.cpu()  # to cpu
         if output_path:
             # 直接保存音频到指定路径中
-            if os.path.isfile(output_path):
-                os.remove(output_path)
-                print(">> remove old wav file:", output_path)
-            if os.path.dirname(output_path) != "":
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
+            def _save_output_audio():
+                if os.path.isfile(output_path):
+                    os.remove(output_path)
+                if os.path.dirname(output_path) != "":
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
+
+            await asyncio.to_thread(_save_output_audio)
             print(">> wav file saved to:", output_path)
             return output_path
         else:
@@ -1008,7 +1103,7 @@ def find_most_similar_cosine(query_vector, matrix):
     return most_similar_index
 
 class QwenEmotion:
-    def __init__(self, model_dir, gpu_memory_utilization=0.1, cache_dir="emotion_cache"):
+    def __init__(self, model_dir, gpu_memory_utilization=0.05, cache_dir="emotion_cache"):
         self.model_dir = model_dir
         self.cache_dir = cache_dir
         

@@ -59,6 +59,8 @@ import signal
 import urllib.request
 import urllib.error
 import hashlib
+import gzip
+import threading
 import zipfile
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
@@ -337,6 +339,14 @@ class AppSettings:
 # Use CPU count for parallel audio processing, but cap at 8 to avoid excessive context switching
 _executor_workers = min(8, max(4, (os.cpu_count() or 4)))
 executor = ThreadPoolExecutor(max_workers=_executor_workers, thread_name_prefix="fastapi_async")
+io_executor = ThreadPoolExecutor(
+    max_workers=_env_int("INDEXTTS_IO_WORKERS", 4, min_value=1, max_value=16),
+    thread_name_prefix="fastapi_io",
+)
+audio_executor = ThreadPoolExecutor(
+    max_workers=_env_int("INDEXTTS_AUDIO_WORKERS", 2, min_value=1, max_value=8),
+    thread_name_prefix="fastapi_audio",
+)
 
 # Global ClearVoice models (initialized lazily and reused)
 _enhancement_model: Optional[Any] = None
@@ -564,7 +574,18 @@ TRANSLATE_DEFAULT_OUTPUT_FORMAT = "mp3"
 TRANSLATE_DEFAULT_BITRATE = "128k"
 CHUNK_SESSION_CREATION_CONCURRENCY = 4
 AUDIO_GENERATION_MARGIN_MS = 20
-TRANSLATION_TTS_CONCURRENCY = 100
+INDEXTTS_GPU_WORK_CONCURRENCY = _env_int(
+    "INDEXTTS_GPU_WORK_CONCURRENCY",
+    100,
+    min_value=1,
+    max_value=256,
+)
+TRANSLATION_TTS_CONCURRENCY = _env_int(
+    "TRANSLATION_TTS_CONCURRENCY",
+    100,
+    min_value=1,
+    max_value=INDEXTTS_GPU_WORK_CONCURRENCY,
+)
 MIN_SPEECH_DURATION_MS = 3000
 MAX_MERGE_INTERVAL_MS = 0
 CONFUCIUS_RECOVERY_RETRY_ATTEMPTS = _env_int("CONFUCIUS_RECOVERY_RETRY_ATTEMPTS", 8, min_value=1, max_value=50)
@@ -699,8 +720,21 @@ class ClearVoiceParallelChunkResult:
 
 
 async def _run_blocking(func: Callable, *args, **kwargs):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(executor, functools.partial(func, *args, **kwargs))
+
+
+async def _run_io(func: Callable, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(io_executor, functools.partial(func, *args, **kwargs))
+
+
+async def _run_audio_cpu(func: Callable, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(audio_executor, functools.partial(func, *args, **kwargs))
+
+
+INDEXTTS_GPU_WORK_SLOTS = asyncio.BoundedSemaphore(INDEXTTS_GPU_WORK_CONCURRENCY)
 
 
 def _normalize_gemini_model_name(gemini_model_value: Optional[str]) -> str:
@@ -779,7 +813,7 @@ def _decode_audio_segment_sync(audio_bytes: bytes, audio_format: Optional[str]) 
 
 
 async def _decode_audio_segment(audio_bytes: bytes, audio_format: Optional[str]) -> AudioSegment:
-    return await _run_blocking(_decode_audio_segment_sync, audio_bytes, audio_format)
+    return await _run_audio_cpu(_decode_audio_segment_sync, audio_bytes, audio_format)
 
 
 def _export_audio_segment_bytes_sync(audio: AudioSegment, fmt: str = "mp3", bitrate: Optional[str] = None) -> bytes:
@@ -858,7 +892,7 @@ def _export_audio_via_ffmpeg_sync(audio: AudioSegment, fmt: str = "mp3", bitrate
 
 
 async def _export_audio_segment_bytes(audio: AudioSegment, fmt: str = "mp3", bitrate: Optional[str] = None) -> bytes:
-    return await _run_blocking(_export_audio_segment_bytes_sync, audio, fmt, bitrate)
+    return await _run_audio_cpu(_export_audio_segment_bytes_sync, audio, fmt, bitrate)
 
 
 def _export_audio_segment_to_path_sync(
@@ -937,7 +971,7 @@ async def _export_audio_segment_to_path(
     fmt: str = "mp3",
     bitrate: Optional[str] = None,
 ) -> str:
-    return await _run_blocking(_export_audio_segment_to_path_sync, audio, path, fmt, bitrate)
+    return await _run_audio_cpu(_export_audio_segment_to_path_sync, audio, path, fmt, bitrate)
 
 
 def _export_audio_segment_to_tempfile_sync(audio: AudioSegment, suffix: str = ".wav") -> str:
@@ -947,7 +981,7 @@ def _export_audio_segment_to_tempfile_sync(audio: AudioSegment, suffix: str = ".
 
 
 async def _export_audio_segment_to_tempfile(audio: AudioSegment, suffix: str = ".wav") -> str:
-    return await _run_blocking(_export_audio_segment_to_tempfile_sync, audio, suffix)
+    return await _run_audio_cpu(_export_audio_segment_to_tempfile_sync, audio, suffix)
 
 
 def _load_audio_segment_from_path_sync(path: str) -> AudioSegment:
@@ -962,7 +996,7 @@ def _load_audio_segment_from_path_sync(path: str) -> AudioSegment:
 
 
 async def _load_audio_segment_from_path(path: str) -> AudioSegment:
-    return await _run_blocking(_load_audio_segment_from_path_sync, path)
+    return await _run_audio_cpu(_load_audio_segment_from_path_sync, path)
 
 
 # ==============================================================================
@@ -3543,8 +3577,18 @@ parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the
 parser.add_argument("--model_dir", type=str, default="checkpoints", help="Model checkpoints directory")
 parser.add_argument("--is_fp16", action="store_true", default=False, help="Fp16 infer")
 parser.add_argument("--use_torch_compile", action="store_true", default=False, help="use torch compile")
-parser.add_argument("--gpu_memory_utilization", type=float, default=0.15, help="GPU memory utilization")
-parser.add_argument("--qwenemo_gpu_memory_utilization", type=float, default=0.05, help="QwenEmotion GPU memory utilization")
+parser.add_argument(
+    "--gpu_memory_utilization",
+    type=float,
+    default=_env_float("GPU_MEMORY_UTILIZATION", 0.15, min_value=0.0, max_value=1.0),
+    help="IndexTTS2 vLLM GPU memory utilization (default: 0.15)",
+)
+parser.add_argument(
+    "--qwenemo_gpu_memory_utilization",
+    type=float,
+    default=_env_float("QWENEMO_GPU_MEMORY_UTILIZATION", 0.05, min_value=0.0, max_value=1.0),
+    help="QwenEmotion vLLM GPU memory utilization (default: 0.05)",
+)
 parser.add_argument("--tts_backend", type=str, default=TTS_BACKEND_INDEX, choices=sorted(ALLOWED_TTS_BACKENDS), help="Default TTS backend: index or confucius")
 parser.add_argument("--confucius_repo_dir", type=str, default="../Confucius4-TTS", help="Path to the Confucius4-TTS repository for lazy managed startup")
 parser.add_argument("--confucius_host", type=str, default="127.0.0.1", help="Host for the managed Confucius4-TTS FastAPI backend")
@@ -3632,7 +3676,7 @@ except SystemExit:
         ),
         confucius_vllm_gpu_memory_utilization=_env_float(
             "CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION",
-            0.2,
+            0.15,
             min_value=0.0,
             max_value=1.0,
         ),
@@ -4629,8 +4673,7 @@ async def _read_optional_json_payload(
 # Async wrapper functions for blocking operations
 async def async_write_file(file_path: str, data: bytes) -> None:
     """Async wrapper for writing file data"""
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, _write_file_sync, file_path, data)
+    await _run_io(_write_file_sync, file_path, data)
 
 def _write_file_sync(file_path: str, data: bytes) -> None:
     """Synchronous file write operation"""
@@ -4639,8 +4682,7 @@ def _write_file_sync(file_path: str, data: bytes) -> None:
 
 async def async_read_file(file_path: str) -> bytes:
     """Async wrapper for reading file data"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, _read_file_sync, file_path)
+    return await _run_io(_read_file_sync, file_path)
 
 def _read_file_sync(file_path: str) -> bytes:
     """Synchronous file read operation"""
@@ -4661,8 +4703,7 @@ def _safe_remove_file(path: Optional[str]) -> None:
 
 async def async_remove_file(file_path: str) -> None:
     """Async wrapper for removing files"""
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, _remove_file_sync, file_path)
+    await _run_io(_remove_file_sync, file_path)
 
 def _remove_file_sync(file_path: str) -> None:
     """Synchronous file removal operation"""
@@ -4722,8 +4763,7 @@ async def _create_speaker_preview_mp3(
 
 async def async_audio_read(file_path: str):
     """Async wrapper for soundfile.read()"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, sf.read, file_path)
+    return await _run_audio_cpu(sf.read, file_path)
 
 
 _speaker_effect_applier: Optional[Any] = None
@@ -6820,8 +6860,13 @@ async def apply_clearvoice_processing(
 
 async def convert_audio_to_format(wav_data, sample_rate, output_format="mp3", bitrate="128k"):
     """Convert audio data to specified format (MP3 or WAV)"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, _convert_audio_to_format_sync, wav_data, sample_rate, output_format, bitrate)
+    return await _run_audio_cpu(
+        _convert_audio_to_format_sync,
+        wav_data,
+        sample_rate,
+        output_format,
+        bitrate,
+    )
 
 
 async def _read_generated_audio_bytes(
@@ -10662,9 +10707,7 @@ async def _synthesize_translated_audio(
             }
             return index, audio_seg, log_entry
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_chunk:
-            chunk_audio.export(tmp_chunk.name, format="wav")
-            chunk_path = tmp_chunk.name
+        chunk_path = await _export_audio_segment_to_tempfile(chunk_audio, suffix=".wav")
 
         generation_target_ms = max(0, duration_ms - AUDIO_GENERATION_MARGIN_MS)
         generated_path = os.path.join("outputs", f"translate_{uuid.uuid4().hex}.wav")
@@ -10692,10 +10735,19 @@ async def _synthesize_translated_audio(
                     emo_alpha=resolved_emotion_weight,
                     cache_prompt_audio=not bool(spk_prompt_value),
                 )
-            generated_audio = AudioSegment.from_file(inference_path)
-            if abs(resolved_volume_percent - DEFAULT_GENERATED_VOLUME_PERCENT) >= 0.01:
-                generated_audio = _apply_volume_with_ffmpeg(generated_audio, resolved_volume_percent)
-            generated_audio = _match_segment_duration(generated_audio, duration_ms, frame_rate, sample_width, channels)
+            def _load_and_finalize_generated_audio() -> AudioSegment:
+                audio = AudioSegment.from_file(inference_path)
+                if abs(resolved_volume_percent - DEFAULT_GENERATED_VOLUME_PERCENT) >= 0.01:
+                    audio = _apply_volume_with_ffmpeg(audio, resolved_volume_percent)
+                return _match_segment_duration(
+                    audio,
+                    duration_ms,
+                    frame_rate,
+                    sample_width,
+                    channels,
+                )
+
+            generated_audio = await _run_audio_cpu(_load_and_finalize_generated_audio)
         except Exception as exc:
             status = "error"
             error_message = str(exc)
@@ -10932,8 +10984,7 @@ async def _synthesize_translated_audio(
                     lambda: subprocess.run(unmixed_export_cmd, capture_output=True, text=True, timeout=600)
                 )
                 if unmixed_result.returncode == 0 and os.path.exists(unmixed_output_path):
-                    with open(unmixed_output_path, "rb") as infile:
-                        unmixed_audio_bytes = infile.read()
+                    unmixed_audio_bytes = await async_read_file(unmixed_output_path)
                     paths_to_cleanup.append(unmixed_output_path)
                 else:
                     print(f"⚠️ Failed to export dry translated audio: {unmixed_result.stderr[:300]}")
@@ -11041,8 +11092,7 @@ async def _synthesize_translated_audio(
                 await _run_blocking(lambda: combined_audio.export(buffer, format=audio_format, bitrate=bitrate or "192k"))
                 audio_bytes = buffer.getvalue()
             else:
-                with open(final_output_path, "rb") as f:
-                    audio_bytes = f.read()
+                audio_bytes = await async_read_file(final_output_path)
             
             export_elapsed = (time.perf_counter() - export_start) * 1000
             print(f"[synthesize] Export complete in {export_elapsed:.1f}ms ({len(audio_bytes) / 1024 / 1024:.1f} MB)")
@@ -11795,23 +11845,24 @@ async def _synthesize_tts_to_file(
 ) -> str:
     backend = _normalize_tts_backend(tts_backend, SETTINGS.tts_backend)
     if backend == TTS_BACKEND_INDEX:
-        await tts_manager.ensure_awake()
-        tts = tts_manager.get_tts()
-        return await tts.infer(
-            spk_audio_prompt=spk_audio_prompt,
-            text=text,
-            output_path=output_path,
-            interval_silence=interval_silence,
-            speech_length=speech_length,
-            diffusion_steps=diffusion_steps,
-            verbose=verbose,
-            speaker_preset=speaker_preset,
-            emo_audio_prompt=emo_audio_prompt,
-            emo_alpha=emo_alpha,
-            use_emo_text=use_emo_text,
-            emo_text=emo_text if use_emo_text else None,
-            max_text_tokens_per_sentence=max_text_tokens_per_sentence,
-        )
+        async with INDEXTTS_GPU_WORK_SLOTS:
+            await tts_manager.ensure_awake()
+            tts = tts_manager.get_tts()
+            return await tts.infer(
+                spk_audio_prompt=spk_audio_prompt,
+                text=text,
+                output_path=output_path,
+                interval_silence=interval_silence,
+                speech_length=speech_length,
+                diffusion_steps=diffusion_steps,
+                verbose=verbose,
+                speaker_preset=speaker_preset,
+                emo_audio_prompt=emo_audio_prompt,
+                emo_alpha=emo_alpha,
+                use_emo_text=use_emo_text,
+                emo_text=emo_text if use_emo_text else None,
+                max_text_tokens_per_sentence=max_text_tokens_per_sentence,
+            )
 
     if use_emo_text or emo_text or emo_audio_prompt:
         print("[Confucius4-TTS] Ignoring IndexTTS emotion controls for Confucius backend.")
@@ -11830,6 +11881,19 @@ async def _synthesize_tts_to_file(
         verbose=verbose,
         cache_prompt_audio=cache_prompt_audio,
     )
+
+
+async def _bounded_indextts_stream(tts: Any, **kwargs):
+    """Hold one bounded IndexTTS GPU slot for the lifetime of a stream."""
+    async with INDEXTTS_GPU_WORK_SLOTS:
+        async for item in tts.infer_stream(**kwargs):
+            yield item
+
+
+async def _bounded_indextts_infer(tts: Any, **kwargs):
+    """Run a non-streaming inference through the shared GPU admission bound."""
+    async with INDEXTTS_GPU_WORK_SLOTS:
+        return await tts.infer(**kwargs)
 
 
 # API Models
@@ -12354,7 +12418,8 @@ async def warmup_model():
         try:
             # Run first warmup inference
             print("🔥 Warmup 1/2: Modern text with voice_01.wav...")
-            await tts.infer(
+            await _bounded_indextts_infer(
+                tts,
                 spk_audio_prompt=warmup_audio_1,
                 text=warmup_text_1,
                 output_path=warmup_output_1,
@@ -12394,7 +12459,8 @@ async def warmup_model():
         try:
             # Run second warmup inference
             print("🔥 Warmup 2/2: Ancient poetry with voice_02.wav...")
-            await tts.infer(
+            await _bounded_indextts_infer(
+                tts,
                 spk_audio_prompt=warmup_audio_2,
                 text=warmup_text_2,
                 output_path=warmup_output_2,
@@ -12447,6 +12513,8 @@ async def lifespan(app: FastAPI):
     await confucius_backend_manager.shutdown()
     # Shutdown the thread executor
     executor.shutdown(wait=True)
+    io_executor.shutdown(wait=True)
+    audio_executor.shutdown(wait=True)
 
 def create_app() -> FastAPI:
     return FastAPI(
@@ -12491,15 +12559,86 @@ async def internal_snapshot_wake(request: Request):
 
 # Web Interface - HTML file path for hot reload support
 _HTML_UI_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index_new.html")
+_HTML_UI_CACHE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _HtmlUiCacheEntry:
+    fingerprint: Tuple[int, int]
+    identity: bytes
+    gzip_body: bytes
+    etag: str
+
+
+_HTML_UI_CACHE_ENTRY: Optional[_HtmlUiCacheEntry] = None
+
+
+def _load_html_ui_cache_sync() -> _HtmlUiCacheEntry:
+    """Load and compress the UI once per file version."""
+    global _HTML_UI_CACHE_ENTRY
+
+    stat_result = os.stat(_HTML_UI_FILE_PATH)
+    fingerprint = (stat_result.st_mtime_ns, stat_result.st_size)
+    with _HTML_UI_CACHE_LOCK:
+        cached = _HTML_UI_CACHE_ENTRY
+        if cached is not None and cached.fingerprint == fingerprint:
+            return cached
+
+        with open(_HTML_UI_FILE_PATH, "r", encoding="utf-8") as ui_file:
+            html_content = ui_file.read()
+        html_content = html_content.replace(
+            "{{CHUNK_SPLIT_MIN_SILENCE_MS}}",
+            str(CHUNK_SPLIT_MIN_SILENCE_MS),
+        )
+        identity = html_content.encode("utf-8")
+        cached = _HtmlUiCacheEntry(
+            fingerprint=fingerprint,
+            identity=identity,
+            gzip_body=gzip.compress(identity, compresslevel=6, mtime=0),
+            etag=f'W/"{hashlib.sha256(identity).hexdigest()}"',
+        )
+        _HTML_UI_CACHE_ENTRY = cached
+        return cached
+
+
+def _request_accepts_gzip(request: Request) -> bool:
+    for item in request.headers.get("accept-encoding", "").lower().split(","):
+        encoding, *parameters = (part.strip() for part in item.split(";"))
+        if encoding != "gzip":
+            continue
+        for parameter in parameters:
+            if not parameter.startswith("q="):
+                continue
+            try:
+                return float(parameter[2:]) > 0
+            except ValueError:
+                return False
+        return True
+    return False
 
 @app.get("/", response_class=HTMLResponse)
-async def home():
+async def home(request: Request):
     try:
-        with open(_HTML_UI_FILE_PATH, "r", encoding="utf-8") as f:
-            html_content = f.read()
-        # Inject dynamic configuration values
-        html_content = html_content.replace("{{CHUNK_SPLIT_MIN_SILENCE_MS}}", str(CHUNK_SPLIT_MIN_SILENCE_MS))
-        return html_content
+        cached = await _run_io(_load_html_ui_cache_sync)
+        common_headers = {
+            "Cache-Control": "no-cache",
+            "ETag": cached.etag,
+            "Vary": "Accept-Encoding",
+        }
+        if request.headers.get("if-none-match") == cached.etag:
+            return Response(status_code=304, headers=common_headers)
+
+        if _request_accepts_gzip(request):
+            return Response(
+                content=cached.gzip_body,
+                media_type="text/html",
+                headers={**common_headers, "Content-Encoding": "gzip"},
+            )
+        return Response(
+            content=cached.identity,
+            media_type="text/html",
+            headers=common_headers,
+        )
     except FileNotFoundError:
         return HTMLResponse(
             content="<h1>Error: index_new.html not found</h1><p>Please ensure index_new.html exists in the same directory as fastapi_webui_v2.py</p>",
@@ -18350,7 +18489,8 @@ async def speak_stream(req: SpeakRequest):
             """Generator that yields audio chunks as they are produced"""
             try:
                 chunk_count = 0
-                async for chunk_idx, wav_cpu, is_last in tts.infer_stream(
+                async for chunk_idx, wav_cpu, is_last in _bounded_indextts_stream(
+                    tts,
                     spk_audio_prompt="",
                     text=req.text,
                     speaker_preset=req.name,
@@ -18365,7 +18505,12 @@ async def speak_stream(req: SpeakRequest):
                 ):
                     chunk_count += 1
                     print(f"🎵 Streaming chunk {chunk_idx} (is_last={is_last})")
-                    audio_bytes = _encode_streaming_audio_chunk(wav_cpu, req.response_format, req.speaker_effects)
+                    audio_bytes = await _run_audio_cpu(
+                        _encode_streaming_audio_chunk,
+                        wav_cpu,
+                        req.response_format,
+                        req.speaker_effects,
+                    )
                     yield _streaming_audio_frame(chunk_idx, audio_bytes, is_last)
                 
                 print(f"✅ Streaming complete: {chunk_count} chunks sent")
@@ -18456,7 +18601,8 @@ async def clone_voice_stream(
             """Generator that yields audio chunks as they are produced"""
             try:
                 chunk_count = 0
-                async for chunk_idx, wav_cpu, is_last in tts.infer_stream(
+                async for chunk_idx, wav_cpu, is_last in _bounded_indextts_stream(
+                    tts,
                     spk_audio_prompt=tmp_path,
                     text=req.text,
                     use_emo_text=use_emotion_text,
@@ -18470,7 +18616,12 @@ async def clone_voice_stream(
                 ):
                     chunk_count += 1
                     print(f"🎵 Streaming chunk {chunk_idx} (is_last={is_last})")
-                    audio_bytes = _encode_streaming_audio_chunk(wav_cpu, req.response_format, req.speaker_effects)
+                    audio_bytes = await _run_audio_cpu(
+                        _encode_streaming_audio_chunk,
+                        wav_cpu,
+                        req.response_format,
+                        req.speaker_effects,
+                    )
                     yield _streaming_audio_frame(chunk_idx, audio_bytes, is_last)
                 
                 print(f"✅ Streaming complete: {chunk_count} chunks sent")

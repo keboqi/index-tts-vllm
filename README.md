@@ -13,7 +13,7 @@ Working on IndexTTS2 support, coming soon... 0.0
 推理速度在单卡 RTX 4090 上的提升为：
 - 单个请求的 RTF (Real-Time Factor)：≈0.3 -> ≈0.1
 - 单个请求的 gpt 模型 decode 速度：≈90 token / s -> ≈280 token / s
-- 并发量：gpu_memory_utilization设置为0.25（约5GB显存）的情况下，实测 16 左右的并发无压力（测速脚本参考 `simple_test.py`）
+- 并发量：gpu_memory_utilization设置为0.15时，可按实际显存容量测试并发量（测速脚本参考 `simple_test.py`）
 
 ## 新特性
 - 支持多角色音频混合：可以传入多个参考音频，TTS 输出的角色声线为多个参考音频的混合版本（输入多个参考音频会导致输出的角色声线不稳定，可以抽卡抽到满意的声线再作为参考音频）
@@ -106,7 +106,8 @@ python api_server.py --model_dir /your/path/to/Index-TTS
 - `--model_dir`: 必填，模型权重路径
 - `--host`: 服务ip地址，默认为 `6006`
 - `--port`: 服务端口，默认为 `0.0.0.0`
-- `--gpu_memory_utilization`: vllm 显存占用率，默认设置为 `0.25`
+- `--gpu_memory_utilization`: IndexTTS2 vLLM 显存占用率，默认设置为 `0.15`
+- `--qwenemo_gpu_memory_utilization`: QwenEmotion vLLM 显存占用率，默认设置为 `0.05`
 
 ### 请求示例
 参考 `api_example.py`
