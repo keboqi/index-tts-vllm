@@ -12,6 +12,8 @@ INSTALL_SYSTEM_DEPS="${INSTALL_SYSTEM_DEPS:-1}"
 INSTALL_CONFUCIUS="${INSTALL_CONFUCIUS:-1}"
 DOWNLOAD_MODEL="${DOWNLOAD_MODEL:-1}"
 RUN_SERVER="${RUN_SERVER:-1}"
+EXPORT_TUNNEL="${EXPORT_TUNNEL:-1}"
+SERVER_PORT="${SERVER_PORT:-8000}"
 UV_BIN="${UV_BIN:-uv}"
 
 if [[ "${1:-}" == "--setup-only" ]]; then
@@ -137,8 +139,10 @@ install_python_dependencies() {
             --no-build-isolation flash-attn
     fi
 
-    # qwen-asr is deliberately excluded: requirements.txt installs qwen-tts, and
-    # their current releases pin incompatible exact transformers versions.
+    # Qwen3-ASR + OmniVAD: required for the translate_audio pipeline.
+    # The README quick start installs these directly and is battle-tested.
+    log "Installing Qwen3-ASR and OmniVAD for translation pipeline"
+    "${UV_BIN}" pip install --python "${python}" qwen-asr omnivad sentencepiece
 }
 
 download_model() {
@@ -172,9 +176,21 @@ if [[ "${RUN_SERVER}" != "1" ]]; then
     exit 0
 fi
 
-log "Starting FastAPI WebUI"
+# Export port 8000 via Cloudflare tunnel (runs in background)
+EXPORT_SCRIPT="${SCRIPT_DIR}/export_services.sh"
+if [[ "${EXPORT_TUNNEL}" == "1" ]] && [[ -x "${EXPORT_SCRIPT}" ]]; then
+    log "Exporting port ${SERVER_PORT} via Cloudflare tunnel"
+    bash "${EXPORT_SCRIPT}" start "${SERVER_PORT}" &
+    TUNNEL_PID=$!
+    log "Cloudflare tunnel starting in background (PID: ${TUNNEL_PID})"
+elif [[ "${EXPORT_TUNNEL}" == "1" ]]; then
+    log "export_services.sh not found or not executable at ${EXPORT_SCRIPT}; skipping tunnel"
+fi
+
+log "Starting FastAPI WebUI on port ${SERVER_PORT}"
 exec "${VENV_DIR}/bin/python" fastapi_webui_v2.py \
     --use_torch_compile \
     --model_dir "${MODEL_DIR}" \
+    --port "${SERVER_PORT}" \
     --confucius_repo_dir "${CONFUCIUS_REPO_DIR}" \
     "$@"
