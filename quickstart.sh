@@ -128,7 +128,7 @@ install_python_dependencies() {
     "${UV_BIN}" pip install --python "${python}" flashinfer-python
     if ! "${python}" -c 'import flash_attn' >/dev/null 2>&1; then
         "${UV_BIN}" pip install --python "${python}" \
-            --no-build-isolation --no-cache flash-attn
+            --no-build-isolation flash-attn
     fi
 
     # qwen-asr is deliberately excluded: requirements.txt installs qwen-tts, and
