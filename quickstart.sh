@@ -95,6 +95,12 @@ ensure_venv() {
     "${UV_BIN}" venv --seed --python "${PYTHON_VERSION}" "${VENV_DIR}"
 }
 
+activate_venv() {
+    VIRTUAL_ENV="$(cd -- "${VENV_DIR}" && pwd)"
+    export VIRTUAL_ENV
+    export PATH="${VIRTUAL_ENV}/bin:${PATH}"
+}
+
 install_python_dependencies() {
     local python="${VENV_DIR}/bin/python"
 
@@ -151,6 +157,7 @@ ensure_system_dependencies
 ensure_uv
 ensure_confucius_checkout
 ensure_venv
+activate_venv
 install_python_dependencies
 download_model
 
