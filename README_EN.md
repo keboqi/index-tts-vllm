@@ -40,7 +40,7 @@ export YTDLP_NODE_PATH="$(node -p 'process.execPath')"
 python fastapi_webui_v2.py --use_torch_compile --confucius_repo_dir ../Confucius4-TTS
 ```
 
-`Confucius4-TTS` and `Higgs Audio SGLang` are optional and lazy-loaded. The default TTS backend remains IndexTTS; when the UI or API selects `tts_backend=confucius` or `tts_backend=higgs`, `fastapi_webui_v2.py` starts and manages the selected external TTS service on demand. Default local ports are WebUI `8000`, Confucius `8001`, and Higgs SGLang `8002`.
+`Confucius4-TTS` and `Higgs Audio SGLang` are optional and lazy-loaded. The default TTS backend remains IndexTTS; when the UI or API selects `tts_backend=confucius` or `tts_backend=higgs`, `fastapi_webui_v2.py` starts and manages the selected external TTS service on demand. Default local ports are WebUI `8000`, Confucius `8001`, and Higgs SGLang `8002`. The WebUI automatically uses the streaming transport for these external backends so cold starts can emit keepalive frames through Cloudflare/local tunnels instead of timing out silently.
 
 ```bash
 npx localtunnel --port 8000
@@ -191,11 +191,12 @@ python fastapi_webui_v2.py [OPTIONS]
 - `--confucius_repo_dir` (string): Path to a sibling `Confucius4-TTS` checkout used for lazy startup (default: `../Confucius4-TTS`).
 - `--confucius_host` / `--confucius_port`: Host and port for the managed Confucius FastAPI backend (default: `127.0.0.1:8001`).
 - `--confucius_start_command` (string): Optional custom command for starting Confucius instead of the built-in launcher.
-- `--confucius_start_timeout` / `--confucius_request_timeout`: Startup and synthesis request timeouts in seconds.
+- `--confucius_start_timeout` / `--confucius_request_timeout`: Startup and synthesis request timeouts in seconds (defaults: `1800` / `900`).
 - `--higgs_server_url`: URL for the managed or external Higgs SGLang endpoint (default: `http://127.0.0.1:8002`).
 - `--higgs_manager_script`: Docker manager script copied into this repo from `higgs_tts_gradio` (default: `sglang_omni_higgs.sh`).
 - `--higgs_manage_backend` / `--no-higgs_manage_backend`: Start/stop Higgs SGLang lazily from the WebUI, or require a manually managed endpoint.
-- `--higgs_start_timeout` / `--higgs_request_timeout`: Startup and synthesis request timeouts in seconds.
+- `--higgs_start_timeout` / `--higgs_request_timeout`: Startup and synthesis request timeouts in seconds (defaults: `3600` / `1800`).
+- `EXTERNAL_TTS_STREAM_KEEPALIVE_SECONDS` (env): Heartbeat interval for external-backend stream responses (default: `15`).
 - `--verbose` (flag): Enable verbose logging output in the console.
 
 ### Confucius4-TTS Backend
@@ -225,7 +226,7 @@ The Higgs integration reuses `sglang_omni_higgs.sh` from `higgs_tts_gradio`, wit
 bash sglang_omni_higgs.sh start
 ```
 
-The endpoint is OpenAI-style `/v1/audio/speech` through SGLang Omni. Higgs does not expose native duration control, so translate/edit requests generate speech first and then post-process the WAV with FFmpeg time-stretching plus exact trim/pad matching before segment assembly. IndexTTS emotion text/weight controls are ignored for Higgs.
+The endpoint is OpenAI-style `/v1/audio/speech` through SGLang Omni. Higgs does not expose native duration control, so translate/edit requests generate speech first and then post-process the WAV with FFmpeg time-stretching plus exact trim/pad matching before segment assembly. Higgs also does not auto-chunk long text, so the adapter uses the same IndexTTS tokenizer splitting mechanism before sending chunks to SGLang, concatenates the generated WAV chunks, then applies duration matching once to the combined audio. IndexTTS emotion text/weight controls are ignored for Higgs.
 
 ---
 
@@ -259,11 +260,12 @@ Clone a voice using an uploaded reference audio file (zero-shot synthesis).
 - **Response**: `audio/mpeg` binary audio data (MP3).
 
 #### 3. POST `/speak_stream`
-Generate speech with streaming chunks for ultra-low latency.
+Generate speech with streaming chunks for low latency and external-backend cold-start keepalives.
 - **Request Body (JSON)**: Same parameters as `/speak`.
-- **Response**: `text/event-stream` SSE chunks.
+- **Response**: `application/octet-stream` binary frames.
   - Stream Format: `CHUNK:{idx}:{size}:{status}\n{audio_bytes}`
-  - Status: `CONTINUE` (more chunks follow) or `LAST` (final chunk).
+  - Status: `MORE` (more chunks follow) or `LAST` (final chunk).
+  - External backends may also send `KEEPALIVE:{size}\n{json}` frames before the final audio chunk.
 
 #### 4. POST `/clone_voice_stream`
 Clone a voice with streaming chunk outputs.

@@ -6517,8 +6517,9 @@
                 try {
                     const startTime = performance.now();
 
-                    if (streamingMode) {
-                        // Streaming mode
+                    const useStreamingTransport = streamingMode || ttsBackend === 'confucius' || ttsBackend === 'higgs';
+                    if (useStreamingTransport) {
+                        // Streaming transport keeps long external backend cold starts alive through tunnels/proxies.
                         await handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime, ttsBackend, ttsLanguage);
                     } else {
                         // Regular mode
@@ -12568,6 +12569,43 @@
                         if (headerText.startsWith('ERROR:')) {
                             showStatus(`Streaming error: ${headerText.substring(6)}`, 'error');
                             return;
+                        }
+
+                        if (headerText.startsWith('KEEPALIVE:')) {
+                            const parts = headerText.split(':');
+                            const parsedPayloadSize = parts.length >= 2 ? parseInt(parts[1]) : 0;
+                            const payloadSize = Number.isFinite(parsedPayloadSize) && parsedPayloadSize > 0
+                                ? parsedPayloadSize
+                                : 0;
+                            const payloadStart = headerEnd + 1;
+                            const payloadEnd = payloadStart + payloadSize;
+
+                            if (buffer.length < payloadEnd) break;
+
+                            const payloadData = buffer.slice(payloadStart, payloadEnd);
+                            buffer = buffer.slice(payloadEnd);
+
+                            let payload = {};
+                            try {
+                                const payloadText = new TextDecoder().decode(payloadData);
+                                payload = payloadText ? JSON.parse(payloadText) : {};
+                            } catch (parseError) {
+                                console.warn('Failed to parse streaming keepalive:', parseError);
+                            }
+                            const elapsed = typeof payload.elapsed_seconds === 'number'
+                                ? ` (${payload.elapsed_seconds}s)`
+                                : '';
+                            const message = payload.message || `External TTS backend is still working${elapsed}.`;
+                            showStatus(message, 'info');
+                            if (firstChunkTime === null) {
+                                document.getElementById('audioResult').innerHTML = `
+                                    <div style="background: rgba(30, 41, 59, 0.55); padding: 16px; border-radius: 10px; margin: 10px 0; border: 1px solid var(--border);">
+                                        <h3 style="margin: 0 0 8px 0;">External backend warming up...</h3>
+                                        <div style="color: var(--text-muted);">${message}</div>
+                                    </div>
+                                `;
+                            }
+                            continue;
                         }
 
                         if (!headerText.startsWith('CHUNK:')) break;

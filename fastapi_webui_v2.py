@@ -210,9 +210,13 @@ TTS_BACKEND_CONFUCIUS = "confucius"
 TTS_BACKEND_HIGGS = "higgs"
 ALLOWED_TTS_BACKENDS = {TTS_BACKEND_INDEX, TTS_BACKEND_CONFUCIUS, TTS_BACKEND_HIGGS}
 TTSBackendName = Literal["index", "confucius", "higgs"]
+CONFUCIUS_DEFAULT_START_TIMEOUT = 1800.0
+CONFUCIUS_DEFAULT_REQUEST_TIMEOUT = 900.0
 HIGGS_DEFAULT_MODEL = "bosonai/higgs-audio-v3-tts-4b"
 HIGGS_DEFAULT_SERVER_URL = "http://127.0.0.1:8002"
 HIGGS_SPEECH_PATH = "/v1/audio/speech"
+HIGGS_DEFAULT_START_TIMEOUT = 3600.0
+HIGGS_DEFAULT_REQUEST_TIMEOUT = 1800.0
 
 
 def _normalize_transcription_pipeline(value: Any, default: str = "gemini") -> str:
@@ -309,8 +313,8 @@ class AppSettings:
     confucius_detach_process: bool = True
     confucius_attach_stdio: bool = False
     confucius_log_dir: str = ""
-    confucius_start_timeout: float = 900.0
-    confucius_request_timeout: float = 600.0
+    confucius_start_timeout: float = CONFUCIUS_DEFAULT_START_TIMEOUT
+    confucius_request_timeout: float = CONFUCIUS_DEFAULT_REQUEST_TIMEOUT
     confucius_keepalive_interval: float = 60.0
     confucius_unhealthy_grace: float = 30.0
     confucius_vllm_gpu_memory_utilization: float = 0.15
@@ -318,8 +322,8 @@ class AppSettings:
     higgs_model: str = HIGGS_DEFAULT_MODEL
     higgs_manage_backend: bool = True
     higgs_manager_script: str = "sglang_omni_higgs.sh"
-    higgs_start_timeout: float = 1800.0
-    higgs_request_timeout: float = 900.0
+    higgs_start_timeout: float = HIGGS_DEFAULT_START_TIMEOUT
+    higgs_request_timeout: float = HIGGS_DEFAULT_REQUEST_TIMEOUT
     higgs_mem_fraction_static: float = 0.30
     higgs_max_new_tokens: int = 4096
     higgs_temperature: float = 0.8
@@ -346,8 +350,8 @@ class AppSettings:
             confucius_detach_process=bool(getattr(args, "confucius_detach_process", True)),
             confucius_attach_stdio=bool(getattr(args, "confucius_attach_stdio", False)),
             confucius_log_dir=str(getattr(args, "confucius_log_dir", "")),
-            confucius_start_timeout=float(getattr(args, "confucius_start_timeout", 900.0)),
-            confucius_request_timeout=float(getattr(args, "confucius_request_timeout", 600.0)),
+            confucius_start_timeout=float(getattr(args, "confucius_start_timeout", CONFUCIUS_DEFAULT_START_TIMEOUT)),
+            confucius_request_timeout=float(getattr(args, "confucius_request_timeout", CONFUCIUS_DEFAULT_REQUEST_TIMEOUT)),
             confucius_keepalive_interval=float(getattr(args, "confucius_keepalive_interval", 60.0)),
             confucius_unhealthy_grace=float(getattr(args, "confucius_unhealthy_grace", 30.0)),
             confucius_vllm_gpu_memory_utilization=float(
@@ -357,8 +361,8 @@ class AppSettings:
             higgs_model=str(getattr(args, "higgs_model", HIGGS_DEFAULT_MODEL)),
             higgs_manage_backend=bool(getattr(args, "higgs_manage_backend", True)),
             higgs_manager_script=str(getattr(args, "higgs_manager_script", "sglang_omni_higgs.sh")),
-            higgs_start_timeout=float(getattr(args, "higgs_start_timeout", 1800.0)),
-            higgs_request_timeout=float(getattr(args, "higgs_request_timeout", 900.0)),
+            higgs_start_timeout=float(getattr(args, "higgs_start_timeout", HIGGS_DEFAULT_START_TIMEOUT)),
+            higgs_request_timeout=float(getattr(args, "higgs_request_timeout", HIGGS_DEFAULT_REQUEST_TIMEOUT)),
             higgs_mem_fraction_static=float(getattr(args, "higgs_mem_fraction_static", 0.30)),
             higgs_max_new_tokens=int(getattr(args, "higgs_max_new_tokens", 4096)),
             higgs_temperature=float(getattr(args, "higgs_temperature", 0.8)),
@@ -622,6 +626,12 @@ HIGGS_TTS_WORK_CONCURRENCY = _env_int(
     100,
     min_value=1,
     max_value=256,
+)
+EXTERNAL_TTS_STREAM_KEEPALIVE_SECONDS = _env_float(
+    "EXTERNAL_TTS_STREAM_KEEPALIVE_SECONDS",
+    15.0,
+    min_value=1.0,
+    max_value=60.0,
 )
 MIN_SPEECH_DURATION_MS = 3000
 MAX_MERGE_INTERVAL_MS = 0
@@ -3656,8 +3666,18 @@ parser.add_argument(
     default=os.environ.get("CONFUCIUS_LOG_DIR", ""),
     help="Directory for managed Confucius4-TTS stdout/stderr logs; defaults to outputs/confucius_backend_logs",
 )
-parser.add_argument("--confucius_start_timeout", type=float, default=900.0, help="Seconds to wait for lazy Confucius4-TTS startup")
-parser.add_argument("--confucius_request_timeout", type=float, default=600.0, help="Seconds to wait for each Confucius4-TTS synthesis request")
+parser.add_argument(
+    "--confucius_start_timeout",
+    type=float,
+    default=_env_float("CONFUCIUS_START_TIMEOUT", CONFUCIUS_DEFAULT_START_TIMEOUT, min_value=1.0),
+    help="Seconds to wait for lazy Confucius4-TTS startup",
+)
+parser.add_argument(
+    "--confucius_request_timeout",
+    type=float,
+    default=_env_float("CONFUCIUS_REQUEST_TIMEOUT", CONFUCIUS_DEFAULT_REQUEST_TIMEOUT, min_value=1.0),
+    help="Seconds to wait for each Confucius4-TTS synthesis request",
+)
 parser.add_argument(
     "--confucius_keepalive_interval",
     type=float,
@@ -3700,8 +3720,8 @@ parser.add_argument(
     default=os.environ.get("HIGGS_TTS_MANAGER_SCRIPT", "sglang_omni_higgs.sh"),
     help="Path to the copied Higgs SGLang manager script",
 )
-parser.add_argument("--higgs_start_timeout", type=float, default=_env_float("HIGGS_TTS_START_TIMEOUT", 1800.0, min_value=1.0), help="Seconds to wait for managed Higgs SGLang startup")
-parser.add_argument("--higgs_request_timeout", type=float, default=_env_float("HIGGS_TTS_REQUEST_TIMEOUT", 900.0, min_value=1.0), help="Seconds to wait for each Higgs synthesis request")
+parser.add_argument("--higgs_start_timeout", type=float, default=_env_float("HIGGS_TTS_START_TIMEOUT", HIGGS_DEFAULT_START_TIMEOUT, min_value=1.0), help="Seconds to wait for managed Higgs SGLang startup")
+parser.add_argument("--higgs_request_timeout", type=float, default=_env_float("HIGGS_TTS_REQUEST_TIMEOUT", HIGGS_DEFAULT_REQUEST_TIMEOUT, min_value=1.0), help="Seconds to wait for each Higgs synthesis request")
 parser.add_argument(
     "--higgs_mem_fraction_static",
     type=float,
@@ -3736,8 +3756,8 @@ except SystemExit:
         confucius_detach_process=_env_flag("CONFUCIUS_DETACH_PROCESS", True),
         confucius_attach_stdio=_env_flag("CONFUCIUS_ATTACH_STDIO", False),
         confucius_log_dir=os.environ.get("CONFUCIUS_LOG_DIR", ""),
-        confucius_start_timeout=900.0,
-        confucius_request_timeout=600.0,
+        confucius_start_timeout=_env_float("CONFUCIUS_START_TIMEOUT", CONFUCIUS_DEFAULT_START_TIMEOUT, min_value=1.0),
+        confucius_request_timeout=_env_float("CONFUCIUS_REQUEST_TIMEOUT", CONFUCIUS_DEFAULT_REQUEST_TIMEOUT, min_value=1.0),
         confucius_keepalive_interval=_env_float(
             "CONFUCIUS_KEEPALIVE_INTERVAL",
             60.0,
@@ -3758,8 +3778,8 @@ except SystemExit:
         higgs_model=os.environ.get("HIGGS_TTS_MODEL", HIGGS_DEFAULT_MODEL),
         higgs_manage_backend=_env_flag("HIGGS_TTS_MANAGE_BACKEND", True),
         higgs_manager_script=os.environ.get("HIGGS_TTS_MANAGER_SCRIPT", "sglang_omni_higgs.sh"),
-        higgs_start_timeout=_env_float("HIGGS_TTS_START_TIMEOUT", 1800.0, min_value=1.0),
-        higgs_request_timeout=_env_float("HIGGS_TTS_REQUEST_TIMEOUT", 900.0, min_value=1.0),
+        higgs_start_timeout=_env_float("HIGGS_TTS_START_TIMEOUT", HIGGS_DEFAULT_START_TIMEOUT, min_value=1.0),
+        higgs_request_timeout=_env_float("HIGGS_TTS_REQUEST_TIMEOUT", HIGGS_DEFAULT_REQUEST_TIMEOUT, min_value=1.0),
         higgs_mem_fraction_static=_env_float("HIGGS_TTS_MEM_FRACTION_STATIC", 0.30, min_value=0.01, max_value=1.0),
         higgs_max_new_tokens=_env_int("HIGGS_TTS_MAX_NEW_TOKENS", 4096, min_value=1),
         higgs_temperature=_env_float("HIGGS_TTS_TEMPERATURE", 0.8, min_value=0.0),
@@ -4858,6 +4878,81 @@ def _write_higgs_audio_response_sync(
         _safe_remove_file(temp_path)
 
 
+def _fallback_split_higgs_text(text: str, max_chars: int) -> List[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    max_chars = max(40, int(max_chars or 120))
+    pieces = re.split(r"([.!?;]\s*)", text)
+    segments: List[str] = []
+    current = ""
+    for idx in range(0, len(pieces), 2):
+        part = pieces[idx] or ""
+        delimiter = pieces[idx + 1] if idx + 1 < len(pieces) else ""
+        candidate = f"{part}{delimiter}".strip()
+        if not candidate:
+            continue
+        if current and len(current) + len(candidate) + 1 > max_chars:
+            segments.append(current.strip())
+            current = candidate
+        else:
+            current = f"{current} {candidate}".strip() if current else candidate
+    if current:
+        segments.append(current.strip())
+    if not segments:
+        segments = [text[i : i + max_chars].strip() for i in range(0, len(text), max_chars)]
+    return [segment for segment in segments if segment]
+
+
+def _split_higgs_text_like_indextts(text: str, max_text_tokens_per_sentence: int) -> List[str]:
+    source = (text or "").strip()
+    if not source:
+        return []
+    max_tokens = max(1, int(max_text_tokens_per_sentence or 120))
+    try:
+        tokenizer = getattr(tts_manager.get_tts(), "tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError("IndexTTS tokenizer is not available")
+        text_tokens = tokenizer.tokenize(source)
+        if len(text_tokens) <= max_tokens:
+            return [source]
+        sentences = tokenizer.split_sentences(text_tokens, max_tokens)
+        chunks: List[str] = []
+        for sentence_tokens in sentences:
+            if not sentence_tokens:
+                continue
+            token_ids = tokenizer.convert_tokens_to_ids(sentence_tokens)
+            chunk_text = tokenizer.decode(token_ids).strip()
+            if chunk_text:
+                chunks.append(chunk_text)
+        if chunks:
+            return chunks
+    except Exception as exc:
+        print(f"[Higgs SGLang] IndexTTS-style text splitting failed; using fallback splitter: {exc}")
+
+    # Fallback is character based, but only used when the IndexTTS tokenizer is unavailable.
+    return _fallback_split_higgs_text(source, max_tokens * 4) or [source]
+
+
+def _concat_higgs_audio_chunks_sync(input_paths: List[str], output_path: str) -> None:
+    if not input_paths:
+        raise ValueError("No Higgs audio chunks were generated.")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    if len(input_paths) == 1:
+        shutil.copyfile(input_paths[0], output_path)
+        return
+    try:
+        _ffmpeg_concat_files(input_paths, output_path, copy_codec=True, target_format="wav")
+        return
+    except Exception as exc:
+        print(f"[Higgs SGLang] FFmpeg chunk concat failed; using pydub fallback: {exc}")
+
+    combined = AudioSegment.silent(duration=0)
+    for path in input_paths:
+        combined += AudioSegment.from_file(path)
+    combined.export(output_path, format="wav")
+
+
 class ManagedHiggsSGLangBackend:
     """Lazy manager and OpenAI-compatible client for Higgs Audio through SGLang."""
 
@@ -4995,6 +5090,46 @@ class ManagedHiggsSGLangBackend:
             payload["references"] = [reference]
         return payload
 
+    async def _request_audio_to_file(
+        self,
+        *,
+        text: str,
+        output_path: str,
+        prompt_wav: Optional[str],
+        reference_text: Optional[str],
+        temperature: Optional[float],
+        top_k: Optional[int],
+        top_p: Optional[float],
+        max_new_tokens: Optional[int],
+        seed: Optional[int],
+    ) -> str:
+        payload = self._build_payload(
+            text=text,
+            prompt_wav=prompt_wav,
+            reference_text=reference_text,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
+            seed=seed,
+        )
+        async with HIGGS_TTS_WORK_SLOTS:
+            audio_bytes, headers = await _run_blocking(
+                _http_json_audio_post_with_headers_sync,
+                f"{self.base_url}{HIGGS_SPEECH_PATH}",
+                payload,
+                max(1.0, float(SETTINGS.higgs_request_timeout)),
+                error_prefix="Higgs SGLang",
+            )
+        await _run_audio_cpu(
+            _write_higgs_audio_response_sync,
+            output_path,
+            audio_bytes,
+            headers,
+            "wav",
+        )
+        return output_path
+
     async def synthesize_to_file(
         self,
         *,
@@ -5003,6 +5138,7 @@ class ManagedHiggsSGLangBackend:
         prompt_wav: Optional[str],
         reference_text: Optional[str] = None,
         speech_length: int = 0,
+        max_text_tokens_per_sentence: int = 120,
         temperature: Optional[float] = None,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
@@ -5012,31 +5148,59 @@ class ManagedHiggsSGLangBackend:
         self._active_requests += 1
         try:
             await self.ensure_ready()
-            payload = self._build_payload(
-                text=text,
-                prompt_wav=prompt_wav,
-                reference_text=reference_text,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                max_new_tokens=max_new_tokens,
-                seed=seed,
-            )
-            async with HIGGS_TTS_WORK_SLOTS:
-                audio_bytes, headers = await _run_blocking(
-                    _http_json_audio_post_with_headers_sync,
-                    f"{self.base_url}{HIGGS_SPEECH_PATH}",
-                    payload,
-                    max(1.0, float(SETTINGS.higgs_request_timeout)),
-                    error_prefix="Higgs SGLang",
-                )
-            await _run_audio_cpu(
-                _write_higgs_audio_response_sync,
-                output_path,
-                audio_bytes,
-                headers,
-                "wav",
-            )
+            text_chunks = _split_higgs_text_like_indextts(text, max_text_tokens_per_sentence)
+            if not text_chunks:
+                text_chunks = [text]
+
+            chunk_paths: List[str] = []
+            try:
+                if len(text_chunks) == 1:
+                    await self._request_audio_to_file(
+                        text=text_chunks[0],
+                        output_path=output_path,
+                        prompt_wav=prompt_wav,
+                        reference_text=reference_text,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        max_new_tokens=max_new_tokens,
+                        seed=seed,
+                    )
+                else:
+                    print(
+                        f"[Higgs SGLang] Splitting long text into {len(text_chunks)} chunks "
+                        f"(max_text_tokens_per_sentence={max_text_tokens_per_sentence})."
+                    )
+                    output = Path(output_path)
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    for index, chunk_text in enumerate(text_chunks):
+                        chunk_path = str(
+                            output.with_name(
+                                f"{output.stem}_higgs_chunk_{index + 1:03d}_{uuid.uuid4().hex}.wav"
+                            )
+                        )
+                        chunk_paths.append(chunk_path)
+                        chunk_seed = (
+                            int(seed) + index
+                            if seed is not None and int(seed) >= 0
+                            else seed
+                        )
+                        await self._request_audio_to_file(
+                            text=chunk_text,
+                            output_path=chunk_path,
+                            prompt_wav=prompt_wav,
+                            reference_text=reference_text,
+                            temperature=temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                            max_new_tokens=max_new_tokens,
+                            seed=chunk_seed,
+                        )
+                    await _run_audio_cpu(_concat_higgs_audio_chunks_sync, chunk_paths, output_path)
+            finally:
+                for chunk_path in chunk_paths:
+                    await async_remove_file(chunk_path)
+
             if speech_length and int(speech_length) > 0:
                 await _postprocess_higgs_duration(output_path, int(speech_length))
             return output_path
@@ -7434,6 +7598,16 @@ def _streaming_audio_frame(chunk_idx: int, audio_bytes: bytes, is_last: bool) ->
     state = "LAST" if is_last else "MORE"
     header = f"CHUNK:{chunk_idx}:{len(audio_bytes)}:{state}\n".encode("utf-8")
     return header + audio_bytes
+
+
+def _streaming_keepalive_frame(message: str, *, elapsed_seconds: Optional[int] = None) -> bytes:
+    payload = {
+        "message": message,
+        "elapsed_seconds": elapsed_seconds,
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    header = f"KEEPALIVE:{len(data)}\n".encode("utf-8")
+    return header + data
 
 
 STREAMING_RESPONSE_HEADERS = {
@@ -12478,6 +12652,7 @@ async def _synthesize_tts_to_file(
             prompt_wav=prompt_wav,
             reference_text=reference_text,
             speech_length=speech_length,
+            max_text_tokens_per_sentence=max_text_tokens_per_sentence,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
@@ -19075,6 +19250,58 @@ async def server_info():
     except Exception as e:
         return _success_error(f"Failed to get server info: {str(e)}")
 
+
+async def _external_tts_single_audio_stream(
+    *,
+    backend_label: str,
+    synthesis: Awaitable[str],
+    result_path: str,
+    response_format: str,
+    speaker_effects: Any = None,
+    cleanup_paths: Optional[List[Optional[str]]] = None,
+):
+    """Stream progress heartbeats while a non-streaming external TTS backend runs."""
+    started = time.perf_counter()
+    task = asyncio.create_task(synthesis)
+    cleanup_items = [result_path]
+    cleanup_items.extend(cleanup_paths or [])
+    try:
+        yield _streaming_keepalive_frame(
+            f"{backend_label} request accepted; backend may still be starting.",
+            elapsed_seconds=0,
+        )
+        while not task.done():
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=max(1.0, float(EXTERNAL_TTS_STREAM_KEEPALIVE_SECONDS)),
+                )
+                break
+            except asyncio.TimeoutError:
+                elapsed = int(time.perf_counter() - started)
+                yield _streaming_keepalive_frame(
+                    f"{backend_label} still starting or generating audio ({elapsed}s elapsed).",
+                    elapsed_seconds=elapsed,
+                )
+        else:
+            result = await task
+
+        await _apply_speaker_effects_to_file(result, speaker_effects)
+        audio_bytes = await _read_generated_audio_bytes(result, response_format)
+        yield _streaming_audio_frame(0, audio_bytes, True)
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    except Exception as exc:
+        print(f"[{backend_label}] Streaming fallback error: {exc}")
+        traceback.print_exc()
+        yield f"ERROR:{str(exc)}\n".encode("utf-8")
+    finally:
+        for path in cleanup_items:
+            if path:
+                await async_remove_file(path)
+
+
 @app.post("/speak_stream")
 async def speak_stream(req: SpeakRequest):
     """API: Generate speech using registered speaker with streaming"""
@@ -19090,41 +19317,35 @@ async def speak_stream(req: SpeakRequest):
         backend = _normalize_tts_backend(req.tts_backend, SETTINGS.tts_backend)
 
         if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_HIGGS}:
-            async def confucius_audio_stream_generator():
-                result_path = os.path.join("outputs", f"speak_stream_{uuid.uuid4().hex}.wav")
-                try:
-                    result = await _synthesize_tts_to_file(
-                        tts_backend=backend,
-                        spk_audio_prompt="",
-                        text=req.text,
-                        output_path=result_path,
-                        speaker_preset=req.name,
-                        language=req.language,
-                        use_emo_text=use_emotion_text,
-                        emo_text=req.emotion_text if use_emotion_text else None,
-                        emo_alpha=req.emotion_weight,
-                        speech_length=req.speech_length,
-                        diffusion_steps=req.diffusion_steps,
-                        max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
-                        verbose=SETTINGS.verbose,
-                        temperature=req.temperature,
-                        top_k=req.top_k,
-                        top_p=req.top_p,
-                        max_new_tokens=req.max_tokens,
-                    )
-                    await _apply_speaker_effects_to_file(result, req.speaker_effects)
-                    audio_bytes = await _read_generated_audio_bytes(result, req.response_format)
-                    yield _streaming_audio_frame(0, audio_bytes, True)
-                except Exception as e:
-                    error_msg = f"ERROR:{str(e)}\n".encode("utf-8")
-                    print(f"鉂?Confucius streaming fallback error: {e}")
-                    traceback.print_exc()
-                    yield error_msg
-                finally:
-                    await async_remove_file(result_path)
-
+            result_path = os.path.join("outputs", f"speak_stream_{uuid.uuid4().hex}.wav")
+            backend_label = "Confucius4-TTS" if backend == TTS_BACKEND_CONFUCIUS else "Higgs SGLang"
+            synthesis = _synthesize_tts_to_file(
+                tts_backend=backend,
+                spk_audio_prompt="",
+                text=req.text,
+                output_path=result_path,
+                speaker_preset=req.name,
+                language=req.language,
+                use_emo_text=use_emotion_text,
+                emo_text=req.emotion_text if use_emotion_text else None,
+                emo_alpha=req.emotion_weight,
+                speech_length=req.speech_length,
+                diffusion_steps=req.diffusion_steps,
+                max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
+                verbose=SETTINGS.verbose,
+                temperature=req.temperature,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                max_new_tokens=req.max_tokens,
+            )
             return StreamingResponse(
-                confucius_audio_stream_generator(),
+                _external_tts_single_audio_stream(
+                    backend_label=backend_label,
+                    synthesis=synthesis,
+                    result_path=result_path,
+                    response_format=req.response_format,
+                    speaker_effects=req.speaker_effects,
+                ),
                 media_type="application/octet-stream",
                 headers=STREAMING_RESPONSE_HEADERS,
             )
@@ -19205,43 +19426,36 @@ async def clone_voice_stream(
         backend = _normalize_tts_backend(req.tts_backend, SETTINGS.tts_backend)
 
         if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_HIGGS}:
-            async def confucius_audio_stream_generator():
-                result_path = os.path.join("outputs", f"clone_stream_{uuid.uuid4().hex}.wav")
-                try:
-                    result = await _synthesize_tts_to_file(
-                        tts_backend=backend,
-                        spk_audio_prompt=tmp_path or "",
-                        text=req.text,
-                        output_path=result_path,
-                        language=req.language,
-                        use_emo_text=use_emotion_text,
-                        emo_text=req.emotion_text if use_emotion_text else None,
-                        emo_alpha=req.emotion_weight,
-                        speech_length=req.speech_length,
-                        diffusion_steps=req.diffusion_steps,
-                        max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
-                        verbose=SETTINGS.verbose,
-                        reference_text=req.reference_text,
-                        temperature=req.temperature,
-                        top_k=req.top_k,
-                        top_p=req.top_p,
-                        max_new_tokens=req.max_tokens,
-                    )
-                    await _apply_speaker_effects_to_file(result, req.speaker_effects)
-                    audio_bytes = await _read_generated_audio_bytes(result, req.response_format)
-                    yield _streaming_audio_frame(0, audio_bytes, True)
-                except Exception as e:
-                    error_msg = f"ERROR:{str(e)}\n".encode("utf-8")
-                    print(f"鉂?Confucius clone streaming fallback error: {e}")
-                    traceback.print_exc()
-                    yield error_msg
-                finally:
-                    await async_remove_file(result_path)
-                    if tmp_path:
-                        await async_remove_file(tmp_path)
-
+            result_path = os.path.join("outputs", f"clone_stream_{uuid.uuid4().hex}.wav")
+            backend_label = "Confucius4-TTS" if backend == TTS_BACKEND_CONFUCIUS else "Higgs SGLang"
+            synthesis = _synthesize_tts_to_file(
+                tts_backend=backend,
+                spk_audio_prompt=tmp_path or "",
+                text=req.text,
+                output_path=result_path,
+                language=req.language,
+                use_emo_text=use_emotion_text,
+                emo_text=req.emotion_text if use_emotion_text else None,
+                emo_alpha=req.emotion_weight,
+                speech_length=req.speech_length,
+                diffusion_steps=req.diffusion_steps,
+                max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
+                verbose=SETTINGS.verbose,
+                reference_text=req.reference_text,
+                temperature=req.temperature,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                max_new_tokens=req.max_tokens,
+            )
             return StreamingResponse(
-                confucius_audio_stream_generator(),
+                _external_tts_single_audio_stream(
+                    backend_label=backend_label,
+                    synthesis=synthesis,
+                    result_path=result_path,
+                    response_format=req.response_format,
+                    speaker_effects=req.speaker_effects,
+                    cleanup_paths=[tmp_path],
+                ),
                 media_type="application/octet-stream",
                 headers=STREAMING_RESPONSE_HEADERS,
             )
