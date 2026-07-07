@@ -226,7 +226,7 @@ The Higgs integration reuses `sglang_omni_higgs.sh` from `higgs_tts_gradio`, wit
 bash sglang_omni_higgs.sh start
 ```
 
-The endpoint is OpenAI-style `/v1/audio/speech` through SGLang Omni. Higgs does not expose native duration control, so translate/edit requests generate speech first and then post-process the WAV with FFmpeg time-stretching plus exact trim/pad matching before segment assembly. Higgs also does not auto-chunk long text, so the adapter uses the same IndexTTS tokenizer splitting mechanism before sending chunks to SGLang, concatenates the generated WAV chunks, then applies duration matching once to the combined audio. IndexTTS emotion text/weight controls are ignored for Higgs.
+The endpoint is OpenAI-style `/v1/audio/speech` through SGLang Omni. Higgs does not expose native duration control, so translate/edit requests generate speech first and then post-process the WAV with FFmpeg time-stretching plus exact trim/pad matching before segment assembly. The WebUI also has a persistent global Duration Control switch: `Original` keeps IndexTTS/Confucius native duration behavior while Higgs uses FFmpeg, and `Force FFmpeg` makes all backends synthesize without native timing and then use FFmpeg duration matching. API calls can set `duration_control` to `original` or `ffmpeg` (default behavior is `original`). Higgs also does not auto-chunk long text, so the adapter uses the same IndexTTS tokenizer splitting mechanism before sending chunks to SGLang, concatenates the generated WAV chunks, then applies duration matching once to the combined audio. IndexTTS emotion text/weight controls are ignored for Higgs.
 
 ---
 
@@ -246,6 +246,7 @@ Synthesize speech from text using an existing speaker preset.
   - `diffusion_steps` (int, optional): Quality steps (default: `10`).
   - `max_text_tokens_per_sentence` (int, optional): Text split threshold (default: `120`).
   - `tts_backend` (`index`, `confucius`, or `higgs`, optional): Override the server default backend.
+  - `duration_control` (`original` or `ffmpeg`, optional): Force FFmpeg post-process duration matching when set to `ffmpeg`.
   - `language` (string, optional): External backend language code/label; auto-detected when omitted where supported.
 - **Response**: `audio/mpeg` binary audio data (MP3).
 

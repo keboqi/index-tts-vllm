@@ -210,6 +210,10 @@ TTS_BACKEND_CONFUCIUS = "confucius"
 TTS_BACKEND_HIGGS = "higgs"
 ALLOWED_TTS_BACKENDS = {TTS_BACKEND_INDEX, TTS_BACKEND_CONFUCIUS, TTS_BACKEND_HIGGS}
 TTSBackendName = Literal["index", "confucius", "higgs"]
+DURATION_CONTROL_ORIGINAL = "original"
+DURATION_CONTROL_FFMPEG = "ffmpeg"
+ALLOWED_DURATION_CONTROLS = {DURATION_CONTROL_ORIGINAL, DURATION_CONTROL_FFMPEG}
+DurationControlMode = Literal["original", "ffmpeg"]
 CONFUCIUS_DEFAULT_START_TIMEOUT = 1800.0
 CONFUCIUS_DEFAULT_REQUEST_TIMEOUT = 900.0
 HIGGS_DEFAULT_MODEL = "bosonai/higgs-audio-v3-tts-4b"
@@ -292,6 +296,17 @@ def _normalize_tts_backend(value: Any, default: str = TTS_BACKEND_INDEX) -> str:
     if backend in ALLOWED_TTS_BACKENDS:
         return backend
     return default
+
+
+def _normalize_duration_control(value: Any, default: str = DURATION_CONTROL_ORIGINAL) -> str:
+    mode = str(value or "").strip().lower().replace("-", "_")
+    if mode in {"native", "auto", "default"}:
+        return DURATION_CONTROL_ORIGINAL
+    if mode in {"force_ffmpeg", "postprocess", "post_process", "ffmpeg_postprocess"}:
+        return DURATION_CONTROL_FFMPEG
+    if mode in ALLOWED_DURATION_CONTROLS:
+        return mode
+    return default if default in ALLOWED_DURATION_CONTROLS else DURATION_CONTROL_ORIGINAL
 
 
 @dataclass(frozen=True)
@@ -2444,6 +2459,7 @@ async def _build_translation_segments(
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
     tts_backend: Optional[str] = None,
+    duration_control: Optional[str] = None,
     clearvoice_settings: Optional[Dict[str, Any]] = None,
     # Cached source paths for fast session storage (avoids re-encoding)
     original_audio_source_path: Optional[str] = None,
@@ -2483,6 +2499,7 @@ async def _build_translation_segments(
     resolved_translation_llm_model = _normalize_translation_llm_model(
         translation_llm_model
     )
+    resolved_duration_control = _normalize_duration_control(duration_control)
 
     # Resolve pipeline label
     use_whisperx = transcription_pipeline == "whisperx"
@@ -2746,6 +2763,7 @@ async def _build_translation_segments(
         default_speaker_preset=normalized_default_speaker,
         default_emotion_weight=normalized_default_emotion,
         tts_backend=resolved_tts_backend,
+        duration_control=resolved_duration_control,
         # Pass cached paths for fast session storage
         original_audio_path=original_audio_source_path,
         backing_track_path=backing_track_source_path,
@@ -2783,6 +2801,7 @@ async def _build_translation_segments(
         "response_format": response_format_value,
         "bitrate": bitrate_value,
         "tts_backend": resolved_tts_backend,
+        "duration_control": resolved_duration_control,
         "prompt": final_prompt,
         "gemini_model": resolved_gemini_model,
         "translation_llm_model": resolved_translation_llm_model,
@@ -2890,6 +2909,7 @@ class TranslateSessionData:
     response_format: str
     bitrate: str
     tts_backend: str
+    duration_control: str
     input_mime_type: Optional[str]
     clearvoice_settings: Dict[str, Any]
     base_segments: List[Dict[str, Any]]
@@ -5224,7 +5244,7 @@ class ManagedHiggsSGLangBackend:
                     await async_remove_file(chunk_path)
 
             if speech_length and int(speech_length) > 0:
-                await _postprocess_higgs_duration(output_path, int(speech_length))
+                await _postprocess_ffmpeg_duration(output_path, int(speech_length))
             return output_path
         finally:
             self._active_requests = max(0, self._active_requests - 1)
@@ -6687,6 +6707,7 @@ def _serialize_chunk_session(session: TranslateSessionData) -> Dict[str, Any]:
         "duration_label": _format_ms_to_timestamp(duration_ms),
         "generated": bool(session.chunk_generated),
         "generated_at": session.chunk_generated_at,
+        "duration_control": session.duration_control,
         "audio_url": audio_url,
         "output_format": session.chunk_output_format,
         "output_filename": session.chunk_output_filename,
@@ -6709,6 +6730,7 @@ def _session_to_manifest(session: TranslateSessionData) -> Dict[str, Any]:
         "response_format": session.response_format,
         "bitrate": session.bitrate,
         "tts_backend": session.tts_backend,
+        "duration_control": session.duration_control,
         "input_mime_type": session.input_mime_type,
         "clearvoice_settings": copy.deepcopy(session.clearvoice_settings),
         "base_segments": copy.deepcopy(session.base_segments),
@@ -6814,6 +6836,7 @@ async def _rehydrate_session_from_manifest(manifest: Dict[str, Any]) -> Translat
         original_audio_path=manifest.get("original_audio_path"),
         original_audio_info=audio_info,
         tts_backend=manifest.get("tts_backend"),
+        duration_control=manifest.get("duration_control", DURATION_CONTROL_ORIGINAL),
         session_id=manifest.get("session_id"),
         persist_media=False,
     )
@@ -6950,6 +6973,7 @@ async def _generate_chunk_audio_from_session(
     silence_volume_percent: float,
     force_gemini_regenerate: bool = False,
     tts_backend: Optional[str] = None,
+    duration_control: Optional[str] = None,
     transcription_pipeline: Optional[str] = None,
     whisperx_proxy_refiner: Any = None,
     default_speaker_preset: Optional[str] = None,
@@ -6964,6 +6988,10 @@ async def _generate_chunk_audio_from_session(
     resolved_tts_backend = _normalize_tts_backend(
         tts_backend or getattr(chunk_session, "tts_backend", None),
         SETTINGS.tts_backend,
+    )
+    resolved_duration_control = _normalize_duration_control(
+        duration_control,
+        getattr(chunk_session, "duration_control", DURATION_CONTROL_ORIGINAL),
     )
     transcription_pipeline = (
         transcription_pipeline
@@ -7112,6 +7140,7 @@ async def _generate_chunk_audio_from_session(
         default_speaker_preset=default_speaker_preset,
         default_emotion_weight=default_emotion_weight,
         tts_backend=resolved_tts_backend,
+        duration_control=resolved_duration_control,
         clearvoice_settings=clearvoice_settings,
         transcription_pipeline=transcription_pipeline,
         whisperx_proxy_refiner=whisperx_proxy_refiner,
@@ -7141,6 +7170,7 @@ async def _generate_chunk_audio_from_session(
         default_speaker_preset=default_speaker_preset,
         default_emotion_weight=default_emotion_weight,
         tts_backend=resolved_tts_backend,
+        duration_control=resolved_duration_control,
         return_unmixed_audio=merge_with_backing and backing_track_audio is not None,
     )
 
@@ -7163,6 +7193,7 @@ async def _generate_chunk_audio_from_session(
     metadata["output_base_name"] = resolved_base_name
     metadata["default_speaker_preset"] = default_speaker_preset
     metadata["default_emotion_weight"] = default_emotion_weight
+    metadata["duration_control"] = resolved_duration_control
 
     language_code = _language_code_from_label(dest_language)
     base_stem = _compose_output_stem(resolved_base_name, chunk_index=chunk_session.chunk_index)
@@ -9189,6 +9220,7 @@ async def _create_translate_session(
     original_audio_path: Optional[str] = None,
     original_audio_info: Optional[AudioAssetInfo] = None,
     tts_backend: Optional[str] = None,
+    duration_control: Optional[str] = None,
     session_id: Optional[str] = None,
 ) -> TranslateSessionData:
     response_format = _normalize_translate_output_format(response_format)
@@ -9204,6 +9236,7 @@ async def _create_translate_session(
     )
     resolved_transcription_pipeline = _normalize_transcription_pipeline(transcription_pipeline)
     resolved_tts_backend = _normalize_tts_backend(tts_backend, SETTINGS.tts_backend)
+    resolved_duration_control = _normalize_duration_control(duration_control)
     resolved_whisperx_proxy_refiner = (
         _coerce_to_bool(whisperx_proxy_refiner)
         and resolved_transcription_pipeline == "whisperx"
@@ -9299,6 +9332,7 @@ async def _create_translate_session(
         response_format=response_format,
         bitrate=bitrate,
         tts_backend=resolved_tts_backend,
+        duration_control=resolved_duration_control,
         input_mime_type=input_mime_type,
         clearvoice_settings=dict(clearvoice_settings or {}),
         base_segments=copy.deepcopy(base_segments),
@@ -9715,7 +9749,7 @@ def _audio_file_duration_ms(path: str) -> Optional[int]:
         return None
 
 
-def _postprocess_higgs_duration_sync(path: str, target_ms: int) -> Dict[str, Any]:
+def _postprocess_ffmpeg_duration_sync(path: str, target_ms: int) -> Dict[str, Any]:
     target_ms = max(0, int(target_ms))
     if target_ms <= 0:
         return {"applied": False, "reason": "no_target"}
@@ -9730,7 +9764,7 @@ def _postprocess_higgs_duration_sync(path: str, target_ms: int) -> Dict[str, Any
     try:
         source_path = path
         if abs(original_ms - target_ms) > 30 and _ffmpeg_available():
-            stretched_path = str(Path(path).with_name(f"{Path(path).stem}_higgs_duration_{uuid.uuid4().hex}.wav"))
+            stretched_path = str(Path(path).with_name(f"{Path(path).stem}_duration_{uuid.uuid4().hex}.wav"))
             cmd = [
                 "ffmpeg",
                 "-y",
@@ -9774,8 +9808,8 @@ def _postprocess_higgs_duration_sync(path: str, target_ms: int) -> Dict[str, Any
     }
 
 
-async def _postprocess_higgs_duration(path: str, target_ms: int) -> Dict[str, Any]:
-    return await _run_audio_cpu(_postprocess_higgs_duration_sync, path, target_ms)
+async def _postprocess_ffmpeg_duration(path: str, target_ms: int) -> Dict[str, Any]:
+    return await _run_audio_cpu(_postprocess_ffmpeg_duration_sync, path, target_ms)
 
 
 def _apply_volume_with_ffmpeg(segment: AudioSegment, volume_percent: float) -> AudioSegment:
@@ -11343,10 +11377,12 @@ async def _synthesize_translated_audio(
     default_speaker_preset: Optional[str] = None,
     default_emotion_weight: Optional[float] = None,
     tts_backend: Optional[str] = None,
+    duration_control: Optional[str] = None,
     emit_status: Optional[Callable[..., Awaitable[None]]] = None,
     return_unmixed_audio: bool = False,
 ) -> Tuple[bytes, str, Dict[str, Any]]:
     resolved_tts_backend = _normalize_tts_backend(tts_backend, SETTINGS.tts_backend)
+    resolved_duration_control = _normalize_duration_control(duration_control)
     frame_rate = int(original_audio.frame_rate or 22050)
     sample_width = int(original_audio.sample_width or 2)
     channels = int(original_audio.channels or 1)
@@ -11504,6 +11540,7 @@ async def _synthesize_translated_audio(
                     language=dest_language,
                     interval_silence=0,
                     speech_length=generation_target_ms,
+                    duration_control=resolved_duration_control,
                     diffusion_steps=10,
                     verbose=SETTINGS.verbose,
                     speaker_preset=preset_name,
@@ -11998,6 +12035,7 @@ async def _synthesize_translated_audio(
         "generated_duration_ms": final_duration_ms,
         "generation_log": generation_log,
         "tts_backend": resolved_tts_backend,
+        "duration_control": resolved_duration_control,
         "padded_to_original": pad_to_original,
         "backing_volume_percent": backing_volume_percent,
     }
@@ -12624,6 +12662,7 @@ async def _synthesize_tts_to_file(
     language: Optional[str] = None,
     interval_silence: int = 0,
     speech_length: int = 0,
+    duration_control: str = DURATION_CONTROL_ORIGINAL,
     diffusion_steps: int = 10,
     max_text_tokens_per_sentence: int = 120,
     verbose: bool = False,
@@ -12640,16 +12679,23 @@ async def _synthesize_tts_to_file(
     seed: Optional[int] = None,
 ) -> str:
     backend = _normalize_tts_backend(tts_backend, SETTINGS.tts_backend)
+    duration_control_mode = _normalize_duration_control(duration_control)
+    target_duration_ms = max(0, int(speech_length or 0))
+    native_speech_length = (
+        0
+        if duration_control_mode == DURATION_CONTROL_FFMPEG and target_duration_ms > 0
+        else target_duration_ms
+    )
     if backend == TTS_BACKEND_INDEX:
         async with INDEXTTS_GPU_WORK_SLOTS:
             await tts_manager.ensure_awake()
             tts = tts_manager.get_tts()
-            return await tts.infer(
+            result_path = await tts.infer(
                 spk_audio_prompt=spk_audio_prompt,
                 text=text,
                 output_path=output_path,
                 interval_silence=interval_silence,
-                speech_length=speech_length,
+                speech_length=native_speech_length,
                 diffusion_steps=diffusion_steps,
                 verbose=verbose,
                 speaker_preset=speaker_preset,
@@ -12659,6 +12705,9 @@ async def _synthesize_tts_to_file(
                 emo_text=emo_text if use_emo_text else None,
                 max_text_tokens_per_sentence=max_text_tokens_per_sentence,
             )
+        if duration_control_mode == DURATION_CONTROL_FFMPEG and target_duration_ms > 0:
+            await _postprocess_ffmpeg_duration(result_path, target_duration_ms)
+        return result_path
 
     if backend == TTS_BACKEND_HIGGS:
         if use_emo_text or emo_text or emo_audio_prompt:
@@ -12673,7 +12722,7 @@ async def _synthesize_tts_to_file(
             output_path=output_path,
             prompt_wav=prompt_wav,
             reference_text=reference_text,
-            speech_length=speech_length,
+            speech_length=target_duration_ms,
             max_text_tokens_per_sentence=max_text_tokens_per_sentence,
             temperature=temperature,
             top_k=top_k,
@@ -12688,17 +12737,20 @@ async def _synthesize_tts_to_file(
         spk_audio_prompt=spk_audio_prompt,
         speaker_preset=speaker_preset,
     )
-    return await confucius_backend_manager.synthesize_to_file(
+    result_path = await confucius_backend_manager.synthesize_to_file(
         text=text,
         output_path=output_path,
         language=language,
         prompt_wav=prompt_wav,
-        speech_length=speech_length,
+        speech_length=native_speech_length,
         diffusion_steps=diffusion_steps,
         max_text_tokens_per_sentence=max_text_tokens_per_sentence,
         verbose=verbose,
         cache_prompt_audio=cache_prompt_audio,
     )
+    if duration_control_mode == DURATION_CONTROL_FFMPEG and target_duration_ms > 0:
+        await _postprocess_ffmpeg_duration(result_path, target_duration_ms)
+    return result_path
 
 
 async def _bounded_indextts_stream(tts: Any, **kwargs):
@@ -12732,6 +12784,10 @@ class TranslateRequest(BaseModel):
     tts_backend: Optional[TTSBackendName] = Field(
         default=None,
         description="TTS backend for synthesis. Defaults to server --tts_backend.",
+    )
+    duration_control: Optional[DurationControlMode] = Field(
+        default=None,
+        description="Duration matching strategy: 'original' uses backend-native timing where available; 'ffmpeg' forces post-process time stretching.",
     )
     audio_mime_type: Optional[str] = Field(default=None, description="MIME type of the audio, e.g., 'audio/wav'.")
     base_filename: Optional[str] = Field(
@@ -12968,6 +13024,10 @@ class SegmentPreviewRequest(BaseModel):
         default=None,
         description="Optional TTS backend override for this preview.",
     )
+    duration_control: Optional[DurationControlMode] = Field(
+        default=None,
+        description="Optional duration matching override for this preview.",
+    )
     generated_volume_percent: Optional[float] = Field(
         default=None,
         ge=MIN_GENERATED_VOLUME_PERCENT,
@@ -12992,6 +13052,10 @@ class TranslateGenerateRequest(BaseModel):
     tts_backend: Optional[TTSBackendName] = Field(
         default=None,
         description="Optional TTS backend override; defaults to the stored session backend.",
+    )
+    duration_control: Optional[DurationControlMode] = Field(
+        default=None,
+        description="Optional duration matching override; defaults to the stored session setting.",
     )
     response_format: Optional[Literal["mp3", "wav", "flac", "aac", "opus", "ogg", "webm"]] = Field(
         default=None, description="Desired audio format for output. Defaults to the original request value."
@@ -13057,6 +13121,10 @@ class ChunkBatchGenerateRequest(BaseModel):
     tts_backend: Optional[TTSBackendName] = Field(
         default=None,
         description="Optional TTS backend override for generated chunks.",
+    )
+    duration_control: Optional[DurationControlMode] = Field(
+        default=None,
+        description="Optional duration matching override for generated chunks.",
     )
     response_format: Optional[Literal["mp3", "wav", "flac", "aac", "opus", "ogg", "webm"]] = Field(
         default=None,
@@ -13170,6 +13238,10 @@ class CloneRequest(BaseModel):
     emotion_text: Optional[str] = Field(default="", description="Emotion description text for emotion control")
     emotion_weight: float = Field(default=0.6, description="Emotion control weight (0.0 to 1.0)")
     speech_length: int = Field(default=0, description="Target audio duration in milliseconds. If 0, uses default duration calculation.")
+    duration_control: DurationControlMode = Field(
+        default=DURATION_CONTROL_ORIGINAL,
+        description="Duration matching strategy: 'original' uses backend-native timing where available; 'ffmpeg' forces post-process time stretching.",
+    )
     diffusion_steps: int = Field(default=10, description="Number of diffusion steps for mel-spectrogram generation (1-50). Higher values improve quality but increase latency.")
     max_text_tokens_per_sentence: int = Field(default=120, ge=80, le=200, description="Maximum tokens per sentence for text splitting (80-200). Higher values = longer sentences but may impact quality.")
     speaker_effects: List[str] = Field(default_factory=list, description="Optional ordered list of speaker effects to apply after speech generation.")
@@ -13201,6 +13273,10 @@ class SpeakRequest(BaseModel):
     emotion_text: Optional[str] = Field(default="", description="Emotion description text for emotion control")
     emotion_weight: float = Field(default=0.6, description="Emotion control weight (0.0 to 1.0)")
     speech_length: int = Field(default=0, description="Target audio duration in milliseconds. If 0, uses default duration calculation.")
+    duration_control: DurationControlMode = Field(
+        default=DURATION_CONTROL_ORIGINAL,
+        description="Duration matching strategy: 'original' uses backend-native timing where available; 'ffmpeg' forces post-process time stretching.",
+    )
     diffusion_steps: int = Field(default=10, description="Number of diffusion steps for mel-spectrogram generation (1-50). Higher values improve quality but increase latency.")
     max_text_tokens_per_sentence: int = Field(default=120, ge=80, le=200, description="Maximum tokens per sentence for text splitting (80-200). Higher values = longer sentences but may impact quality.")
     speaker_effects: List[str] = Field(default_factory=list, description="Optional ordered list of speaker effects to apply after speech generation.")
@@ -15895,6 +15971,10 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
         translation_llm_model_value = _normalize_translation_llm_model(
             payload.translation_llm_model or config_template.translation_llm_model
         )
+        duration_control_value = _normalize_duration_control(
+            payload.duration_control,
+            getattr(config_template, "duration_control", DURATION_CONTROL_ORIGINAL),
+        )
         transcription_pipeline_value = (
             payload.transcription_pipeline
             or getattr(config_template, "transcription_pipeline", None)
@@ -15996,6 +16076,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
         )
 
         for session in sessions:
+            session.duration_control = duration_control_value
             if default_speaker_value:
                 session.default_speaker_preset = default_speaker_value
             session.default_emotion_weight = default_emotion_weight_value
@@ -16007,6 +16088,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
             "bitrate": bitrate_value,
             "gemini_model": gemini_model_value,
             "translation_llm_model": translation_llm_model_value,
+            "duration_control": duration_control_value,
             "transcription_pipeline": transcription_pipeline_value,
             "whisperx_proxy_refiner": whisperx_proxy_refiner_flag,
             "qwen_omnivad_enable_diarization": qwen_omnivad_enable_diarization_flag,
@@ -16079,6 +16161,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
                             silence_volume_percent=silence_volume_percent_value,
                             force_gemini_regenerate=force_gemini_regenerate_flag,
                             tts_backend=payload.tts_backend,
+                            duration_control=duration_control_value,
                             transcription_pipeline=transcription_pipeline_value,
                             whisperx_proxy_refiner=whisperx_proxy_refiner_flag,
                             default_speaker_preset=session.default_speaker_preset,
@@ -16172,6 +16255,7 @@ async def api_translate_segments(
     request: Request,
     dest_language: Optional[str] = Form(None),
     tts_backend: Optional[str] = Form(None),
+    duration_control: Optional[str] = Form(None),
     response_format: Optional[str] = Form(None),
     bitrate: Optional[str] = Form(None),
     audio: Optional[str] = Form(None),
@@ -16225,6 +16309,7 @@ async def api_translate_segments(
         payload: Optional[Dict[str, Any]] = None
         dest_language_value = dest_language
         tts_backend_value = tts_backend
+        duration_control_value = duration_control
         response_format_value = response_format
         bitrate_value = bitrate
         audio_reference = audio
@@ -16280,6 +16365,7 @@ async def api_translate_segments(
         if payload is not None:
             dest_language_value = payload.get("dest_language", dest_language_value)
             tts_backend_value = payload.get("tts_backend", tts_backend_value)
+            duration_control_value = payload.get("duration_control", duration_control_value)
             response_format_value = payload.get("response_format", response_format_value)
             bitrate_value = payload.get("bitrate", bitrate_value)
             audio_reference = payload.get("audio", audio_reference)
@@ -16420,6 +16506,9 @@ async def api_translate_segments(
                 getattr(reuse_source_session, "tts_backend", None),
                 SETTINGS.tts_backend,
             )
+        if not duration_control_value and reuse_source_session is not None:
+            duration_control_value = getattr(reuse_source_session, "duration_control", None)
+        duration_control_value = _normalize_duration_control(duration_control_value)
         reuse_backing_available = bool(reuse_source_session and _session_has_backing_audio(reuse_source_session))
         audio_separator_enabled_flag = preprocess_options.audio_separator_enabled
         audio_separator_model_key = preprocess_options.audio_separator_model
@@ -16657,6 +16746,7 @@ async def api_translate_segments(
                         default_speaker_preset=default_speaker_value,
                         default_emotion_weight=default_emotion_weight_value,
                         tts_backend=tts_backend_value,
+                        duration_control=duration_control_value,
                         clearvoice_settings=clearvoice_settings,
                         # Pass cached paths for fast session storage
                         original_audio_source_path=cached_vocals_path,
@@ -16762,6 +16852,11 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
             SETTINGS.tts_backend,
         )
         session.tts_backend = resolved_tts_backend
+        resolved_duration_control = _normalize_duration_control(
+            payload.duration_control,
+            session.duration_control,
+        )
+        session.duration_control = resolved_duration_control
 
         bitrate_value = payload.bitrate or session.bitrate or TRANSLATE_DEFAULT_BITRATE
         max_duration = _session_audio_duration_ms(session)
@@ -16950,6 +17045,7 @@ async def api_translate_generate_segments(payload: TranslateGenerateRequest):
                         default_speaker_preset=session.default_speaker_preset,
                         default_emotion_weight=session.default_emotion_weight,
                         tts_backend=resolved_tts_backend,
+                        duration_control=resolved_duration_control,
                         emit_status=emit_status,
                         return_unmixed_audio=merge_with_backing and _session_has_backing_audio(session),
                     )
@@ -17256,6 +17352,10 @@ async def api_translate_segment_preview(payload: SegmentPreviewRequest):
             payload.tts_backend or session.tts_backend,
             SETTINGS.tts_backend,
         )
+        resolved_duration_control = _normalize_duration_control(
+            payload.duration_control,
+            session.duration_control,
+        )
 
         audio_bytes, media_type, metadata = await _synthesize_translated_audio(
             _get_session_original_audio(session),
@@ -17276,6 +17376,7 @@ async def api_translate_segment_preview(payload: SegmentPreviewRequest):
             default_speaker_preset=session.default_speaker_preset,
             default_emotion_weight=session.default_emotion_weight,
             tts_backend=resolved_tts_backend,
+            duration_control=resolved_duration_control,
         )
 
         metadata["preview"] = True
@@ -17750,6 +17851,7 @@ async def api_translate_audio(
     request: Request,
     dest_language: Optional[str] = Form(None),
     tts_backend: Optional[str] = Form(None),
+    duration_control: Optional[str] = Form(None),
     response_format: Optional[str] = Form(None),
     bitrate: Optional[str] = Form(None),
     audio: Optional[str] = Form(None),
@@ -17802,6 +17904,7 @@ async def api_translate_audio(
         payload: Optional[Dict[str, Any]] = None
         dest_language_value = dest_language
         tts_backend_value = tts_backend
+        duration_control_value = duration_control
         audio_reference = audio
         downloaded_video_id_value = downloaded_video_id
         audio_mime_type_value = audio_mime_type
@@ -17859,6 +17962,7 @@ async def api_translate_audio(
                 return _status_error(f"Invalid translate request: {str(exc)}")
             dest_language_value = translate_req.dest_language
             tts_backend_value = translate_req.tts_backend or tts_backend_value
+            duration_control_value = translate_req.duration_control or duration_control_value
             audio_reference = translate_req.audio or audio_reference
             downloaded_video_id_value = translate_req.downloaded_video_id or downloaded_video_id_value
             audio_mime_type_value = translate_req.audio_mime_type or audio_mime_type_value
@@ -18010,6 +18114,9 @@ async def api_translate_audio(
         if not tts_backend_value and reuse_source_session is not None:
             tts_backend_value = getattr(reuse_source_session, "tts_backend", None)
         tts_backend_value = _normalize_tts_backend(tts_backend_value, SETTINGS.tts_backend)
+        if not duration_control_value and reuse_source_session is not None:
+            duration_control_value = getattr(reuse_source_session, "duration_control", None)
+        duration_control_value = _normalize_duration_control(duration_control_value)
         bitrate_value = bitrate_value or TRANSLATE_DEFAULT_BITRATE
         ignore_non_speech_flag = _coerce_to_bool(ignore_non_speech_value)
         preserve_silence_audio_flag = _coerce_to_bool(preserve_silence_audio_value)
@@ -18276,6 +18383,7 @@ async def api_translate_audio(
                         default_speaker_preset=default_speaker_value,
                         default_emotion_weight=default_emotion_weight_value,
                         tts_backend=tts_backend_value,
+                        duration_control=duration_control_value,
                         clearvoice_settings=clearvoice_settings,
                         # Pass cached paths for fast session storage
                         original_audio_source_path=cached_vocals_path,
@@ -18319,6 +18427,7 @@ async def api_translate_audio(
                         default_speaker_preset=session.default_speaker_preset,
                         default_emotion_weight=session.default_emotion_weight,
                         tts_backend=tts_backend_value,
+                        duration_control=duration_control_value,
                         emit_status=emit_status,
                         return_unmixed_audio=merge_with_backing and backing_track_audio is not None,
                     )
@@ -19110,6 +19219,7 @@ async def speak(req: SpeakRequest):
             emo_text=req.emotion_text if use_emotion_text else None,
             emo_alpha=req.emotion_weight,
             speech_length=req.speech_length,
+            duration_control=req.duration_control,
             diffusion_steps=req.diffusion_steps,
             max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
             verbose=SETTINGS.verbose,
@@ -19152,6 +19262,7 @@ def parse_clone_form(
     emotion_text: Optional[str] = Form(""),
     emotion_weight: float = Form(0.6),
     speech_length: int = Form(0),
+    duration_control: DurationControlMode = Form(DURATION_CONTROL_ORIGINAL),
     diffusion_steps: int = Form(10),
     max_text_tokens_per_sentence: int = Form(120),
     speaker_effects: Optional[str] = Form(None),
@@ -19165,6 +19276,7 @@ def parse_clone_form(
         stream=stream, response_format=response_format,
         emotion_text=emotion_text, emotion_weight=emotion_weight,
         speech_length=speech_length,
+        duration_control=duration_control,
         diffusion_steps=diffusion_steps, max_text_tokens_per_sentence=max_text_tokens_per_sentence,
         speaker_effects=_normalize_speaker_effect_names(speaker_effects)
     )
@@ -19203,6 +19315,7 @@ async def clone_voice(
                 emo_text=req.emotion_text if use_emotion_text else None,
                 emo_alpha=req.emotion_weight,
                 speech_length=req.speech_length,
+                duration_control=req.duration_control,
                 diffusion_steps=req.diffusion_steps,
                 max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
                 verbose=SETTINGS.verbose,
@@ -19245,6 +19358,8 @@ async def server_info():
                 "model": "IndexTTS-vLLM-v2",
                 "tts_backend": SETTINGS.tts_backend,
                 "tts_backends": sorted(ALLOWED_TTS_BACKENDS),
+                "duration_control": DURATION_CONTROL_ORIGINAL,
+                "duration_controls": sorted(ALLOWED_DURATION_CONTROLS),
                 "confucius": confucius_status,
                 "higgs": higgs_status,
                 "roles": roles,
@@ -19337,10 +19452,18 @@ async def speak_stream(req: SpeakRequest):
         # Check if emotion text is provided and not empty
         use_emotion_text = req.emotion_text and req.emotion_text.strip() != ""
         backend = _normalize_tts_backend(req.tts_backend, SETTINGS.tts_backend)
+        duration_control_mode = _normalize_duration_control(req.duration_control)
+        force_file_stream = (
+            duration_control_mode == DURATION_CONTROL_FFMPEG
+            and int(req.speech_length or 0) > 0
+        )
 
-        if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_HIGGS}:
+        if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_HIGGS} or force_file_stream:
             result_path = os.path.join("outputs", f"speak_stream_{uuid.uuid4().hex}.wav")
-            backend_label = "Confucius4-TTS" if backend == TTS_BACKEND_CONFUCIUS else "Higgs SGLang"
+            backend_label = {
+                TTS_BACKEND_CONFUCIUS: "Confucius4-TTS",
+                TTS_BACKEND_HIGGS: "Higgs SGLang",
+            }.get(backend, "IndexTTS")
             synthesis = _synthesize_tts_to_file(
                 tts_backend=backend,
                 spk_audio_prompt="",
@@ -19352,6 +19475,7 @@ async def speak_stream(req: SpeakRequest):
                 emo_text=req.emotion_text if use_emotion_text else None,
                 emo_alpha=req.emotion_weight,
                 speech_length=req.speech_length,
+                duration_control=duration_control_mode,
                 diffusion_steps=req.diffusion_steps,
                 max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
                 verbose=SETTINGS.verbose,
@@ -19446,10 +19570,18 @@ async def clone_voice_stream(
         # Check if emotion text is provided and not empty
         use_emotion_text = req.emotion_text and req.emotion_text.strip() != ""
         backend = _normalize_tts_backend(req.tts_backend, SETTINGS.tts_backend)
+        duration_control_mode = _normalize_duration_control(req.duration_control)
+        force_file_stream = (
+            duration_control_mode == DURATION_CONTROL_FFMPEG
+            and int(req.speech_length or 0) > 0
+        )
 
-        if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_HIGGS}:
+        if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_HIGGS} or force_file_stream:
             result_path = os.path.join("outputs", f"clone_stream_{uuid.uuid4().hex}.wav")
-            backend_label = "Confucius4-TTS" if backend == TTS_BACKEND_CONFUCIUS else "Higgs SGLang"
+            backend_label = {
+                TTS_BACKEND_CONFUCIUS: "Confucius4-TTS",
+                TTS_BACKEND_HIGGS: "Higgs SGLang",
+            }.get(backend, "IndexTTS")
             synthesis = _synthesize_tts_to_file(
                 tts_backend=backend,
                 spk_audio_prompt=tmp_path or "",
@@ -19460,6 +19592,7 @@ async def clone_voice_stream(
                 emo_text=req.emotion_text if use_emotion_text else None,
                 emo_alpha=req.emotion_weight,
                 speech_length=req.speech_length,
+                duration_control=duration_control_mode,
                 diffusion_steps=req.diffusion_steps,
                 max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
                 verbose=SETTINGS.verbose,

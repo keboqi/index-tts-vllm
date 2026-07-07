@@ -2594,6 +2594,14 @@
                                         <input type="number" id="speechLength" name="speechLength" value="0" min="0"
                                             max="6000000" step="100" placeholder="0">
                                     </div>
+                                    <div class="form-group">
+                                        <label for="durationControl">Duration Control:</label>
+                                        <select id="durationControl" name="duration_control"
+                                            data-duration-control-select>
+                                            <option value="original" selected>Original</option>
+                                            <option value="ffmpeg">Force FFmpeg</option>
+                                        </select>
+                                    </div>
                                     <div class="form-group" style="display: flex; align-items: flex-end;">
                                         <button type="button" class="btn btn-secondary" data-action="estimate-duration"
                                             style="width: 100%;">📊 Estimate</button>
@@ -3377,6 +3385,14 @@
                                                     <option value="index" selected>IndexTTS</option>
                                                     <option value="confucius">Confucius4-TTS</option>
                                                     <option value="higgs">Higgs Audio SGLang</option>
+                                                </select>
+                                            </div>
+                                            <div class="form-group">
+                                                <label for="translateDurationControl">Duration Control:</label>
+                                                <select id="translateDurationControl" name="duration_control"
+                                                    data-duration-control-select>
+                                                    <option value="original" selected>Original</option>
+                                                    <option value="ffmpeg">Force FFmpeg</option>
                                                 </select>
                                             </div>
                                         </div>
@@ -4950,6 +4966,70 @@
             MODELS_UNLOAD: '/api/models/unload',
             MODELS_WAKE: '/api/models/wake',
         });
+
+        const DURATION_CONTROL_STORAGE_KEY = 'indexTts.durationControl.v1';
+        const DURATION_CONTROL_VALUES = new Set(['original', 'ffmpeg']);
+
+        function normalizeDurationControl(value) {
+            const normalized = String(value || '').trim().toLowerCase();
+            return DURATION_CONTROL_VALUES.has(normalized) ? normalized : 'original';
+        }
+
+        function getDurationControlSelects() {
+            return Array.from(document.querySelectorAll('[data-duration-control-select]'));
+        }
+
+        function readDurationControlSetting() {
+            try {
+                if (window.localStorage) {
+                    return normalizeDurationControl(window.localStorage.getItem(DURATION_CONTROL_STORAGE_KEY));
+                }
+            } catch (error) {
+                console.warn('Unable to read duration control setting:', error);
+            }
+            return 'original';
+        }
+
+        function writeDurationControlSetting(value) {
+            const normalized = normalizeDurationControl(value);
+            try {
+                if (window.localStorage) {
+                    window.localStorage.setItem(DURATION_CONTROL_STORAGE_KEY, normalized);
+                }
+            } catch (error) {
+                console.warn('Unable to save duration control setting:', error);
+            }
+            return normalized;
+        }
+
+        function syncDurationControlSelects(value) {
+            const normalized = normalizeDurationControl(value);
+            getDurationControlSelects().forEach(select => {
+                select.value = normalized;
+            });
+            return normalized;
+        }
+
+        function getDurationControlMode() {
+            const firstSelect = getDurationControlSelects()[0];
+            return normalizeDurationControl(firstSelect ? firstSelect.value : readDurationControlSetting());
+        }
+
+        function initDurationControlControls() {
+            syncDurationControlSelects(readDurationControlSetting());
+            getDurationControlSelects().forEach(select => {
+                select.addEventListener('change', () => {
+                    const normalized = writeDurationControlSetting(select.value);
+                    syncDurationControlSelects(normalized);
+                    if (typeof updateAdditionalSettingsSummary === 'function') {
+                        updateAdditionalSettingsSummary();
+                    }
+                });
+            });
+            if (typeof updateAdditionalSettingsSummary === 'function') {
+                updateAdditionalSettingsSummary();
+            }
+        }
 
         /* ---------- Helpers (HTTP, UI binding) ---------- */
 
@@ -6601,6 +6681,7 @@
         const translatePipelineInfo = document.getElementById('translatePipelineInfo');
         const translateAiConfigSummary = document.getElementById('translateAiConfigSummary');
         const translateAdditionalSettingsSummary = document.getElementById('translateAdditionalSettingsSummary');
+        const translateDurationControlEl = document.getElementById('translateDurationControl');
         const DEFAULT_EMOTION_WEIGHT = 0.6;
         const TRANSLATE_SETTINGS_STORAGE_KEY = 'indexTts.translateSettings.v1';
         const MULTILINGUAL_TTS_DESTINATION_LANGUAGES = Object.freeze([
@@ -7264,6 +7345,7 @@
             const outputFormatSelect = document.getElementById('translateOutputFormat');
             renderStepSummary(translateAdditionalSettingsSummary, [
                 { label: 'Backend', value: selectedOptionLabel(translateTtsBackendEl, 'IndexTTS') },
+                { label: 'Duration', value: selectedOptionLabel(translateDurationControlEl, 'Original') },
                 { label: 'Format', value: selectedOptionLabel(outputFormatSelect, 'MP3') },
                 {
                     label: 'Merge',
@@ -7349,6 +7431,7 @@
             translateDefaultEmotionWeightInput,
             translateVolumeInput,
             translateBackingVolumeInput,
+            translateDurationControlEl,
             translateAudioSeparatorUseSoundfileEl,
             translateMergeBackEl,
             translatePreserveSilenceEl,
@@ -7877,6 +7960,7 @@
                 chunk_session_ids: Array.from(translateChunkSelections),
                 dest_language: destLanguage,
                 tts_backend: translateTtsBackendEl && translateTtsBackendEl.value ? translateTtsBackendEl.value : 'index',
+                duration_control: getDurationControlMode(),
                 response_format: selectedFormat,
             };
             if (translateGeminiModel && translateGeminiModel.value) {
@@ -8585,6 +8669,7 @@
             const metadata = {
                 session_id: chunk.session_id,
                 reuse_session_id: chunk.session_id,
+                duration_control: chunk.duration_control,
                 backing_track: {
                     available: chunk.backing_available,
                     source: chunk.backing_source || 'none',
@@ -10203,6 +10288,7 @@
             if (translateTtsBackendEl && translateTtsBackendEl.value) {
                 formData.append('tts_backend', translateTtsBackendEl.value);
             }
+            formData.append('duration_control', getDurationControlMode());
             if (translateMinSpeechInput) {
                 const minValue = (translateMinSpeechInput.value || '').trim();
                 if (minValue) {
@@ -10840,6 +10926,7 @@
                 const requestPayload = {
                     session_id: currentTranslateSessionId,
                     segment: segmentPayload,
+                    duration_control: getDurationControlMode(),
                 };
                 if (translateVolumeInput && translateVolumeInput.value) {
                     const parsedVolume = parseFloat(translateVolumeInput.value);
@@ -11839,6 +11926,7 @@
                     segments: segmentsPayload,
                     response_format: selectedFormat,
                     tts_backend: translateTtsBackendEl && translateTtsBackendEl.value ? translateTtsBackendEl.value : 'index',
+                    duration_control: getDurationControlMode(),
                     merge_backing_track: translateMergeBackEl && translateMergeBackEl.checked ? true : false,
                 };
                 if (translateVolumeInput && translateVolumeInput.value) {
@@ -12399,6 +12487,7 @@
                     emotion_text: emotionText || "",
                     emotion_weight: emotionWeight,
                     speech_length: parseInt(document.getElementById('speechLength').value) || 0,
+                    duration_control: getDurationControlMode(),
                     diffusion_steps: diffusionSteps,
                     max_text_tokens_per_sentence: maxTextTokens,
                     speaker_effects: speakerEffects,
@@ -12420,6 +12509,7 @@
                 cloneFormData.append('emotion_text', emotionText || "");
                 cloneFormData.append('emotion_weight', emotionWeight.toString());
                 cloneFormData.append('speech_length', (parseInt(document.getElementById('speechLength').value) || 0).toString());
+                cloneFormData.append('duration_control', getDurationControlMode());
                 cloneFormData.append('diffusion_steps', diffusionSteps.toString());
                 cloneFormData.append('max_text_tokens_per_sentence', maxTextTokens.toString());
                 cloneFormData.append('speaker_effects', JSON.stringify(speakerEffects || []));
@@ -12486,6 +12576,7 @@
                         emotion_text: emotionText || "",
                         emotion_weight: emotionWeight,
                         speech_length: parseInt(document.getElementById('speechLength').value) || 0,
+                        duration_control: getDurationControlMode(),
                         diffusion_steps: diffusionSteps,
                         max_text_tokens_per_sentence: maxTextTokens,
                         speaker_effects: speakerEffects,
@@ -12503,6 +12594,7 @@
                 cloneFormData.append('emotion_text', emotionText || "");
                 cloneFormData.append('emotion_weight', emotionWeight.toString());
                 cloneFormData.append('speech_length', (parseInt(document.getElementById('speechLength').value) || 0).toString());
+                cloneFormData.append('duration_control', getDurationControlMode());
                 cloneFormData.append('diffusion_steps', diffusionSteps.toString());
                 cloneFormData.append('max_text_tokens_per_sentence', maxTextTokens.toString());
                 cloneFormData.append('speaker_effects', JSON.stringify(speakerEffects || []));
@@ -12770,6 +12862,7 @@
         function init() {
             bindRangeOutputs();
             bindDelegatedActions();
+            initDurationControlControls();
             const voicePresetSelect = document.getElementById('voiceDesignPreset');
             if (voicePresetSelect) {
                 voicePresetSelect.addEventListener('change', applyVoiceDesignPreset);
