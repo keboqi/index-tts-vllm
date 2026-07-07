@@ -63,6 +63,8 @@ import gzip
 import threading
 import zipfile
 import unicodedata
+import mimetypes
+import wave
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import copy
 import gc
@@ -114,7 +116,7 @@ except ImportError:
 from fastapi import FastAPI, File, UploadFile, Form, Request, HTTPException, Depends, Query
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, validator
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 # IndexTTS v2 and speaker management
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -205,7 +207,12 @@ import argparse
 ALLOWED_TRANSCRIPTION_PIPELINES = {"gemini", "whisperx", "qwen_omnivad", "parakeet"}
 TTS_BACKEND_INDEX = "index"
 TTS_BACKEND_CONFUCIUS = "confucius"
-ALLOWED_TTS_BACKENDS = {TTS_BACKEND_INDEX, TTS_BACKEND_CONFUCIUS}
+TTS_BACKEND_HIGGS = "higgs"
+ALLOWED_TTS_BACKENDS = {TTS_BACKEND_INDEX, TTS_BACKEND_CONFUCIUS, TTS_BACKEND_HIGGS}
+TTSBackendName = Literal["index", "confucius", "higgs"]
+HIGGS_DEFAULT_MODEL = "bosonai/higgs-audio-v3-tts-4b"
+HIGGS_DEFAULT_SERVER_URL = "http://127.0.0.1:8002"
+HIGGS_SPEECH_PATH = "/v1/audio/speech"
 
 
 def _normalize_transcription_pipeline(value: Any, default: str = "gemini") -> str:
@@ -276,6 +283,8 @@ def _normalize_tts_backend(value: Any, default: str = TTS_BACKEND_INDEX) -> str:
         return TTS_BACKEND_INDEX
     if backend in {"confucius4_tts", "confucius_tts", "confucius4"}:
         return TTS_BACKEND_CONFUCIUS
+    if backend in {"higgs_tts", "higgs_audio", "higgs_audio_v3", "sglang_higgs", "higgs_sglang"}:
+        return TTS_BACKEND_HIGGS
     if backend in ALLOWED_TTS_BACKENDS:
         return backend
     return default
@@ -305,6 +314,17 @@ class AppSettings:
     confucius_keepalive_interval: float = 60.0
     confucius_unhealthy_grace: float = 30.0
     confucius_vllm_gpu_memory_utilization: float = 0.15
+    higgs_server_url: str = HIGGS_DEFAULT_SERVER_URL
+    higgs_model: str = HIGGS_DEFAULT_MODEL
+    higgs_manage_backend: bool = True
+    higgs_manager_script: str = "sglang_omni_higgs.sh"
+    higgs_start_timeout: float = 1800.0
+    higgs_request_timeout: float = 900.0
+    higgs_mem_fraction_static: float = 0.30
+    higgs_max_new_tokens: int = 4096
+    higgs_temperature: float = 0.8
+    higgs_top_k: int = 50
+    higgs_top_p: float = 0.0
 
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> "AppSettings":
@@ -333,6 +353,17 @@ class AppSettings:
             confucius_vllm_gpu_memory_utilization=float(
                 getattr(args, "confucius_vllm_gpu_memory_utilization", 0.15)
             ),
+            higgs_server_url=str(getattr(args, "higgs_server_url", HIGGS_DEFAULT_SERVER_URL)),
+            higgs_model=str(getattr(args, "higgs_model", HIGGS_DEFAULT_MODEL)),
+            higgs_manage_backend=bool(getattr(args, "higgs_manage_backend", True)),
+            higgs_manager_script=str(getattr(args, "higgs_manager_script", "sglang_omni_higgs.sh")),
+            higgs_start_timeout=float(getattr(args, "higgs_start_timeout", 1800.0)),
+            higgs_request_timeout=float(getattr(args, "higgs_request_timeout", 900.0)),
+            higgs_mem_fraction_static=float(getattr(args, "higgs_mem_fraction_static", 0.30)),
+            higgs_max_new_tokens=int(getattr(args, "higgs_max_new_tokens", 4096)),
+            higgs_temperature=float(getattr(args, "higgs_temperature", 0.8)),
+            higgs_top_k=int(getattr(args, "higgs_top_k", 50)),
+            higgs_top_p=float(getattr(args, "higgs_top_p", 0.0)),
         )
 
 # Global thread executor for blocking operations
@@ -586,6 +617,12 @@ TRANSLATION_TTS_CONCURRENCY = _env_int(
     min_value=1,
     max_value=INDEXTTS_GPU_WORK_CONCURRENCY,
 )
+HIGGS_TTS_WORK_CONCURRENCY = _env_int(
+    "HIGGS_TTS_WORK_CONCURRENCY",
+    100,
+    min_value=1,
+    max_value=256,
+)
 MIN_SPEECH_DURATION_MS = 3000
 MAX_MERGE_INTERVAL_MS = 0
 CONFUCIUS_RECOVERY_RETRY_ATTEMPTS = _env_int("CONFUCIUS_RECOVERY_RETRY_ATTEMPTS", 8, min_value=1, max_value=50)
@@ -735,6 +772,7 @@ async def _run_audio_cpu(func: Callable, *args, **kwargs):
 
 
 INDEXTTS_GPU_WORK_SLOTS = asyncio.BoundedSemaphore(INDEXTTS_GPU_WORK_CONCURRENCY)
+HIGGS_TTS_WORK_SLOTS = asyncio.BoundedSemaphore(HIGGS_TTS_WORK_CONCURRENCY)
 
 
 def _normalize_gemini_model_name(gemini_model_value: Optional[str]) -> str:
@@ -3589,7 +3627,7 @@ parser.add_argument(
     default=_env_float("QWENEMO_GPU_MEMORY_UTILIZATION", 0.05, min_value=0.0, max_value=1.0),
     help="QwenEmotion vLLM GPU memory utilization (default: 0.05)",
 )
-parser.add_argument("--tts_backend", type=str, default=TTS_BACKEND_INDEX, choices=sorted(ALLOWED_TTS_BACKENDS), help="Default TTS backend: index or confucius")
+parser.add_argument("--tts_backend", type=str, default=TTS_BACKEND_INDEX, choices=sorted(ALLOWED_TTS_BACKENDS), help="Default TTS backend: index, confucius, or higgs")
 parser.add_argument("--confucius_repo_dir", type=str, default="../Confucius4-TTS", help="Path to the Confucius4-TTS repository for lazy managed startup")
 parser.add_argument("--confucius_host", type=str, default="127.0.0.1", help="Host for the managed Confucius4-TTS FastAPI backend")
 parser.add_argument("--confucius_port", type=int, default=8001, help="Port for the managed Confucius4-TTS FastAPI backend")
@@ -3638,6 +3676,42 @@ parser.add_argument(
     default=_env_float("CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION", 0.15, min_value=0.0, max_value=1.0),
     help="Confucius4-TTS vLLM GPU memory utilization for managed startup",
 )
+parser.add_argument(
+    "--higgs_server_url",
+    type=str,
+    default=os.environ.get("HIGGS_TTS_SGLANG_URL", HIGGS_DEFAULT_SERVER_URL),
+    help="Higgs SGLang /v1-compatible server URL (default: http://127.0.0.1:8002)",
+)
+parser.add_argument(
+    "--higgs_model",
+    type=str,
+    default=os.environ.get("HIGGS_TTS_MODEL", HIGGS_DEFAULT_MODEL),
+    help="Higgs model id for managed SGLang startup",
+)
+parser.add_argument(
+    "--higgs_manage_backend",
+    action=argparse.BooleanOptionalAction,
+    default=_env_flag("HIGGS_TTS_MANAGE_BACKEND", True),
+    help="Start the copied Higgs SGLang backend script on demand",
+)
+parser.add_argument(
+    "--higgs_manager_script",
+    type=str,
+    default=os.environ.get("HIGGS_TTS_MANAGER_SCRIPT", "sglang_omni_higgs.sh"),
+    help="Path to the copied Higgs SGLang manager script",
+)
+parser.add_argument("--higgs_start_timeout", type=float, default=_env_float("HIGGS_TTS_START_TIMEOUT", 1800.0, min_value=1.0), help="Seconds to wait for managed Higgs SGLang startup")
+parser.add_argument("--higgs_request_timeout", type=float, default=_env_float("HIGGS_TTS_REQUEST_TIMEOUT", 900.0, min_value=1.0), help="Seconds to wait for each Higgs synthesis request")
+parser.add_argument(
+    "--higgs_mem_fraction_static",
+    type=float,
+    default=_env_float("HIGGS_TTS_MEM_FRACTION_STATIC", 0.30, min_value=0.01, max_value=1.0),
+    help="SGLang static memory fraction for managed Higgs startup",
+)
+parser.add_argument("--higgs_max_new_tokens", type=int, default=_env_int("HIGGS_TTS_MAX_NEW_TOKENS", 4096, min_value=1), help="Default Higgs max_new_tokens")
+parser.add_argument("--higgs_temperature", type=float, default=_env_float("HIGGS_TTS_TEMPERATURE", 0.8, min_value=0.0), help="Default Higgs sampling temperature")
+parser.add_argument("--higgs_top_k", type=int, default=_env_int("HIGGS_TTS_TOP_K", 50, min_value=0), help="Default Higgs top_k; 0 disables top_k")
+parser.add_argument("--higgs_top_p", type=float, default=_env_float("HIGGS_TTS_TOP_P", 0.0, min_value=0.0, max_value=1.0), help="Default Higgs top_p; 0 disables top_p")
 
 # Parse args if run as script, otherwise use defaults
 try:
@@ -3680,12 +3754,77 @@ except SystemExit:
             min_value=0.0,
             max_value=1.0,
         ),
+        higgs_server_url=os.environ.get("HIGGS_TTS_SGLANG_URL", HIGGS_DEFAULT_SERVER_URL),
+        higgs_model=os.environ.get("HIGGS_TTS_MODEL", HIGGS_DEFAULT_MODEL),
+        higgs_manage_backend=_env_flag("HIGGS_TTS_MANAGE_BACKEND", True),
+        higgs_manager_script=os.environ.get("HIGGS_TTS_MANAGER_SCRIPT", "sglang_omni_higgs.sh"),
+        higgs_start_timeout=_env_float("HIGGS_TTS_START_TIMEOUT", 1800.0, min_value=1.0),
+        higgs_request_timeout=_env_float("HIGGS_TTS_REQUEST_TIMEOUT", 900.0, min_value=1.0),
+        higgs_mem_fraction_static=_env_float("HIGGS_TTS_MEM_FRACTION_STATIC", 0.30, min_value=0.01, max_value=1.0),
+        higgs_max_new_tokens=_env_int("HIGGS_TTS_MAX_NEW_TOKENS", 4096, min_value=1),
+        higgs_temperature=_env_float("HIGGS_TTS_TEMPERATURE", 0.8, min_value=0.0),
+        higgs_top_k=_env_int("HIGGS_TTS_TOP_K", 50, min_value=0),
+        higgs_top_p=_env_float("HIGGS_TTS_TOP_P", 0.0, min_value=0.0, max_value=1.0),
     )
 
 SETTINGS = AppSettings.from_namespace(cmd_args)
 
 # Create directories
 APP_DIR = Path(__file__).resolve().parent
+
+
+def _normalize_service_url(url: str, default_url: str) -> str:
+    resolved = (url or default_url).strip()
+    if not resolved:
+        resolved = default_url
+    if not resolved.startswith(("http://", "https://")):
+        resolved = f"http://{resolved}"
+    return resolved.rstrip("/")
+
+
+def _service_host_port_from_url(url: str, default_url: str) -> Tuple[str, int]:
+    normalized = _normalize_service_url(url, default_url)
+    parsed = urlparse(normalized)
+    default_port = 443 if parsed.scheme == "https" else 80
+    return (parsed.hostname or "", int(parsed.port or default_port))
+
+
+def _is_local_service_host(host: str) -> bool:
+    return (host or "").strip().lower() in {
+        "",
+        "0.0.0.0",
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }
+
+
+def _validate_local_service_ports() -> None:
+    """Fail fast when local app/backend ports are configured to collide."""
+    higgs_host, higgs_port = _service_host_port_from_url(
+        SETTINGS.higgs_server_url,
+        HIGGS_DEFAULT_SERVER_URL,
+    )
+    candidates = [
+        ("FastAPI WebUI", SETTINGS.host, int(SETTINGS.port)),
+        ("Confucius4-TTS", SETTINGS.confucius_host, int(SETTINGS.confucius_port)),
+        ("Higgs SGLang", higgs_host, higgs_port),
+    ]
+    local_ports: Dict[int, str] = {}
+    for name, host, port in candidates:
+        if not _is_local_service_host(host):
+            continue
+        previous = local_ports.get(port)
+        if previous:
+            raise RuntimeError(
+                f"Local service port conflict: {previous} and {name} are both configured "
+                f"to use port {port}. Change --port, --confucius_port, or --higgs_server_url."
+            )
+        local_ports[port] = name
+
+
+_validate_local_service_ports()
+
 _OUTPUT_SUBDIRS = (
     "translate_results",
     "clearvoice_cache",
@@ -3801,6 +3940,13 @@ def _loaded_model_inventory() -> List[Dict[str, Any]]:
             "name": "ConfuciusTTS vLLM",
             "kind": "TTS Backend",
             "state": "sleeping" if confucius_backend_manager._vllm_sleeping else "loaded",
+        })
+    if higgs_backend_manager._started_by_manager or higgs_backend_manager._last_health is not None:
+        models.append({
+            "key": "higgs_sglang",
+            "name": "Higgs Audio SGLang",
+            "kind": "TTS Backend",
+            "state": "loaded" if higgs_backend_manager._last_health is not None else "starting",
         })
     for key in stable_audio3_manager.status().get("loaded_models", []):
         models.append({"key": f"stable_audio:{key}", "name": f"Stable Audio 3 ({key})", "kind": "Stable Audio", "state": "loaded"})
@@ -3982,23 +4128,57 @@ def _http_json_get_sync(url: str, timeout: float) -> Dict[str, Any]:
     return json.loads(data.decode("utf-8"))
 
 
-def _http_json_audio_post_sync(url: str, payload: Dict[str, Any], timeout: float) -> bytes:
+def _http_json_post_sync(url: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         url,
         data=data,
         headers={
             "Content-Type": "application/json",
-            "Accept": "audio/wav, audio/mpeg, application/octet-stream",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = response.read()
+    if not body:
+        return {}
+    return json.loads(body.decode("utf-8"))
+
+
+def _http_json_audio_post_with_headers_sync(
+    url: str,
+    payload: Dict[str, Any],
+    timeout: float,
+    *,
+    error_prefix: str = "TTS backend",
+) -> Tuple[bytes, Dict[str, str]]:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "audio/wav, audio/mpeg, audio/pcm, application/octet-stream",
         },
         method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read()
+            return response.read(), dict(response.headers)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Confucius4-TTS HTTP {exc.code}: {detail}") from exc
+        raise RuntimeError(f"{error_prefix} HTTP {exc.code}: {detail}") from exc
+
+
+def _http_json_audio_post_sync(url: str, payload: Dict[str, Any], timeout: float) -> bytes:
+    audio_bytes, _ = _http_json_audio_post_with_headers_sync(
+        url,
+        payload,
+        timeout,
+        error_prefix="Confucius4-TTS",
+    )
+    return audio_bytes
 
 
 class ManagedConfuciusBackend:
@@ -4585,6 +4765,320 @@ class ManagedConfuciusBackend:
 
 
 confucius_backend_manager = ManagedConfuciusBackend()
+
+
+HIGGS_AUDIO_RESPONSE_SUFFIXES = {
+    "audio/aac": "aac",
+    "audio/flac": "flac",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/ogg": "ogg",
+    "audio/opus": "opus",
+    "audio/pcm": "pcm",
+    "audio/wav": "wav",
+    "audio/wave": "wav",
+    "audio/x-wav": "wav",
+}
+
+
+def _higgs_base_url() -> str:
+    return _normalize_service_url(SETTINGS.higgs_server_url, HIGGS_DEFAULT_SERVER_URL)
+
+
+def _resolve_higgs_manager_script() -> Path:
+    script = Path(SETTINGS.higgs_manager_script or "sglang_omni_higgs.sh").expanduser()
+    if not script.is_absolute():
+        script = APP_DIR / script
+    return script.resolve()
+
+
+def _audio_file_data_url(path: str) -> str:
+    source = Path(path).expanduser()
+    if not source.is_absolute():
+        source = APP_DIR / source
+    source = source.resolve()
+    mime = mimetypes.guess_type(source.name)[0] or "audio/wav"
+    encoded = base64.b64encode(source.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _header_int(headers: Dict[str, str], names: List[str], default: int) -> int:
+    lowered = {str(key).lower(): value for key, value in headers.items()}
+    for name in names:
+        raw = lowered.get(name.lower())
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                continue
+    return default
+
+
+def _higgs_response_suffix(headers: Dict[str, str], requested_format: str = "wav") -> str:
+    content_type = str(headers.get("content-type") or headers.get("Content-Type") or "")
+    content_type = content_type.split(";", 1)[0].strip().lower()
+    return HIGGS_AUDIO_RESPONSE_SUFFIXES.get(content_type, requested_format or "wav")
+
+
+def _write_pcm_wav(path: str, pcm_bytes: bytes, headers: Dict[str, str]) -> None:
+    sample_rate = _header_int(headers, ["x-sample-rate", "x-audio-sample-rate", "sample-rate"], 24000)
+    channels = _header_int(headers, ["x-channels", "x-audio-channels", "channels"], 1)
+    bit_depth = _header_int(headers, ["x-bit-depth", "x-audio-bit-depth", "bit-depth"], 16)
+    sample_width = max(1, bit_depth // 8)
+    with wave.open(path, "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(sample_width)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_bytes)
+
+
+def _write_higgs_audio_response_sync(
+    output_path: str,
+    audio_bytes: bytes,
+    headers: Dict[str, str],
+    requested_format: str = "wav",
+) -> None:
+    suffix = _higgs_response_suffix(headers, requested_format)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    if suffix == "pcm":
+        _write_pcm_wav(output_path, audio_bytes, headers)
+        return
+    if suffix == "wav":
+        with open(output_path, "wb") as output_file:
+            output_file.write(audio_bytes)
+        return
+
+    temp_path = f"{output_path}.{suffix}"
+    try:
+        with open(temp_path, "wb") as temp_file:
+            temp_file.write(audio_bytes)
+        audio = AudioSegment.from_file(temp_path, format=suffix)
+        audio.export(output_path, format="wav")
+    finally:
+        _safe_remove_file(temp_path)
+
+
+class ManagedHiggsSGLangBackend:
+    """Lazy manager and OpenAI-compatible client for Higgs Audio through SGLang."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._active_requests = 0
+        self._started_by_manager = False
+        self._last_start_result: Optional[Dict[str, Any]] = None
+        self._last_health: Optional[Dict[str, Any]] = None
+
+    @property
+    def base_url(self) -> str:
+        return _higgs_base_url()
+
+    def _health_sync(self, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
+        try:
+            result = _http_json_get_sync(f"{self.base_url}/v1/models", timeout=timeout)
+            return result or {"ok": True}
+        except Exception:
+            return None
+
+    async def health(self, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
+        health = await _run_blocking(self._health_sync, timeout)
+        self._last_health = health
+        return health
+
+    def _run_manager_script_sync(self, command: str, timeout: float, *, check: bool = True) -> Dict[str, Any]:
+        script = _resolve_higgs_manager_script()
+        if not script.exists():
+            raise RuntimeError(f"Higgs SGLang manager script not found: {script}")
+        bash = shutil.which("bash")
+        if not bash:
+            raise RuntimeError("bash is required to manage the Higgs SGLang backend script.")
+
+        _, port = _service_host_port_from_url(SETTINGS.higgs_server_url, HIGGS_DEFAULT_SERVER_URL)
+        env = os.environ.copy()
+        env["MODEL"] = SETTINGS.higgs_model
+        env["PORT"] = str(port)
+        env["MEM_FRACTION_STATIC"] = f"{float(SETTINGS.higgs_mem_fraction_static):.4f}"
+        completed = subprocess.run(
+            [bash, str(script), command],
+            cwd=str(APP_DIR),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, float(timeout)),
+        )
+        result = {
+            "command": command,
+            "script": str(script),
+            "returncode": completed.returncode,
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip(),
+            "port": port,
+            "model": SETTINGS.higgs_model,
+        }
+        if check and completed.returncode != 0:
+            detail = result["stderr"] or result["stdout"] or "unknown error"
+            raise RuntimeError(f"Higgs SGLang manager {command} failed: {detail[-4000:]}")
+        return result
+
+    async def ensure_ready(self) -> Dict[str, Any]:
+        health = await self.health(timeout=1.0)
+        if health is not None:
+            return health
+
+        if not SETTINGS.higgs_manage_backend:
+            raise RuntimeError(
+                f"Higgs SGLang is not responding at {self.base_url}. "
+                "Start it manually or enable --higgs_manage_backend."
+            )
+
+        async with self._lock:
+            health = await self.health(timeout=1.0)
+            if health is not None:
+                return health
+
+            self._last_start_result = await _run_blocking(
+                self._run_manager_script_sync,
+                "start",
+                SETTINGS.higgs_start_timeout,
+            )
+            self._started_by_manager = True
+
+            deadline = time.perf_counter() + max(1.0, float(SETTINGS.higgs_start_timeout))
+            last_health: Optional[Dict[str, Any]] = None
+            while time.perf_counter() < deadline:
+                last_health = await self.health(timeout=3.0)
+                if last_health is not None:
+                    print("[Higgs SGLang] Managed backend is ready.")
+                    return last_health
+                await asyncio.sleep(2.0)
+
+            raise RuntimeError(
+                f"Timed out waiting {SETTINGS.higgs_start_timeout:.0f}s for Higgs SGLang at {self.base_url}. "
+                f"Last health: {last_health}"
+            )
+
+    def _build_payload(
+        self,
+        *,
+        text: str,
+        prompt_wav: Optional[str],
+        reference_text: Optional[str],
+        temperature: Optional[float],
+        top_k: Optional[int],
+        top_p: Optional[float],
+        max_new_tokens: Optional[int],
+        seed: Optional[int],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "input": text,
+            "response_format": "wav",
+            "stream": False,
+            "max_new_tokens": int(max_new_tokens or SETTINGS.higgs_max_new_tokens),
+            "temperature": float(
+                SETTINGS.higgs_temperature if temperature is None else temperature
+            ),
+        }
+        if top_k is None:
+            top_k = SETTINGS.higgs_top_k
+        if top_p is None:
+            top_p = SETTINGS.higgs_top_p
+        if top_k and int(top_k) > 0:
+            payload["top_k"] = int(top_k)
+        if top_p and float(top_p) > 0:
+            payload["top_p"] = float(top_p)
+        if seed is not None and int(seed) >= 0:
+            payload["seed"] = int(seed)
+
+        if prompt_wav:
+            reference: Dict[str, Any] = {"audio_path": _audio_file_data_url(prompt_wav)}
+            if reference_text and reference_text.strip():
+                reference["text"] = reference_text.strip()
+            payload["references"] = [reference]
+        return payload
+
+    async def synthesize_to_file(
+        self,
+        *,
+        text: str,
+        output_path: str,
+        prompt_wav: Optional[str],
+        reference_text: Optional[str] = None,
+        speech_length: int = 0,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        max_new_tokens: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> str:
+        self._active_requests += 1
+        try:
+            await self.ensure_ready()
+            payload = self._build_payload(
+                text=text,
+                prompt_wav=prompt_wav,
+                reference_text=reference_text,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                max_new_tokens=max_new_tokens,
+                seed=seed,
+            )
+            async with HIGGS_TTS_WORK_SLOTS:
+                audio_bytes, headers = await _run_blocking(
+                    _http_json_audio_post_with_headers_sync,
+                    f"{self.base_url}{HIGGS_SPEECH_PATH}",
+                    payload,
+                    max(1.0, float(SETTINGS.higgs_request_timeout)),
+                    error_prefix="Higgs SGLang",
+                )
+            await _run_audio_cpu(
+                _write_higgs_audio_response_sync,
+                output_path,
+                audio_bytes,
+                headers,
+                "wav",
+            )
+            if speech_length and int(speech_length) > 0:
+                await _postprocess_higgs_duration(output_path, int(speech_length))
+            return output_path
+        finally:
+            self._active_requests = max(0, self._active_requests - 1)
+
+    async def status(self) -> Dict[str, Any]:
+        health = await self.health(timeout=1.0)
+        return {
+            "backend": TTS_BACKEND_HIGGS,
+            "base_url": self.base_url,
+            "healthy": health is not None,
+            "health": health,
+            "manage_backend": SETTINGS.higgs_manage_backend,
+            "manager_script": str(_resolve_higgs_manager_script()),
+            "model": SETTINGS.higgs_model,
+            "active_requests": self._active_requests,
+            "started_by_manager": self._started_by_manager,
+            "last_start_result": self._last_start_result,
+            "work_concurrency": HIGGS_TTS_WORK_CONCURRENCY,
+        }
+
+    async def stop(self) -> None:
+        if self._active_requests > 0:
+            raise RuntimeError("Higgs SGLang has active requests and cannot stop yet")
+        if not SETTINGS.higgs_manage_backend:
+            return
+        if not self._started_by_manager and self._last_health is None:
+            return
+        await _run_blocking(self._run_manager_script_sync, "stop", 900.0, check=False)
+        self._started_by_manager = False
+        self._last_health = None
+
+    async def shutdown(self) -> None:
+        if self._started_by_manager:
+            try:
+                await self.stop()
+            except Exception as exc:
+                print(f"[Higgs SGLang] Shutdown stop failed: {exc}")
+
+
+higgs_backend_manager = ManagedHiggsSGLangBackend()
 
 
 def _clean_ytdl_error(exc: Exception) -> str:
@@ -9002,6 +9496,92 @@ def _match_segment_duration(
     return segment
 
 
+def _atempo_filter_chain(tempo: float) -> str:
+    tempo = max(0.01, float(tempo))
+    factors: List[float] = []
+    while tempo > 2.0:
+        factors.append(2.0)
+        tempo /= 2.0
+    while tempo < 0.5:
+        factors.append(0.5)
+        tempo /= 0.5
+    factors.append(tempo)
+    return ",".join(f"atempo={factor:.6f}".rstrip("0").rstrip(".") for factor in factors)
+
+
+def _audio_file_duration_ms(path: str) -> Optional[int]:
+    duration_seconds = _ffprobe_duration_seconds(path)
+    if duration_seconds is not None:
+        return max(0, int(round(duration_seconds * 1000)))
+    try:
+        return len(AudioSegment.from_file(path))
+    except Exception:
+        return None
+
+
+def _postprocess_higgs_duration_sync(path: str, target_ms: int) -> Dict[str, Any]:
+    target_ms = max(0, int(target_ms))
+    if target_ms <= 0:
+        return {"applied": False, "reason": "no_target"}
+
+    original_ms = _audio_file_duration_ms(path)
+    if not original_ms or original_ms <= 0:
+        return {"applied": False, "reason": "duration_unknown"}
+
+    tempo = original_ms / target_ms
+    stretched_path: Optional[str] = None
+    used_ffmpeg = False
+    try:
+        source_path = path
+        if abs(original_ms - target_ms) > 30 and _ffmpeg_available():
+            stretched_path = str(Path(path).with_name(f"{Path(path).stem}_higgs_duration_{uuid.uuid4().hex}.wav"))
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                path,
+                "-filter:a",
+                _atempo_filter_chain(tempo),
+                "-c:a",
+                "pcm_s16le",
+                *(_ffmpeg_thread_args()),
+                stretched_path,
+            ]
+            _run_ffmpeg_command(cmd)
+            source_path = stretched_path
+            used_ffmpeg = True
+
+        audio = AudioSegment.from_file(source_path)
+        audio = _match_segment_duration(
+            audio,
+            target_ms,
+            int(audio.frame_rate or 22050),
+            int(audio.sample_width or 2),
+            int(audio.channels or 1),
+            allow_trim=True,
+        )
+        audio.export(path, format="wav")
+    finally:
+        _safe_remove_file(stretched_path)
+
+    final_ms = _audio_file_duration_ms(path)
+    return {
+        "applied": True,
+        "original_ms": original_ms,
+        "target_ms": target_ms,
+        "final_ms": final_ms,
+        "tempo": tempo,
+        "used_ffmpeg": used_ffmpeg,
+    }
+
+
+async def _postprocess_higgs_duration(path: str, target_ms: int) -> Dict[str, Any]:
+    return await _run_audio_cpu(_postprocess_higgs_duration_sync, path, target_ms)
+
+
 def _apply_volume_with_ffmpeg(segment: AudioSegment, volume_percent: float) -> AudioSegment:
     """Adjust segment volume using ffmpeg when available, fallback to pydub gain."""
     try:
@@ -10734,6 +11314,7 @@ async def _synthesize_translated_audio(
                     emo_audio_prompt=emo_prompt_value,
                     emo_alpha=resolved_emotion_weight,
                     cache_prompt_audio=not bool(spk_prompt_value),
+                    reference_text=source_text,
                 )
             def _load_and_finalize_generated_audio() -> AudioSegment:
                 audio = AudioSegment.from_file(inference_path)
@@ -11807,21 +12388,34 @@ class SpeakerAPIWrapper:
 speaker_api = None
 
 
+async def _resolve_external_prompt_audio(
+    *,
+    spk_audio_prompt: Optional[str],
+    speaker_preset: Optional[str],
+    backend_label: str,
+) -> Optional[str]:
+    preset_name = (speaker_preset or "").strip()
+    if preset_name:
+        if not speaker_api:
+            raise RuntimeError(f"Speaker manager is not initialized; cannot resolve speaker preset for {backend_label}.")
+        audio_paths = await speaker_api.get_speaker_audio_paths(preset_name)
+        if not audio_paths:
+            raise RuntimeError(f"Speaker preset '{preset_name}' has no saved reference audio for {backend_label}.")
+        return audio_paths[0]
+    prompt = (spk_audio_prompt or "").strip()
+    return prompt or None
+
+
 async def _resolve_confucius_prompt_audio(
     *,
     spk_audio_prompt: Optional[str],
     speaker_preset: Optional[str],
 ) -> Optional[str]:
-    preset_name = (speaker_preset or "").strip()
-    if preset_name:
-        if not speaker_api:
-            raise RuntimeError("Speaker manager is not initialized; cannot resolve speaker preset for Confucius4-TTS.")
-        audio_paths = await speaker_api.get_speaker_audio_paths(preset_name)
-        if not audio_paths:
-            raise RuntimeError(f"Speaker preset '{preset_name}' has no saved reference audio for Confucius4-TTS.")
-        return audio_paths[0]
-    prompt = (spk_audio_prompt or "").strip()
-    return prompt or None
+    return await _resolve_external_prompt_audio(
+        spk_audio_prompt=spk_audio_prompt,
+        speaker_preset=speaker_preset,
+        backend_label="Confucius4-TTS",
+    )
 
 
 async def _synthesize_tts_to_file(
@@ -11842,6 +12436,12 @@ async def _synthesize_tts_to_file(
     use_emo_text: bool = False,
     emo_text: Optional[str] = None,
     cache_prompt_audio: bool = True,
+    reference_text: Optional[str] = None,
+    temperature: Optional[float] = None,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+    max_new_tokens: Optional[int] = None,
+    seed: Optional[int] = None,
 ) -> str:
     backend = _normalize_tts_backend(tts_backend, SETTINGS.tts_backend)
     if backend == TTS_BACKEND_INDEX:
@@ -11863,6 +12463,27 @@ async def _synthesize_tts_to_file(
                 emo_text=emo_text if use_emo_text else None,
                 max_text_tokens_per_sentence=max_text_tokens_per_sentence,
             )
+
+    if backend == TTS_BACKEND_HIGGS:
+        if use_emo_text or emo_text or emo_audio_prompt:
+            print("[Higgs SGLang] Ignoring IndexTTS emotion controls for Higgs backend.")
+        prompt_wav = await _resolve_external_prompt_audio(
+            spk_audio_prompt=spk_audio_prompt,
+            speaker_preset=speaker_preset,
+            backend_label="Higgs SGLang",
+        )
+        return await higgs_backend_manager.synthesize_to_file(
+            text=text,
+            output_path=output_path,
+            prompt_wav=prompt_wav,
+            reference_text=reference_text,
+            speech_length=speech_length,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
+            seed=seed,
+        )
 
     if use_emo_text or emo_text or emo_audio_prompt:
         print("[Confucius4-TTS] Ignoring IndexTTS emotion controls for Confucius backend.")
@@ -11911,7 +12532,7 @@ class TranslateRequest(BaseModel):
             "'pt', and 'vi' are accepted and normalized."
         ),
     )
-    tts_backend: Optional[Literal["index", "confucius"]] = Field(
+    tts_backend: Optional[TTSBackendName] = Field(
         default=None,
         description="TTS backend for synthesis. Defaults to server --tts_backend.",
     )
@@ -12146,7 +12767,7 @@ class TranslateSegmentInput(BaseModel):
 class SegmentPreviewRequest(BaseModel):
     session_id: str = Field(..., description="Active translate session identifier.")
     segment: TranslateSegmentInput = Field(..., description="Segment payload to preview.")
-    tts_backend: Optional[Literal["index", "confucius"]] = Field(
+    tts_backend: Optional[TTSBackendName] = Field(
         default=None,
         description="Optional TTS backend override for this preview.",
     )
@@ -12171,7 +12792,7 @@ class SegmentPreviewRequest(BaseModel):
 class TranslateGenerateRequest(BaseModel):
     session_id: str = Field(..., description="Session identifier returned from /api/translate_segments.")
     segments: List[TranslateSegmentInput] = Field(..., description="Segments to render, including edits and selection.")
-    tts_backend: Optional[Literal["index", "confucius"]] = Field(
+    tts_backend: Optional[TTSBackendName] = Field(
         default=None,
         description="Optional TTS backend override; defaults to the stored session backend.",
     )
@@ -12236,7 +12857,7 @@ class ChunkBatchGenerateRequest(BaseModel):
         default=None,
         description="Override destination language; defaults to the stored chunk language.",
     )
-    tts_backend: Optional[Literal["index", "confucius"]] = Field(
+    tts_backend: Optional[TTSBackendName] = Field(
         default=None,
         description="Optional TTS backend override for generated chunks.",
     )
@@ -12334,7 +12955,7 @@ class ChunkBatchGenerateRequest(BaseModel):
 
 class CloneRequest(BaseModel):
     text: str = Field(..., description="The text to generate audio for.")
-    tts_backend: Optional[Literal["index", "confucius"]] = Field(default=None, description="TTS backend override.")
+    tts_backend: Optional[TTSBackendName] = Field(default=None, description="TTS backend override.")
     language: Optional[str] = Field(default=None, description="Language code/label for Confucius4-TTS.")
     reference_audio: Optional[str] = Field(default=None, description="Reference audio URL or base64")
     reference_text: Optional[str] = Field(default=None, description="Optional transcript")
@@ -12366,7 +12987,7 @@ class CloneRequest(BaseModel):
 
 class SpeakRequest(BaseModel):
     text: str = Field(..., description="The text to generate audio for.")
-    tts_backend: Optional[Literal["index", "confucius"]] = Field(default=None, description="TTS backend override.")
+    tts_backend: Optional[TTSBackendName] = Field(default=None, description="TTS backend override.")
     language: Optional[str] = Field(default=None, description="Language code/label for Confucius4-TTS.")
     name: Optional[str] = Field(default=None, description="The name of the voice character")
     pitch: Optional[Literal["very_low", "low", "moderate", "high", "very_high"]] = Field(default=None)
@@ -12510,6 +13131,7 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown (if needed)
     print("🔄 Shutting down IndexTTS vLLM v2...")
+    await higgs_backend_manager.shutdown()
     await confucius_backend_manager.shutdown()
     # Shutdown the thread executor
     executor.shutdown(wait=True)
@@ -12951,7 +13573,13 @@ async def api_models_unload(request: Request):
         if model_key in {"all", "confucius_vllm"} and confucius_backend_manager._process_running():
             await confucius_backend_manager.sleep_vllm()
             removed.append("confucius_vllm")
-        if model_key == "all" or model_key not in {"indextts_vllm", "emotion_vllm", "confucius_vllm"}:
+        if model_key == "higgs_sglang" or (
+            model_key == "all"
+            and (higgs_backend_manager._started_by_manager or higgs_backend_manager._last_health is not None)
+        ):
+            await higgs_backend_manager.stop()
+            removed.append("higgs_sglang")
+        if model_key == "all" or model_key not in {"indextts_vllm", "emotion_vllm", "confucius_vllm", "higgs_sglang"}:
             removed.extend(await _run_blocking(_unload_optional_model_sync, model_key))
     return JSONResponse(
         content={
@@ -12971,13 +13599,15 @@ async def api_models_wake(request: Request):
     except Exception:
         payload = {}
     model_key = str(payload.get("model_key") or "").strip() if isinstance(payload, dict) else ""
-    if model_key not in {"indextts_vllm", "emotion_vllm", "confucius_vllm"}:
+    if model_key not in {"indextts_vllm", "emotion_vllm", "confucius_vllm", "higgs_sglang"}:
         raise HTTPException(status_code=400, detail="Unknown or non-sleepable model")
     async with _model_manager_lock:
         if model_key in {"indextts_vllm", "emotion_vllm"}:
             await tts_manager.wake_engine(model_key)
-        else:
+        elif model_key == "confucius_vllm":
             await confucius_backend_manager.wake_vllm()
+        else:
+            await higgs_backend_manager.ensure_ready()
     return JSONResponse(
         content={
             "status": "success",
@@ -18285,7 +18915,11 @@ async def speak(req: SpeakRequest):
             speech_length=req.speech_length,
             diffusion_steps=req.diffusion_steps,
             max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
-            verbose=SETTINGS.verbose
+            verbose=SETTINGS.verbose,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+            max_new_tokens=req.max_tokens,
         )
         
         await _apply_speaker_effects_to_file(result, req.speaker_effects)
@@ -18303,7 +18937,7 @@ async def speak(req: SpeakRequest):
 
 def parse_clone_form(
     text: str = Form(...),
-    tts_backend: Optional[Literal["index", "confucius"]] = Form(None),
+    tts_backend: Optional[TTSBackendName] = Form(None),
     language: Optional[str] = Form(None),
     reference_audio: Optional[str] = Form(None),
     reference_text: Optional[str] = Form(None),
@@ -18320,6 +18954,7 @@ def parse_clone_form(
     response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = Form("mp3"),
     emotion_text: Optional[str] = Form(""),
     emotion_weight: float = Form(0.6),
+    speech_length: int = Form(0),
     diffusion_steps: int = Form(10),
     max_text_tokens_per_sentence: int = Form(120),
     speaker_effects: Optional[str] = Form(None),
@@ -18332,6 +18967,7 @@ def parse_clone_form(
         length_threshold=length_threshold, window_size=window_size,
         stream=stream, response_format=response_format,
         emotion_text=emotion_text, emotion_weight=emotion_weight,
+        speech_length=speech_length,
         diffusion_steps=diffusion_steps, max_text_tokens_per_sentence=max_text_tokens_per_sentence,
         speaker_effects=_normalize_speaker_effect_names(speaker_effects)
     )
@@ -18372,7 +19008,12 @@ async def clone_voice(
                 speech_length=req.speech_length,
                 diffusion_steps=req.diffusion_steps,
                 max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
-                verbose=SETTINGS.verbose
+                verbose=SETTINGS.verbose,
+                reference_text=req.reference_text,
+                temperature=req.temperature,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                max_new_tokens=req.max_tokens,
             )
             
             await _apply_speaker_effects_to_file(result, req.speaker_effects)
@@ -18399,6 +19040,7 @@ async def server_info():
             speakers_data = await speaker_api.list_speakers()
             roles = list(speakers_data["speakers"].keys()) if speakers_data["status"] == "success" else []
         confucius_status = await confucius_backend_manager.status()
+        higgs_status = await higgs_backend_manager.status()
 
         return JSONResponse(content={
             "success": True,
@@ -18407,6 +19049,7 @@ async def server_info():
                 "tts_backend": SETTINGS.tts_backend,
                 "tts_backends": sorted(ALLOWED_TTS_BACKENDS),
                 "confucius": confucius_status,
+                "higgs": higgs_status,
                 "roles": roles,
                 "sample_rate": 22050,
                 "engine": "vLLM v2",
@@ -18446,7 +19089,7 @@ async def speak_stream(req: SpeakRequest):
         use_emotion_text = req.emotion_text and req.emotion_text.strip() != ""
         backend = _normalize_tts_backend(req.tts_backend, SETTINGS.tts_backend)
 
-        if backend == TTS_BACKEND_CONFUCIUS:
+        if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_HIGGS}:
             async def confucius_audio_stream_generator():
                 result_path = os.path.join("outputs", f"speak_stream_{uuid.uuid4().hex}.wav")
                 try:
@@ -18464,6 +19107,10 @@ async def speak_stream(req: SpeakRequest):
                         diffusion_steps=req.diffusion_steps,
                         max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
                         verbose=SETTINGS.verbose,
+                        temperature=req.temperature,
+                        top_k=req.top_k,
+                        top_p=req.top_p,
+                        max_new_tokens=req.max_tokens,
                     )
                     await _apply_speaker_effects_to_file(result, req.speaker_effects)
                     audio_bytes = await _read_generated_audio_bytes(result, req.response_format)
@@ -18557,7 +19204,7 @@ async def clone_voice_stream(
         use_emotion_text = req.emotion_text and req.emotion_text.strip() != ""
         backend = _normalize_tts_backend(req.tts_backend, SETTINGS.tts_backend)
 
-        if backend == TTS_BACKEND_CONFUCIUS:
+        if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_HIGGS}:
             async def confucius_audio_stream_generator():
                 result_path = os.path.join("outputs", f"clone_stream_{uuid.uuid4().hex}.wav")
                 try:
@@ -18574,6 +19221,11 @@ async def clone_voice_stream(
                         diffusion_steps=req.diffusion_steps,
                         max_text_tokens_per_sentence=req.max_text_tokens_per_sentence,
                         verbose=SETTINGS.verbose,
+                        reference_text=req.reference_text,
+                        temperature=req.temperature,
+                        top_k=req.top_k,
+                        top_p=req.top_p,
+                        max_new_tokens=req.max_tokens,
                     )
                     await _apply_speaker_effects_to_file(result, req.speaker_effects)
                     audio_bytes = await _read_generated_audio_bytes(result, req.response_format)

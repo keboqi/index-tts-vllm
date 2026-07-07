@@ -2523,10 +2523,11 @@
                                     <select id="ttsBackend" name="tts_backend">
                                         <option value="index" selected>IndexTTS</option>
                                         <option value="confucius">Confucius4-TTS</option>
+                                        <option value="higgs">Higgs Audio SGLang</option>
                                     </select>
                                 </div>
                                 <div class="form-group">
-                                    <label for="ttsLanguage">Confucius Language:</label>
+                                    <label for="ttsLanguage">Backend Language:</label>
                                     <select id="ttsLanguage" name="language">
                                         <option value="auto" selected>Auto</option>
                                         <option value="en">English</option>
@@ -3375,6 +3376,7 @@
                                                 <select id="translateTtsBackend" name="tts_backend">
                                                     <option value="index" selected>IndexTTS</option>
                                                     <option value="confucius">Confucius4-TTS</option>
+                                                    <option value="higgs">Higgs Audio SGLang</option>
                                                 </select>
                                             </div>
                                         </div>
@@ -6600,33 +6602,36 @@
         const translateAdditionalSettingsSummary = document.getElementById('translateAdditionalSettingsSummary');
         const DEFAULT_EMOTION_WEIGHT = 0.6;
         const TRANSLATE_SETTINGS_STORAGE_KEY = 'indexTts.translateSettings.v1';
+        const MULTILINGUAL_TTS_DESTINATION_LANGUAGES = Object.freeze([
+            ['', 'Select...'],
+            ['Chinese', 'Chinese'],
+            ['English', 'English'],
+            ['Japanese', 'Japanese'],
+            ['Korean', 'Korean'],
+            ['German', 'German'],
+            ['French', 'French'],
+            ['Spanish', 'Spanish'],
+            ['Indonesian', 'Indonesian'],
+            ['Italian', 'Italian'],
+            ['Thai', 'Thai'],
+            ['Portuguese', 'Portuguese'],
+            ['Russian', 'Russian'],
+            ['Malay', 'Malay'],
+            ['Vietnamese', 'Vietnamese'],
+        ]);
         const TRANSLATE_DESTINATION_LANGUAGES_BY_BACKEND = Object.freeze({
             index: Object.freeze([
                 ['', 'Select...'],
                 ['English', 'English'],
                 ['Chinese', 'Chinese'],
             ]),
-            confucius: Object.freeze([
-                ['', 'Select...'],
-                ['Chinese', 'Chinese'],
-                ['English', 'English'],
-                ['Japanese', 'Japanese'],
-                ['Korean', 'Korean'],
-                ['German', 'German'],
-                ['French', 'French'],
-                ['Spanish', 'Spanish'],
-                ['Indonesian', 'Indonesian'],
-                ['Italian', 'Italian'],
-                ['Thai', 'Thai'],
-                ['Portuguese', 'Portuguese'],
-                ['Russian', 'Russian'],
-                ['Malay', 'Malay'],
-                ['Vietnamese', 'Vietnamese'],
-            ]),
+            confucius: MULTILINGUAL_TTS_DESTINATION_LANGUAGES,
+            higgs: MULTILINGUAL_TTS_DESTINATION_LANGUAGES,
         });
         const DEFAULT_TRANSLATE_DESTINATION_BY_BACKEND = Object.freeze({
             index: 'Chinese',
             confucius: 'Chinese',
+            higgs: 'Chinese',
         });
 
         function readTranslatePersistentSettings() {
@@ -6663,9 +6668,10 @@
         }
 
         function getTranslateTtsBackendKey() {
-            return translateTtsBackendEl && translateTtsBackendEl.value === 'confucius'
-                ? 'confucius'
+            const backend = translateTtsBackendEl && translateTtsBackendEl.value
+                ? translateTtsBackendEl.value
                 : 'index';
+            return TRANSLATE_DESTINATION_LANGUAGES_BY_BACKEND[backend] ? backend : 'index';
         }
 
         function syncTranslateDestinationLanguageOptions(preferredValue = '') {
@@ -7023,10 +7029,10 @@
             syncDefaultEmotionWeightDisplay();
         }
         function syncTranslateTtsBackendControls() {
-            const isConfucius = translateTtsBackendEl && translateTtsBackendEl.value === 'confucius';
+            const usesIndexEmotionControls = !translateTtsBackendEl || translateTtsBackendEl.value === 'index';
             syncTranslateDestinationLanguageOptions();
             if (translateDefaultEmotionWeightInput) {
-                translateDefaultEmotionWeightInput.disabled = Boolean(isConfucius);
+                translateDefaultEmotionWeightInput.disabled = !usesIndexEmotionControls;
             }
             updateAiConfigSummary();
             updateAdditionalSettingsSummary();
@@ -12444,7 +12450,7 @@
                         `;
                 // Show enhanced status message with emotion info
                 let statusMessage = `Speech generated in ${duration}s! 🚀`;
-                if (ttsBackend !== 'confucius' && emotionText && emotionText.trim()) {
+                if (ttsBackend === 'index' && emotionText && emotionText.trim()) {
                     statusMessage += ` 😊 Emotion: "${emotionText}" (${emotionWeight})`;
                 }
                 statusMessage += formatSpeakerEffectsStatus(speakerEffects);
@@ -12708,7 +12714,7 @@
                             `;
 
                             let statusMessage = `✅ Streaming complete! First chunk: ${firstChunkDuration}s, Total: ${totalGenTime}s (${chunkCount} chunks)`;
-                            if (ttsBackend !== 'confucius' && emotionText && emotionText.trim()) {
+                            if (ttsBackend === 'index' && emotionText && emotionText.trim()) {
                                 statusMessage += ` 😊 Emotion: "${emotionText}" (${emotionWeight})`;
                             }
                             statusMessage += formatSpeakerEffectsStatus(speakerEffects);
@@ -12744,12 +12750,12 @@
             const emotionTextEl = document.getElementById('emotionText');
             const emotionWeightEl = document.getElementById('emotionWeight');
             function updateTtsBackendControls() {
-                const isConfucius = ttsBackendEl && ttsBackendEl.value === 'confucius';
+                const usesIndexEmotionControls = !ttsBackendEl || ttsBackendEl.value === 'index';
                 if (emotionTextEl) {
-                    emotionTextEl.disabled = Boolean(isConfucius);
+                    emotionTextEl.disabled = !usesIndexEmotionControls;
                 }
                 if (emotionWeightEl) {
-                    emotionWeightEl.disabled = Boolean(isConfucius);
+                    emotionWeightEl.disabled = !usesIndexEmotionControls;
                 }
             }
             if (ttsBackendEl) {
