@@ -382,6 +382,10 @@ audio_executor = ThreadPoolExecutor(
     max_workers=_env_int("INDEXTTS_AUDIO_WORKERS", 2, min_value=1, max_value=8),
     thread_name_prefix="fastapi_audio",
 )
+higgs_executor = ThreadPoolExecutor(
+    max_workers=_env_int("HIGGS_HTTP_WORKERS", 100, min_value=1, max_value=256),
+    thread_name_prefix="higgs_http",
+)
 
 # Global ClearVoice models (initialized lazily and reused)
 _enhancement_model: Optional[Any] = None
@@ -5114,12 +5118,16 @@ class ManagedHiggsSGLangBackend:
             seed=seed,
         )
         async with HIGGS_TTS_WORK_SLOTS:
-            audio_bytes, headers = await _run_blocking(
-                _http_json_audio_post_with_headers_sync,
-                f"{self.base_url}{HIGGS_SPEECH_PATH}",
-                payload,
-                max(1.0, float(SETTINGS.higgs_request_timeout)),
-                error_prefix="Higgs SGLang",
+            loop = asyncio.get_running_loop()
+            audio_bytes, headers = await loop.run_in_executor(
+                higgs_executor,
+                functools.partial(
+                    _http_json_audio_post_with_headers_sync,
+                    f"{self.base_url}{HIGGS_SPEECH_PATH}",
+                    payload,
+                    max(1.0, float(SETTINGS.higgs_request_timeout)),
+                    error_prefix="Higgs SGLang",
+                ),
             )
         await _run_audio_cpu(
             _write_higgs_audio_response_sync,
