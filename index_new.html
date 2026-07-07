@@ -6517,9 +6517,9 @@
                 try {
                     const startTime = performance.now();
 
-                    const useStreamingTransport = streamingMode || ttsBackend === 'confucius' || ttsBackend === 'higgs';
+                    const useStreamingTransport = streamingMode;
                     if (useStreamingTransport) {
-                        // Streaming transport keeps long external backend cold starts alive through tunnels/proxies.
+                        // Streaming transport: uses chunked response with keepalive frames.
                         await handleStreamingRequest(text, speaker, emotionText, emotionWeight, diffusionSteps, maxTextTokens, speakerEffects, formData, startTime, ttsBackend, ttsLanguage);
                     } else {
                         // Regular mode

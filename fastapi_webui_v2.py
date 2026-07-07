@@ -5173,6 +5173,11 @@ class ManagedHiggsSGLangBackend:
                     )
                     output = Path(output_path)
                     output.parent.mkdir(parents=True, exist_ok=True)
+                    # Build chunk paths and coroutines up-front, then
+                    # fire all requests in parallel.  The per-request
+                    # HIGGS_TTS_WORK_SLOTS semaphore still throttles
+                    # concurrency at the HTTP level.
+                    coros = []
                     for index, chunk_text in enumerate(text_chunks):
                         chunk_path = str(
                             output.with_name(
@@ -5185,17 +5190,20 @@ class ManagedHiggsSGLangBackend:
                             if seed is not None and int(seed) >= 0
                             else seed
                         )
-                        await self._request_audio_to_file(
-                            text=chunk_text,
-                            output_path=chunk_path,
-                            prompt_wav=prompt_wav,
-                            reference_text=reference_text,
-                            temperature=temperature,
-                            top_k=top_k,
-                            top_p=top_p,
-                            max_new_tokens=max_new_tokens,
-                            seed=chunk_seed,
+                        coros.append(
+                            self._request_audio_to_file(
+                                text=chunk_text,
+                                output_path=chunk_path,
+                                prompt_wav=prompt_wav,
+                                reference_text=reference_text,
+                                temperature=temperature,
+                                top_k=top_k,
+                                top_p=top_p,
+                                max_new_tokens=max_new_tokens,
+                                seed=chunk_seed,
+                            )
                         )
+                    await asyncio.gather(*coros)
                     await _run_audio_cpu(_concat_higgs_audio_chunks_sync, chunk_paths, output_path)
             finally:
                 for chunk_path in chunk_paths:
