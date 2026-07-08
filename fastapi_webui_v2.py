@@ -5356,6 +5356,14 @@ class ManagedHiggsSGLangBackend:
                     )
                     output = Path(output_path)
                     output.parent.mkdir(parents=True, exist_ok=True)
+                    # Keep all chunks from one utterance on the same sampling seed.
+                    # If no seed was supplied, choose one request-scoped seed instead
+                    # of letting the backend randomize every chunk independently.
+                    chunk_seed = (
+                        int(seed)
+                        if seed is not None and int(seed) >= 0
+                        else ((uuid.uuid4().int & 0x7FFFFFFF) if seed is None else None)
+                    )
                     # Cap parallel chunk requests to avoid overwhelming
                     # the Higgs backend.  Up to 100 in-flight at once.
                     _chunk_sem = asyncio.Semaphore(100)
@@ -5372,11 +5380,6 @@ class ManagedHiggsSGLangBackend:
                             )
                         )
                         chunk_paths.append(chunk_path)
-                        chunk_seed = (
-                            int(seed) + index
-                            if seed is not None and int(seed) >= 0
-                            else seed
-                        )
                         coros.append(
                             _throttled_chunk(
                                 self._request_audio_to_file(
