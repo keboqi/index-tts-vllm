@@ -4935,6 +4935,7 @@ HIGGS_DELIVERY_TAG_PATTERN = re.compile(
     r"<\|prosody:(?:speed_very_slow|speed_slow|speed_fast|speed_very_fast|pitch_low|pitch_high|expressive_high|expressive_low)\|>))+)"
 )
 HIGGS_SENTENCE_BREAK_CHARS = set(".!?;\u3002\uff01\uff1f\uff1b")
+HIGGS_SENTENCE_SPLIT_PATTERN = re.compile(r"([.!?;\u3002\uff01\uff1f\uff1b]\s*|\n+)")
 
 
 def _fallback_split_higgs_text(text: str, max_chars: int) -> List[str]:
@@ -4942,7 +4943,7 @@ def _fallback_split_higgs_text(text: str, max_chars: int) -> List[str]:
     if not text:
         return []
     max_chars = max(40, int(max_chars or 120))
-    pieces = re.split(r"([.!?;]\s*)", text)
+    pieces = HIGGS_SENTENCE_SPLIT_PATTERN.split(text)
     segments: List[str] = []
     current = ""
     for idx in range(0, len(pieces), 2):
@@ -4950,6 +4951,12 @@ def _fallback_split_higgs_text(text: str, max_chars: int) -> List[str]:
         delimiter = pieces[idx + 1] if idx + 1 < len(pieces) else ""
         candidate = f"{part}{delimiter}".strip()
         if not candidate:
+            continue
+        if len(candidate) > max_chars:
+            if current:
+                segments.append(current.strip())
+                current = ""
+            segments.extend(_split_long_higgs_control_unit(candidate, max_chars))
             continue
         if current and len(current) + len(candidate) + 1 > max_chars:
             segments.append(current.strip())
@@ -5084,32 +5091,14 @@ def _split_higgs_text_like_indextts(text: str, max_text_tokens_per_sentence: int
     if not source:
         return []
     max_tokens = max(1, int(max_text_tokens_per_sentence or 120))
-    if HIGGS_CONTROL_TAG_PATTERN.search(source):
-        chunks = _split_higgs_control_text(source, max_tokens)
-        if chunks:
-            return chunks
-    try:
-        tokenizer = getattr(tts_manager.get_tts(), "tokenizer", None)
-        if tokenizer is None:
-            raise RuntimeError("IndexTTS tokenizer is not available")
-        text_tokens = tokenizer.tokenize(source)
-        if len(text_tokens) <= max_tokens:
-            return [source]
-        sentences = tokenizer.split_sentences(text_tokens, max_tokens)
-        chunks: List[str] = []
-        for sentence_tokens in sentences:
-            if not sentence_tokens:
-                continue
-            token_ids = tokenizer.convert_tokens_to_ids(sentence_tokens)
-            chunk_text = tokenizer.decode(token_ids).strip()
-            if chunk_text:
-                chunks.append(chunk_text)
-        if chunks:
-            return chunks
-    except Exception as exc:
-        print(f"[Higgs SGLang] IndexTTS-style text splitting failed; using fallback splitter: {exc}")
 
-    # Fallback is character based, but only used when the IndexTTS tokenizer is unavailable.
+    # Higgs does not share IndexTTS tokenization.  Use a Higgs-aware
+    # character splitter first so long requests do not collapse into one
+    # backend call and hit max_new_tokens.
+    chunks = _split_higgs_control_text(source, max_tokens)
+    if chunks:
+        return chunks
+
     return _fallback_split_higgs_text(source, max_tokens * 4) or [source]
 
 
