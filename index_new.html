@@ -2504,6 +2504,12 @@
                                     required style="min-height: 80px;"></textarea>
                             </div>
 
+                            <div id="higgsEnhancerToggleRow"
+                                style="display:none; justify-content:flex-end; margin: 8px 0 14px;">
+                                <button type="button" class="btn btn-secondary" id="toggleHiggsEnhancerBtn"
+                                    aria-controls="higgsEnhancerPanel" aria-expanded="false">Show Higgs enhancer</button>
+                            </div>
+
                             <div id="higgsEnhancerPanel"
                                 style="display:none; background: rgba(34, 211, 238, 0.09); padding: 14px; border-radius: 10px; margin: 14px 0; border: 1px solid rgba(34, 211, 238, 0.25);">
                                 <div class="form-row-2">
@@ -5549,11 +5555,32 @@ Enhanced Higgs TTS input:`;
             showStatus('Enhanced Higgs text loaded into the synthesis text box.', 'success', 'higgsEnhanceStatus');
         }
 
+        let higgsEnhancerExpanded = false;
+
+        function toggleHiggsEnhancer() {
+            higgsEnhancerExpanded = !higgsEnhancerExpanded;
+            updateHiggsEnhancerVisibility();
+        }
+
         function updateHiggsEnhancerVisibility() {
             const panel = document.getElementById('higgsEnhancerPanel');
+            const toggleRow = document.getElementById('higgsEnhancerToggleRow');
+            const toggleBtn = document.getElementById('toggleHiggsEnhancerBtn');
             const backendEl = document.getElementById('ttsBackend');
-            if (!panel) return;
-            panel.style.display = backendEl && backendEl.value === 'higgs' ? 'block' : 'none';
+            const isHiggs = Boolean(backendEl && backendEl.value === 'higgs');
+            if (!isHiggs) {
+                higgsEnhancerExpanded = false;
+            }
+            if (toggleRow) {
+                toggleRow.style.display = isHiggs ? 'flex' : 'none';
+            }
+            if (panel) {
+                panel.style.display = isHiggs && higgsEnhancerExpanded ? 'block' : 'none';
+            }
+            if (toggleBtn) {
+                toggleBtn.textContent = higgsEnhancerExpanded ? 'Hide Higgs enhancer' : 'Show Higgs enhancer';
+                toggleBtn.setAttribute('aria-expanded', String(isHiggs && higgsEnhancerExpanded));
+            }
             updateHiggsEnhancePromptPreview();
         }
 
@@ -6763,8 +6790,12 @@ Enhanced Higgs TTS input:`;
         const generateHiggsEnhancedBtn = document.getElementById('generateHiggsEnhancedBtn');
         const useHiggsEnhancedBtn = document.getElementById('useHiggsEnhancedBtn');
         const higgsEnhancedText = document.getElementById('higgsEnhancedText');
+        const toggleHiggsEnhancerBtn = document.getElementById('toggleHiggsEnhancerBtn');
         if (synthesisTextInput) {
             synthesisTextInput.addEventListener('input', updateHiggsEnhancePromptPreview);
+        }
+        if (toggleHiggsEnhancerBtn) {
+            toggleHiggsEnhancerBtn.addEventListener('click', toggleHiggsEnhancer);
         }
         if (copyHiggsEnhancePromptBtn) {
             copyHiggsEnhancePromptBtn.addEventListener('click', copyHiggsEnhancePrompt);
