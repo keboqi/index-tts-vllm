@@ -13,5 +13,10 @@ smoothquart.py
 
 
 checkpoints/*
+!checkpoints/whisperx/
+checkpoints/whisperx/*
+!checkpoints/whisperx/hy-mt/
+checkpoints/whisperx/hy-mt/*
+!checkpoints/whisperx/hy-mt/.gitkeep
 
 output.wav
