@@ -7,10 +7,15 @@ cd "${SCRIPT_DIR}"
 VENV_DIR="${VENV_DIR:-.venv}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 MODEL_DIR="${MODEL_DIR:-checkpoints}"
+HY_MT_TRANSLATION_MODEL="${HY_MT_TRANSLATION_MODEL:-tencent/Hy-MT2-1.8B}"
+HY_MT_TRANSLATION_LOCAL_DIR="${HY_MT_TRANSLATION_LOCAL_DIR:-${MODEL_DIR}/hy-mt}"
+export HY_MT_TRANSLATION_MODEL
+export HY_MT_TRANSLATION_LOCAL_DIR
 CONFUCIUS_REPO_DIR="${CONFUCIUS_REPO_DIR:-../Confucius4-TTS}"
 INSTALL_SYSTEM_DEPS="${INSTALL_SYSTEM_DEPS:-1}"
 INSTALL_CONFUCIUS="${INSTALL_CONFUCIUS:-1}"
 DOWNLOAD_MODEL="${DOWNLOAD_MODEL:-1}"
+DOWNLOAD_HY_MT_MODEL="${DOWNLOAD_HY_MT_MODEL:-1}"
 RUN_SERVER="${RUN_SERVER:-1}"
 EXPORT_TUNNEL="${EXPORT_TUNNEL:-1}"
 SERVER_PORT="${SERVER_PORT:-8000}"
@@ -155,6 +160,13 @@ download_model() {
     "${VENV_DIR}/bin/hf" download \
         garyswansrs/index_tts_2_vllm \
         --local-dir "${MODEL_DIR}"
+
+    if [[ "${DOWNLOAD_HY_MT_MODEL}" == "1" ]]; then
+        log "Downloading/resuming HY-MT translation model"
+        "${VENV_DIR}/bin/hf" download \
+            "${HY_MT_TRANSLATION_MODEL}" \
+            --local-dir "${HY_MT_TRANSLATION_LOCAL_DIR}"
+    fi
 }
 
 ensure_system_dependencies
