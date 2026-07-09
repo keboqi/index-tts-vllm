@@ -16,6 +16,8 @@ set -Eeuo pipefail
 #   MODEL=bosonai/higgs-audio-v3-tts-4b
 #   PORT=8002
 #   MEM_FRACTION_STATIC=0.30
+#   MAX_RUNNING_REQUESTS=100
+#   DTYPE=bfloat16
 #   ALLOWED_LOCAL_MEDIA_PATH=/workspace/higgs_tts_reference_audio
 #   PROJECT_ROOT=$HOME/index-tts-higgs-sglang-workspace
 #   HF_CACHE=$HOME/.cache/huggingface
@@ -26,6 +28,8 @@ IMAGE="${IMAGE:-lmsysorg/sglang-omni:dev}"
 MODEL="${MODEL:-bosonai/higgs-audio-v3-tts-4b}"
 PORT="${PORT:-8002}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.30}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-100}"
+DTYPE="${DTYPE:-bfloat16}"
 ALLOWED_LOCAL_MEDIA_PATH="${ALLOWED_LOCAL_MEDIA_PATH:-/workspace/higgs_tts_reference_audio}"
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/index-tts-higgs-sglang-workspace}"
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
@@ -64,6 +68,8 @@ Env overrides:
   MODEL=${MODEL}
   PORT=${PORT}
   MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC}
+  MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS}
+  DTYPE=${DTYPE}
   ALLOWED_LOCAL_MEDIA_PATH=${ALLOWED_LOCAL_MEDIA_PATH}
   PROJECT_ROOT=${PROJECT_ROOT}
   HF_CACHE=${HF_CACHE}
@@ -75,7 +81,7 @@ Examples:
   bash $0 logs
   PORT=8010 bash $0 start
   MEM_FRACTION_STATIC=0.35 bash $0 start
-  EXTRA_ARGS="--dtype bfloat16" bash $0 start
+  MAX_RUNNING_REQUESTS=100 DTYPE=bfloat16 bash $0 start
 USAGE
 }
 
@@ -313,6 +319,8 @@ start_server() {
     -e MODEL="$MODEL" \
     -e PORT="$PORT" \
     -e MEM_FRACTION_STATIC="$MEM_FRACTION_STATIC" \
+    -e MAX_RUNNING_REQUESTS="$MAX_RUNNING_REQUESTS" \
+    -e DTYPE="$DTYPE" \
     -e ALLOWED_LOCAL_MEDIA_PATH="$ALLOWED_LOCAL_MEDIA_PATH" \
     -e EXTRA_ARGS="$EXTRA_ARGS" \
     -e REPO_IN="$REPO_IN" \
@@ -340,6 +348,8 @@ nohup $SESSION_PREFIX .venv/bin/sgl-omni serve \
   --port "$PORT" \
   --allowed-local-media-path "$ALLOWED_LOCAL_MEDIA_PATH" \
   --stages.2.runtime.sglang_server_args.mem_fraction_static="$MEM_FRACTION_STATIC" \
+  --stages.2.runtime.sglang_server_args.max_running_requests="$MAX_RUNNING_REQUESTS" \
+  --stages.2.runtime.sglang_server_args.dtype="$DTYPE" \
   $EXTRA_ARGS \
   > "$LOG_FILE_IN" 2>&1 &
 

@@ -196,6 +196,10 @@ python fastapi_webui_v2.py [OPTIONS]
 - `--higgs_manager_script`: Docker manager script copied into this repo from `higgs_tts_gradio` (default: `sglang_omni_higgs.sh`).
 - `--higgs_manage_backend` / `--no-higgs_manage_backend`: Start/stop Higgs SGLang lazily from the WebUI, or require a manually managed endpoint.
 - `--higgs_start_timeout` / `--higgs_request_timeout`: Startup and synthesis request timeouts in seconds (defaults: `3600` / `1800`).
+- `--higgs_max_running_requests`: Managed SGLang `max_running_requests` (default: `100`; lower this if your GPU starts queueing or OOMing).
+- `--higgs_dtype`: Managed SGLang dtype (default: `bfloat16`).
+- `--higgs_initial_codec_chunk_frames`: Initial Higgs streaming window size in codec frames (default: `1` for lower first-audio latency).
+- `HIGGS_REFERENCE_DATA_URL_CACHE_SIZE` (env): Number of local Higgs reference-audio data URLs to cache before sending requests to SGLang (default: `256`).
 - `EXTERNAL_TTS_STREAM_KEEPALIVE_SECONDS` (env): Heartbeat interval for external-backend stream responses (default: `15`).
 - `--verbose` (flag): Enable verbose logging output in the console.
 
@@ -226,7 +230,9 @@ The Higgs integration reuses `sglang_omni_higgs.sh` from `higgs_tts_gradio`, wit
 bash sglang_omni_higgs.sh start
 ```
 
-The endpoint is OpenAI-style `/v1/audio/speech` through SGLang Omni. Higgs does not expose native duration control, so translate/edit requests generate speech first and then post-process the WAV with FFmpeg time-stretching plus exact trim/pad matching before segment assembly. The WebUI also has a persistent global Duration Control switch: `Original` keeps IndexTTS/Confucius native duration behavior while Higgs uses FFmpeg, and `Force FFmpeg` makes all backends synthesize without native timing and then use FFmpeg duration matching. API calls can set `duration_control` to `original` or `ffmpeg` (default behavior is `original`). Higgs also does not auto-chunk long text, so the adapter uses the same IndexTTS tokenizer splitting mechanism before sending chunks to SGLang, concatenates the generated WAV chunks, then applies duration matching once to the combined audio. IndexTTS emotion text/weight controls are ignored for Higgs.
+The endpoint is OpenAI-style `/v1/audio/speech` through SGLang Omni. Managed startup defaults to BF16, `max_running_requests=100`, and SGLang Omni's CUDA Graph path. The shared synthesis path used by `/speak`, `/clone_voice`, and the translate/audiobook generation flow caches serialized local reference audio before sending requests to SGLang, so repeated speaker presets avoid repeated file reads/base64 encoding while preserving stable reference bytes for SGLang's own reference/prefix caches. The `/speak_stream` and `/clone_voice_stream` endpoints use Higgs native PCM streaming when no duration post-process or speaker effects are requested, then wrap those PCM chunks in the WebUI's existing `CHUNK` frame format. Requests that need FFmpeg duration matching or speaker effects still use the full-file fallback so post-processing stays exact.
+
+Higgs does not expose native duration control, so translate/edit requests generate speech first and then post-process the WAV with FFmpeg time-stretching plus exact trim/pad matching before segment assembly. The WebUI also has a persistent global Duration Control switch: `Original` keeps IndexTTS/Confucius native duration behavior while Higgs uses FFmpeg, and `Force FFmpeg` makes all backends synthesize without native timing and then use FFmpeg duration matching. API calls can set `duration_control` to `original` or `ffmpeg` (default behavior is `original`). Higgs also does not auto-chunk long text, so the adapter uses the same IndexTTS tokenizer splitting mechanism before sending chunks to SGLang, concatenates the generated WAV chunks, then applies duration matching once to the combined audio. IndexTTS emotion text/weight controls are ignored for Higgs.
 
 ---
 
