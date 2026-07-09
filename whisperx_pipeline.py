@@ -151,7 +151,7 @@ HY_MT_TRANSLATION_MODEL = (
     os.getenv("HY_MT_TRANSLATION_MODEL", "tencent/Hy-MT2-1.8B").strip()
     or "tencent/Hy-MT2-1.8B"
 )
-HY_MT_TRANSLATION_CACHE_DIR = os.getenv("HY_MT_TRANSLATION_CACHE_DIR", "").strip()
+HY_MT_TRANSLATION_LOCAL_DIR = os.getenv("HY_MT_TRANSLATION_LOCAL_DIR", "checkpoints/hy-mt").strip()
 HY_MT_TRANSLATION_MODEL_ALIASES = {
     "hy-mt",
     "hy-mt2",
@@ -211,15 +211,12 @@ WHISPERX_MODEL_DIR = os.path.join(_SCRIPT_DIR, "checkpoints", "whisperx")
 WHISPERX_ASR_DOWNLOAD_ROOT = os.path.join(WHISPERX_MODEL_DIR, "faster-whisper")
 WHISPERX_ALIGN_MODEL_DIR = os.path.join(WHISPERX_MODEL_DIR, "align")
 WHISPERX_PYANNOTE_CACHE = os.path.join(WHISPERX_MODEL_DIR, "pyannote")
-if not HY_MT_TRANSLATION_CACHE_DIR:
-    HY_MT_TRANSLATION_CACHE_DIR = os.path.join(WHISPERX_MODEL_DIR, "hy-mt")
-elif not os.path.isabs(HY_MT_TRANSLATION_CACHE_DIR):
-    HY_MT_TRANSLATION_CACHE_DIR = os.path.join(_SCRIPT_DIR, HY_MT_TRANSLATION_CACHE_DIR)
+if HY_MT_TRANSLATION_LOCAL_DIR and not os.path.isabs(HY_MT_TRANSLATION_LOCAL_DIR):
+    HY_MT_TRANSLATION_LOCAL_DIR = os.path.join(_SCRIPT_DIR, HY_MT_TRANSLATION_LOCAL_DIR)
 
 # Ensure directories exist
 for _d in (WHISPERX_MODEL_DIR, WHISPERX_ASR_DOWNLOAD_ROOT,
-           WHISPERX_ALIGN_MODEL_DIR, WHISPERX_PYANNOTE_CACHE,
-           HY_MT_TRANSLATION_CACHE_DIR):
+           WHISPERX_ALIGN_MODEL_DIR, WHISPERX_PYANNOTE_CACHE):
     os.makedirs(_d, exist_ok=True)
 
 # Set env vars *before* any model loading as a fallback for any
@@ -235,6 +232,19 @@ _HY_MT_TOKENIZER: Any = None
 _HY_MT_MODEL: Any = None
 _HY_MT_MODEL_REF: Optional[str] = None
 _HY_MT_LOCK = threading.Lock()
+
+
+def _hy_mt_model_load_ref() -> str:
+    if HY_MT_TRANSLATION_LOCAL_DIR:
+        if not os.path.isdir(HY_MT_TRANSLATION_LOCAL_DIR) or not os.listdir(HY_MT_TRANSLATION_LOCAL_DIR):
+            raise RuntimeError(
+                "HY-MT local model directory is missing or empty: "
+                f"{HY_MT_TRANSLATION_LOCAL_DIR}. Download it with "
+                "`hf download tencent/Hy-MT2-1.8B --local-dir checkpoints/hy-mt` "
+                "or clear HY_MT_TRANSLATION_LOCAL_DIR to load from Hugging Face."
+            )
+        return HY_MT_TRANSLATION_LOCAL_DIR
+    return HY_MT_TRANSLATION_MODEL
 
 
 def _lightning_api_key_configured() -> bool:
@@ -287,10 +297,12 @@ def _load_hy_mt_model() -> Tuple[Any, Any]:
     if torch is None:
         raise RuntimeError("torch is required for HY-MT fallback translation.")
 
+    model_load_ref = _hy_mt_model_load_ref()
+
     if (
         _HY_MT_TOKENIZER is not None
         and _HY_MT_MODEL is not None
-        and _HY_MT_MODEL_REF == HY_MT_TRANSLATION_MODEL
+        and _HY_MT_MODEL_REF == model_load_ref
     ):
         return _HY_MT_TOKENIZER, _HY_MT_MODEL
 
@@ -298,23 +310,21 @@ def _load_hy_mt_model() -> Tuple[Any, Any]:
         if (
             _HY_MT_TOKENIZER is not None
             and _HY_MT_MODEL is not None
-            and _HY_MT_MODEL_REF == HY_MT_TRANSLATION_MODEL
+            and _HY_MT_MODEL_REF == model_load_ref
         ):
             return _HY_MT_TOKENIZER, _HY_MT_MODEL
 
         print(
             "Loading HY-MT fallback translation model "
-            f"'{HY_MT_TRANSLATION_MODEL}'..."
+            f"'{model_load_ref}'..."
         )
         tokenizer = AutoTokenizer.from_pretrained(
-            HY_MT_TRANSLATION_MODEL,
-            cache_dir=HY_MT_TRANSLATION_CACHE_DIR,
+            model_load_ref,
             local_files_only=HY_MT_TRANSLATION_LOCAL_FILES_ONLY,
             trust_remote_code=True,
         )
 
         model_kwargs: Dict[str, Any] = {
-            "cache_dir": HY_MT_TRANSLATION_CACHE_DIR,
             "local_files_only": HY_MT_TRANSLATION_LOCAL_FILES_ONLY,
             "trust_remote_code": True,
         }
@@ -326,7 +336,7 @@ def _load_hy_mt_model() -> Tuple[Any, Any]:
         if device == "auto":
             try:
                 model = AutoModelForCausalLM.from_pretrained(
-                    HY_MT_TRANSLATION_MODEL,
+                    model_load_ref,
                     device_map="auto",
                     **model_kwargs,
                 )
@@ -339,7 +349,7 @@ def _load_hy_mt_model() -> Tuple[Any, Any]:
                     "loading on a single device instead."
                 )
                 model = AutoModelForCausalLM.from_pretrained(
-                    HY_MT_TRANSLATION_MODEL,
+                    model_load_ref,
                     **model_kwargs,
                 )
                 fallback_device = (
@@ -350,7 +360,7 @@ def _load_hy_mt_model() -> Tuple[Any, Any]:
                 model = model.to(fallback_device)
         else:
             model = AutoModelForCausalLM.from_pretrained(
-                HY_MT_TRANSLATION_MODEL,
+                model_load_ref,
                 **model_kwargs,
             )
             model = model.to(HY_MT_TRANSLATION_DEVICE)
@@ -360,7 +370,7 @@ def _load_hy_mt_model() -> Tuple[Any, Any]:
 
         _HY_MT_TOKENIZER = tokenizer
         _HY_MT_MODEL = model
-        _HY_MT_MODEL_REF = HY_MT_TRANSLATION_MODEL
+        _HY_MT_MODEL_REF = model_load_ref
         return tokenizer, model
 
 
