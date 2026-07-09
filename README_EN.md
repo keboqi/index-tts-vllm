@@ -96,6 +96,7 @@ The modern Web UI [index_new.html](file:///d:/repo/index_tts_2/index-tts-vllm/in
 
 ### 1. ASR (Speech-to-Text) & Diarization
 The translation workflow supports multiple transcription and alignment backends:
+- **MOSS Transcribe+Diarize via SGLang-Omni**: Default local diarized ASR pipeline, served through an OpenAI-compatible transcription endpoint. The WebUI can manage it with `sglang_omni_moss_transcribe.sh`.
 - **Cloud Gemini**: Fast and highly accurate cloud-based ASR and translation.
 - **Local WhisperX**: Precise phoneme-level word alignment and segment timing.
 - **Qwen3-ASR + OmniVAD**: Extremely robust local diarized ASR. Supports Sortformer and Pyannote diarization backends.
@@ -155,6 +156,8 @@ pip install -U "nemo_toolkit[asr]"
 
 > [!NOTE]
 > Do not install `qwen-asr` into the same environment as `qwen-tts` for now: current releases pin incompatible exact `transformers` versions (`qwen-tts` pins `4.57.3`, while `qwen-asr` pins `4.57.6`). Also do not install `qwen-asr[vllm]` into this environment; this project pins `vllm==0.10.2` for IndexTTS2.
+
+MOSS Transcribe+Diarize is the default `transcription_pipeline`. It runs through the SGLang-Omni Docker manager in `sglang_omni_moss_transcribe.sh`; run `bash sglang_omni_moss_transcribe.sh deploy` ahead of time to pre-pull the image and model, or let the WebUI start it lazily on the first MOSS transcription request.
 
 ### 4. Model Weights
 Download the pre-converted IndexTTS2 vLLM weights and Stable Audio 3 checkpoints:
@@ -355,7 +358,7 @@ Translate a full speech audio file into another language.
   - `super_resolution_voice` (bool, optional): Enable 48kHz upsampling.
   - `merge_backing_track` (bool, optional): Merge backend instrumental track (default: `true`).
   - `tts_backend` (`index`, `confucius`, or `higgs`, optional): Use IndexTTS, Confucius4-TTS, or Higgs SGLang for generated speech.
-  - `transcription_pipeline` (string, optional): 'gemini', 'whisperx', 'qwen_omnivad', or 'parakeet'.
+  - `transcription_pipeline` (string, optional): 'moss_transcribe' (default), 'gemini', 'whisperx', 'qwen_omnivad', or 'parakeet'.
   - `translation_llm_model` (string, optional): Translation LLM.
 - **Response**: `audio/mpeg` binary translated audio with `X-Translation-Segments` headers containing detailed segment metadata.
 

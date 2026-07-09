@@ -144,9 +144,10 @@ install_python_dependencies() {
             --no-build-isolation flash-attn
     fi
 
-    # Qwen3-ASR + OmniVAD: required for the translate_audio pipeline.
+    log "MOSS Transcribe+Diarize is the default translation ASR pipeline; the Docker manager starts it on first use."
+    # Qwen3-ASR + OmniVAD remains available as an alternate local pipeline.
     # The README quick start installs these directly and is battle-tested.
-    log "Installing Qwen3-ASR and OmniVAD for translation pipeline"
+    log "Installing Qwen3-ASR and OmniVAD for alternate translation pipeline"
     "${UV_BIN}" pip install --python "${python}" qwen-asr omnivad sentencepiece
 }
 

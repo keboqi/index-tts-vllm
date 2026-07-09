@@ -19897,6 +19897,8 @@ async def server_info():
                 "qwen_omnivad_available": is_qwen_omnivad_available(),
                 "parakeet_available": is_parakeet_available(),
                 "moss_transcribe_available": is_moss_transcribe_available(),
+                "transcription_pipeline_default": DEFAULT_TRANSCRIPTION_PIPELINE,
+                "transcription_pipelines": sorted(ALLOWED_TRANSCRIPTION_PIPELINES),
                 "translation_llm_default": DEFAULT_TRANSLATION_LLM_MODEL,
                 "translation_llm_models": list(ALLOWED_TRANSLATION_LLM_MODELS),
                 "translate_destination_languages": [

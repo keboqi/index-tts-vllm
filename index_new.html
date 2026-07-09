@@ -6929,6 +6929,7 @@ Enhanced Higgs TTS input:`;
         const translateAdditionalSettingsSummary = document.getElementById('translateAdditionalSettingsSummary');
         const translateDurationControlEl = document.getElementById('translateDurationControl');
         const DEFAULT_EMOTION_WEIGHT = 0.6;
+        const DEFAULT_TRANSLATE_TRANSCRIPTION_PIPELINE = 'moss_transcribe';
         const TRANSLATE_SETTINGS_STORAGE_KEY = 'indexTts.translateSettings.v1';
         const MULTILINGUAL_TTS_DESTINATION_LANGUAGES = Object.freeze([
             ['', 'Select...'],
@@ -7113,7 +7114,7 @@ Enhanced Higgs TTS input:`;
             writeTranslatePersistentSettings({
                 transcription_pipeline: translateTranscriptionPipeline
                     ? translateTranscriptionPipeline.value
-                    : '',
+                    : DEFAULT_TRANSLATE_TRANSCRIPTION_PIPELINE,
                 whisperx_proxy_refiner: translateWhisperXProxyRefiner
                     ? translateWhisperXProxyRefiner.checked
                     : false,
@@ -7161,7 +7162,9 @@ Enhanced Higgs TTS input:`;
 
         // Pipeline selector toggle logic
         function updatePipelineVisibility() {
-            const pipelineValue = translateTranscriptionPipeline ? translateTranscriptionPipeline.value : 'gemini';
+            const pipelineValue = translateTranscriptionPipeline
+                ? translateTranscriptionPipeline.value
+                : DEFAULT_TRANSLATE_TRANSCRIPTION_PIPELINE;
             const isWhisperX = pipelineValue === 'whisperx';
             const isParakeet = pipelineValue === 'parakeet';
             const isMossTranscribe = pipelineValue === 'moss_transcribe';
@@ -7417,7 +7420,7 @@ Enhanced Higgs TTS input:`;
                 case 'gemini':
                     return 'Gemini';
                 default:
-                    return pipelineValue || 'Gemini';
+                    return pipelineValue || 'MOSS Transcribe+Diarize';
             }
         }
 
@@ -7443,7 +7446,9 @@ Enhanced Higgs TTS input:`;
 
             const pipelineValue =
                 metadata.transcription_pipeline ||
-                (translateTranscriptionPipeline ? translateTranscriptionPipeline.value : 'gemini');
+                (translateTranscriptionPipeline
+                    ? translateTranscriptionPipeline.value
+                    : DEFAULT_TRANSLATE_TRANSCRIPTION_PIPELINE);
             if (pipelineValue && pipelineValue !== 'gemini') {
                 const pipelineLabel =
                     metadata.transcription_pipeline_label ||
@@ -7483,7 +7488,7 @@ Enhanced Higgs TTS input:`;
         function updateAiConfigSummary() {
             const pipelineValue = translateTranscriptionPipeline
                 ? translateTranscriptionPipeline.value
-                : 'gemini';
+                : DEFAULT_TRANSLATE_TRANSCRIPTION_PIPELINE;
             const pipelineLabel =
                 pipelineValue === 'whisperx'
                     ? 'WhisperX'
