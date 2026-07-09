@@ -217,6 +217,7 @@ import argparse
 
 
 ALLOWED_TRANSCRIPTION_PIPELINES = {"gemini", "whisperx", "qwen_omnivad", "parakeet", "moss_transcribe"}
+DEFAULT_TRANSCRIPTION_PIPELINE = "moss_transcribe"
 TTS_BACKEND_INDEX = "index"
 TTS_BACKEND_CONFUCIUS = "confucius"
 TTS_BACKEND_HIGGS = "higgs"
@@ -262,7 +263,7 @@ Source text:
 Enhanced Higgs TTS input:"""
 
 
-def _normalize_transcription_pipeline(value: Any, default: str = "gemini") -> str:
+def _normalize_transcription_pipeline(value: Any, default: str = DEFAULT_TRANSCRIPTION_PIPELINE) -> str:
     pipeline = (str(value or "")).strip().lower()
     return pipeline if pipeline in ALLOWED_TRANSCRIPTION_PIPELINES else default
 
@@ -2521,7 +2522,7 @@ async def _build_translation_segments(
     # Cached source paths for fast session storage (avoids re-encoding)
     original_audio_source_path: Optional[str] = None,
     backing_track_source_path: Optional[str] = None,
-    transcription_pipeline: str = "qwen_omnivad",
+    transcription_pipeline: str = DEFAULT_TRANSCRIPTION_PIPELINE,
     whisperx_proxy_refiner: bool = False,
     translation_llm_model: Optional[str] = None,
     qwen_omnivad_enable_diarization: bool = True,
@@ -3003,7 +3004,7 @@ class TranslateSessionData:
     gemini_model: str
     gemini_api_key: Optional[str]
     translation_llm_model: str = DEFAULT_TRANSLATION_LLM_MODEL
-    transcription_pipeline: str = "qwen_omnivad"
+    transcription_pipeline: str = DEFAULT_TRANSCRIPTION_PIPELINE
     whisperx_proxy_refiner: bool = False
     qwen_omnivad_enable_diarization: bool = True
     qwen_omnivad_diarization_backend: str = "auto"
@@ -7196,7 +7197,7 @@ async def _rehydrate_session_from_manifest(manifest: Dict[str, Any]) -> Translat
         manifest.get("gemini_model") or _get_gemini_model_name(),
         manifest.get("gemini_api_key"),
         translation_llm_model=manifest.get("translation_llm_model"),
-        transcription_pipeline=manifest.get("transcription_pipeline", "qwen_omnivad"),
+        transcription_pipeline=manifest.get("transcription_pipeline", DEFAULT_TRANSCRIPTION_PIPELINE),
         whisperx_proxy_refiner=manifest.get("whisperx_proxy_refiner", False),
         qwen_omnivad_enable_diarization=manifest.get("qwen_omnivad_enable_diarization", True),
         qwen_omnivad_diarization_backend=manifest.get("qwen_omnivad_diarization_backend", "auto"),
@@ -7394,7 +7395,7 @@ async def _generate_chunk_audio_from_session(
     transcription_pipeline = (
         transcription_pipeline
         or getattr(chunk_session, "transcription_pipeline", None)
-        or "qwen_omnivad"
+        or DEFAULT_TRANSCRIPTION_PIPELINE
     ).strip().lower()
     transcription_pipeline = _normalize_transcription_pipeline(transcription_pipeline)
     whisperx_proxy_refiner = (
@@ -9609,7 +9610,7 @@ async def _create_translate_session(
     gemini_model: str,
     gemini_api_key: Optional[str],
     translation_llm_model: Optional[str] = None,
-    transcription_pipeline: str = "qwen_omnivad",
+    transcription_pipeline: str = DEFAULT_TRANSCRIPTION_PIPELINE,
     whisperx_proxy_refiner: bool = False,
     qwen_omnivad_enable_diarization: Any = True,
     qwen_omnivad_diarization_backend: Any = "auto",
@@ -13345,8 +13346,8 @@ class TranslateRequest(BaseModel):
         description="Emotion weight (0.0-1.0) when using the original emotion prompt for the default speaker.",
     )
     transcription_pipeline: Optional[str] = Field(
-        default="qwen_omnivad",
-        description="Transcription pipeline to use: 'gemini' (default), 'whisperx', 'qwen_omnivad' (Qwen3-ASR + OmniVAD), 'parakeet' (NVIDIA Parakeet), or 'moss_transcribe' (MOSS Transcribe+Diarize via SGLang).",
+        default=DEFAULT_TRANSCRIPTION_PIPELINE,
+        description="Transcription pipeline to use: 'moss_transcribe' (default, MOSS Transcribe+Diarize via SGLang), 'gemini', 'whisperx', 'qwen_omnivad' (Qwen3-ASR + OmniVAD), or 'parakeet' (NVIDIA Parakeet).",
     )
     whisperx_proxy_refiner: Optional[bool] = Field(
         default=False,
@@ -13574,7 +13575,7 @@ class ChunkBatchGenerateRequest(BaseModel):
     )
     transcription_pipeline: Optional[str] = Field(
         default=None,
-        description="Transcription pipeline to use for selected chunk generation: 'gemini' (default), 'whisperx', 'qwen_omnivad', 'parakeet', or 'moss_transcribe'.",
+        description="Transcription pipeline to use for selected chunk generation: 'moss_transcribe' (default), 'gemini', 'whisperx', 'qwen_omnivad', or 'parakeet'.",
     )
     whisperx_proxy_refiner: Optional[bool] = Field(
         default=None,
@@ -16501,7 +16502,7 @@ async def api_translate_generate_chunks(payload: ChunkBatchGenerateRequest):
         transcription_pipeline_value = (
             payload.transcription_pipeline
             or getattr(config_template, "transcription_pipeline", None)
-            or "qwen_omnivad"
+            or DEFAULT_TRANSCRIPTION_PIPELINE
         )
         transcription_pipeline_value = _normalize_transcription_pipeline(
             transcription_pipeline_value
@@ -16818,7 +16819,7 @@ async def api_translate_segments(
     default_emotion_weight: Optional[float] = Form(None),
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
-    transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), 'qwen_omnivad' (Qwen3-ASR + OmniVAD), 'parakeet' (NVIDIA Parakeet), or 'moss_transcribe' (MOSS Transcribe+Diarize via SGLang)"),
+    transcription_pipeline: Optional[str] = Form(DEFAULT_TRANSCRIPTION_PIPELINE, description="Transcription pipeline: 'moss_transcribe' (default, MOSS Transcribe+Diarize via SGLang), 'gemini' (cloud), 'whisperx' (local), 'qwen_omnivad' (Qwen3-ASR + OmniVAD), or 'parakeet' (NVIDIA Parakeet)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable diarization for Qwen OmniVAD pipeline."),
     qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, or sortformer."),
@@ -18413,7 +18414,7 @@ async def api_translate_audio(
     default_emotion_weight: Optional[float] = Form(None),
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
-    transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), 'qwen_omnivad' (Qwen3-ASR + OmniVAD), 'parakeet' (NVIDIA Parakeet), or 'moss_transcribe' (MOSS Transcribe+Diarize via SGLang)"),
+    transcription_pipeline: Optional[str] = Form(DEFAULT_TRANSCRIPTION_PIPELINE, description="Transcription pipeline: 'moss_transcribe' (default, MOSS Transcribe+Diarize via SGLang), 'gemini' (cloud), 'whisperx' (local), 'qwen_omnivad' (Qwen3-ASR + OmniVAD), or 'parakeet' (NVIDIA Parakeet)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable diarization for Qwen OmniVAD pipeline."),
     qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, or sortformer."),
