@@ -3202,11 +3202,15 @@
                                                     <option value="qwen_omnivad" selected>🎙️ Qwen3-ASR + OmniVAD
                                                         (Local)</option>
                                                     <option value="parakeet">NVIDIA Parakeet (Local)</option>
+                                                    <option value="moss_transcribe">MOSS Transcribe+Diarize (SGLang)
+                                                    </option>
                                                 </select>
                                                 <small
                                                     style="color: var(--text-muted); display: block; margin-top: 4px; font-size: 0.75rem;">
-                                                    Gemini uses Google's API. WhisperX and Qwen3-ASR are local.
+                                                    Gemini uses Google's API. WhisperX, Qwen3-ASR, MOSS, and Parakeet
+                                                    are local.
                                                     Qwen3-ASR uses long-context ASR with OmniVAD timeline support.
+                                                    MOSS uses an SGLang-Omni OpenAI-compatible transcription backend.
                                                     Parakeet is fast local NeMo ASR for English and European languages.
                                                 </small>
                                             </div>
@@ -3287,8 +3291,8 @@
                                                 </select>
                                                 <small
                                                     style="color: var(--text-muted); display: block; margin-top: 4px; font-size: 0.75rem;">
-                                                    Used by WhisperX, Qwen3-ASR, and Parakeet local transcription
-                                                    pipelines for batched translation.
+                                                    Used by WhisperX, Qwen3-ASR, Parakeet, and MOSS local
+                                                    transcription pipelines for batched translation.
                                                 </small>
                                             </div>
                                         </div>
@@ -4185,7 +4189,7 @@
                                                         class="api-param-name">transcription_pipeline</span> <span
                                                         class="api-param-type">string</span> <span
                                                         class="api-param-desc">— 'gemini', 'whisperx', 'qwen_omnivad',
-                                                        or 'parakeet'</span></div>
+                                                        'parakeet', or 'moss_transcribe'</span></div>
                                                 <div class="api-param"><span
                                                         class="api-param-name">translation_llm_model</span> <span
                                                         class="api-param-type">string</span> <span
@@ -4272,7 +4276,7 @@
                                                         class="api-param-name">transcription_pipeline</span> <span
                                                         class="api-param-type">string</span> <span
                                                         class="api-param-desc">— 'gemini', 'whisperx', 'qwen_omnivad',
-                                                        or 'parakeet'</span></div>
+                                                        'parakeet', or 'moss_transcribe'</span></div>
                                                 <div class="api-param"><span
                                                         class="api-param-name">translation_llm_model</span> <span
                                                         class="api-param-type">string</span> <span
@@ -4470,7 +4474,7 @@
                                                         class="api-param-name">transcription_pipeline</span> <span
                                                         class="api-param-type">string</span> <span
                                                         class="api-param-desc">— 'gemini', 'whisperx', 'qwen_omnivad',
-                                                        or 'parakeet'</span></div>
+                                                        'parakeet', or 'moss_transcribe'</span></div>
                                                 <div class="api-param"><span
                                                         class="api-param-name">translation_llm_model</span> <span
                                                         class="api-param-type">string</span> <span
@@ -7160,7 +7164,8 @@ Enhanced Higgs TTS input:`;
             const pipelineValue = translateTranscriptionPipeline ? translateTranscriptionPipeline.value : 'gemini';
             const isWhisperX = pipelineValue === 'whisperx';
             const isParakeet = pipelineValue === 'parakeet';
-            const isLocalTranslationPipeline = isWhisperX || pipelineValue === 'qwen_omnivad' || isParakeet;
+            const isMossTranscribe = pipelineValue === 'moss_transcribe';
+            const isLocalTranslationPipeline = isWhisperX || pipelineValue === 'qwen_omnivad' || isParakeet || isMossTranscribe;
             const isGemini = pipelineValue === 'gemini';
             if (translateGeminiSettingsDiv) {
                 translateGeminiSettingsDiv.style.opacity = isGemini ? '1' : '0.4';
@@ -7176,13 +7181,17 @@ Enhanced Higgs TTS input:`;
                 translateLitAiSettingsDiv.style.display = isLocalTranslationPipeline ? 'grid' : 'none';
             }
             if (translatePipelineInfo) {
-                translatePipelineInfo.textContent = isWhisperX
-                    ? '🖥️ WhisperX local pipeline — Gemini settings do not apply'
-                    : pipelineValue === 'qwen_omnivad'
-                        ? '🎙️ Qwen3-ASR + OmniVAD pipeline — Gemini settings do not apply'
-                        : isParakeet
-                            ? 'NVIDIA Parakeet local pipeline - Gemini settings do not apply'
-                            : '';
+                let pipelineInfoText = '';
+                if (isWhisperX) {
+                    pipelineInfoText = 'WhisperX local pipeline - Gemini settings do not apply';
+                } else if (pipelineValue === 'qwen_omnivad') {
+                    pipelineInfoText = 'Qwen3-ASR + OmniVAD pipeline - Gemini settings do not apply';
+                } else if (isParakeet) {
+                    pipelineInfoText = 'NVIDIA Parakeet local pipeline - Gemini settings do not apply';
+                } else if (isMossTranscribe) {
+                    pipelineInfoText = 'MOSS Transcribe+Diarize SGLang pipeline - Gemini settings do not apply';
+                }
+                translatePipelineInfo.textContent = pipelineInfoText;
             }
         }
         if (translateTranscriptionPipeline) {
@@ -7403,6 +7412,8 @@ Enhanced Higgs TTS input:`;
                     return 'Qwen3-ASR + OmniVAD';
                 case 'parakeet':
                     return 'NVIDIA Parakeet';
+                case 'moss_transcribe':
+                    return 'MOSS Transcribe+Diarize';
                 case 'gemini':
                     return 'Gemini';
                 default:
@@ -7480,7 +7491,9 @@ Enhanced Higgs TTS input:`;
                         ? 'Qwen3'
                         : pipelineValue === 'parakeet'
                             ? 'Parakeet'
-                            : 'Gemini';
+                            : pipelineValue === 'moss_transcribe'
+                                ? 'MOSS'
+                                : 'Gemini';
             const items = [
                 { label: 'Pipeline', value: pipelineLabel },
                 {
@@ -7540,6 +7553,19 @@ Enhanced Higgs TTS input:`;
                 items.push({
                     label: 'Model',
                     value: 'Parakeet 0.6B v3',
+                });
+                items.push({
+                    label: 'Translate',
+                    value: selectedOptionLabel(translateTranslationLlmModel, 'Hy-MT2'),
+                });
+            } else if (pipelineValue === 'moss_transcribe') {
+                items.push({
+                    label: 'Model',
+                    value: 'MOSS 0.9B',
+                });
+                items.push({
+                    label: 'Backend',
+                    value: 'SGLang',
                 });
                 items.push({
                     label: 'Translate',

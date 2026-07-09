@@ -201,11 +201,22 @@ except ImportError:
         return False
     _run_parakeet_pipeline_sync = None  # type: ignore[assignment]
 
+# MOSS-Transcribe-Diarize via SGLang-Omni (optional)
+try:
+    from moss_transcribe_pipeline import (
+        is_moss_transcribe_available,
+        _run_moss_transcribe_pipeline_sync,
+    )
+except ImportError:
+    def is_moss_transcribe_available() -> bool:
+        return False
+    _run_moss_transcribe_pipeline_sync = None  # type: ignore[assignment]
+
 # Configuration
 import argparse
 
 
-ALLOWED_TRANSCRIPTION_PIPELINES = {"gemini", "whisperx", "qwen_omnivad", "parakeet"}
+ALLOWED_TRANSCRIPTION_PIPELINES = {"gemini", "whisperx", "qwen_omnivad", "parakeet", "moss_transcribe"}
 TTS_BACKEND_INDEX = "index"
 TTS_BACKEND_CONFUCIUS = "confucius"
 TTS_BACKEND_HIGGS = "higgs"
@@ -2551,6 +2562,7 @@ async def _build_translation_segments(
     use_whisperx = transcription_pipeline == "whisperx"
     use_qwen_omnivad = transcription_pipeline == "qwen_omnivad"
     use_parakeet = transcription_pipeline == "parakeet"
+    use_moss_transcribe = transcription_pipeline == "moss_transcribe"
     (
         qwen_omnivad_enable_diarization,
         qwen_omnivad_diarization_min_seconds,
@@ -2577,6 +2589,8 @@ async def _build_translation_segments(
         pipeline_label = "Qwen3-ASR + OmniVAD"
     elif use_parakeet:
         pipeline_label = "NVIDIA Parakeet"
+    elif use_moss_transcribe:
+        pipeline_label = "MOSS Transcribe+Diarize"
     else:
         pipeline_label = f"Gemini model '{resolved_gemini_model}'"
 
@@ -2672,6 +2686,32 @@ async def _build_translation_segments(
             executor,
             functools.partial(
                 _run_parakeet_pipeline_sync,
+                processed_audio_bytes,
+                input_mime_type=gemini_mime_type,
+                dest_language=dest_language,
+                enable_translation=translate_enabled,
+                translation_llm_model=resolved_translation_llm_model,
+                force_refresh=force_gemini_regenerate,
+            ),
+        )
+    elif use_moss_transcribe:
+        # --- MOSS-Transcribe-Diarize via SGLang-Omni ---
+        if _run_moss_transcribe_pipeline_sync is None:
+            raise TranslateWorkflowHttpError(
+                500,
+                {"status": "error", "message": "MOSS Transcribe+Diarize pipeline is not installed. Start the SGLang-Omni backend with sglang_omni_moss_transcribe.sh."},
+            )
+        print(f"[translate] Using MOSS Transcribe+Diarize SGLang pipeline for transcription/translation")
+        loop = asyncio.get_event_loop()
+        (
+            gemini_chunks,
+            speaker_profiles,
+            raw_gemini_response_text,
+            gemini_cache_info,
+        ) = await loop.run_in_executor(
+            executor,
+            functools.partial(
+                _run_moss_transcribe_pipeline_sync,
                 processed_audio_bytes,
                 input_mime_type=gemini_mime_type,
                 dest_language=dest_language,
@@ -13306,7 +13346,7 @@ class TranslateRequest(BaseModel):
     )
     transcription_pipeline: Optional[str] = Field(
         default="qwen_omnivad",
-        description="Transcription pipeline to use: 'gemini' (default), 'whisperx', 'qwen_omnivad' (Qwen3-ASR + OmniVAD), or 'parakeet' (NVIDIA Parakeet).",
+        description="Transcription pipeline to use: 'gemini' (default), 'whisperx', 'qwen_omnivad' (Qwen3-ASR + OmniVAD), 'parakeet' (NVIDIA Parakeet), or 'moss_transcribe' (MOSS Transcribe+Diarize via SGLang).",
     )
     whisperx_proxy_refiner: Optional[bool] = Field(
         default=False,
@@ -13534,7 +13574,7 @@ class ChunkBatchGenerateRequest(BaseModel):
     )
     transcription_pipeline: Optional[str] = Field(
         default=None,
-        description="Transcription pipeline to use for selected chunk generation: 'gemini' (default), 'whisperx', 'qwen_omnivad', or 'parakeet'.",
+        description="Transcription pipeline to use for selected chunk generation: 'gemini' (default), 'whisperx', 'qwen_omnivad', 'parakeet', or 'moss_transcribe'.",
     )
     whisperx_proxy_refiner: Optional[bool] = Field(
         default=None,
@@ -16751,7 +16791,7 @@ async def api_translate_segments(
     translate_text: Optional[bool] = Form(True),
     gemini_model: Optional[str] = Form(None),
     gemini_api_key: Optional[str] = Form(None),
-    translation_llm_model: Optional[str] = Form(None, description="Translation model for WhisperX/Qwen local pipelines."),
+    translation_llm_model: Optional[str] = Form(None, description="Translation model for WhisperX/Qwen/Parakeet/MOSS local pipelines."),
     enhance_voice: Optional[bool] = Form(False),
     enhancement_model: Optional[str] = Form(None, description="ClearVoice enhancement model: 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', or 'MossFormer2_SE_48K'"),
     super_resolution_voice: Optional[bool] = Form(False),
@@ -16778,7 +16818,7 @@ async def api_translate_segments(
     default_emotion_weight: Optional[float] = Form(None),
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
-    transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), 'qwen_omnivad' (Qwen3-ASR + OmniVAD), or 'parakeet' (NVIDIA Parakeet)"),
+    transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), 'qwen_omnivad' (Qwen3-ASR + OmniVAD), 'parakeet' (NVIDIA Parakeet), or 'moss_transcribe' (MOSS Transcribe+Diarize via SGLang)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable diarization for Qwen OmniVAD pipeline."),
     qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, or sortformer."),
@@ -18346,7 +18386,7 @@ async def api_translate_audio(
     prompt: Optional[str] = Form(None),
     gemini_model: Optional[str] = Form(None),
     gemini_api_key: Optional[str] = Form(None),
-    translation_llm_model: Optional[str] = Form(None, description="Translation model for WhisperX/Qwen local pipelines."),
+    translation_llm_model: Optional[str] = Form(None, description="Translation model for WhisperX/Qwen/Parakeet/MOSS local pipelines."),
     enhance_voice: Optional[bool] = Form(False),
     enhancement_model: Optional[str] = Form(None, description="ClearVoice enhancement model: 'MossFormerGAN_SE_16K' (default), 'FRCRN_SE_16K', or 'MossFormer2_SE_48K'"),
     super_resolution_voice: Optional[bool] = Form(False),
@@ -18373,7 +18413,7 @@ async def api_translate_audio(
     default_emotion_weight: Optional[float] = Form(None),
     original_srt_file: Optional[UploadFile] = File(None, description="Original language SRT subtitle file"),
     translated_srt_file: Optional[UploadFile] = File(None, description="Translated SRT subtitle file"),
-    transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), 'qwen_omnivad' (Qwen3-ASR + OmniVAD), or 'parakeet' (NVIDIA Parakeet)"),
+    transcription_pipeline: Optional[str] = Form("qwen_omnivad", description="Transcription pipeline: 'gemini' (default), 'whisperx' (local), 'qwen_omnivad' (Qwen3-ASR + OmniVAD), 'parakeet' (NVIDIA Parakeet), or 'moss_transcribe' (MOSS Transcribe+Diarize via SGLang)"),
     whisperx_proxy_refiner: Optional[bool] = Form(False, description="Enable the experimental WhisperX speaker-aware proxy segment refiner."),
     qwen_omnivad_enable_diarization: Optional[bool] = Form(True, description="Enable diarization for Qwen OmniVAD pipeline."),
     qwen_omnivad_diarization_backend: Optional[str] = Form("auto", description="Qwen OmniVAD diarization backend: auto, pyannote, or sortformer."),
@@ -19855,6 +19895,7 @@ async def server_info():
                 "whisperx_available": is_whisperx_available(),
                 "qwen_omnivad_available": is_qwen_omnivad_available(),
                 "parakeet_available": is_parakeet_available(),
+                "moss_transcribe_available": is_moss_transcribe_available(),
                 "translation_llm_default": DEFAULT_TRANSLATION_LLM_MODEL,
                 "translation_llm_models": list(ALLOWED_TRANSLATION_LLM_MODELS),
                 "translate_destination_languages": [
