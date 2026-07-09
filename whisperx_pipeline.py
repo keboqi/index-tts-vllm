@@ -234,10 +234,14 @@ _HY_MT_MODEL_REF: Optional[str] = None
 _HY_MT_LOCK = threading.Lock()
 
 
+class _HyMtLocalModelMissingError(RuntimeError):
+    pass
+
+
 def _hy_mt_model_load_ref() -> str:
     if HY_MT_TRANSLATION_LOCAL_DIR:
         if not os.path.isdir(HY_MT_TRANSLATION_LOCAL_DIR) or not os.listdir(HY_MT_TRANSLATION_LOCAL_DIR):
-            raise RuntimeError(
+            raise _HyMtLocalModelMissingError(
                 "HY-MT local model directory is missing or empty: "
                 f"{HY_MT_TRANSLATION_LOCAL_DIR}. Download it with "
                 "`hf download tencent/Hy-MT2-1.8B --local-dir checkpoints/hy-mt` "
@@ -1070,6 +1074,8 @@ def _translate_batch_with_retry(
                     )
         except Exception as e:
             print(f"  [{batch_label}] ⚠️ API Error: {e}")
+            if isinstance(e, _HyMtLocalModelMissingError):
+                raise
             
     return None
 
