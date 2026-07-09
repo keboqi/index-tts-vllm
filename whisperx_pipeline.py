@@ -151,6 +151,7 @@ HY_MT_TRANSLATION_MODEL = (
     os.getenv("HY_MT_TRANSLATION_MODEL", "tencent/Hy-MT2-1.8B").strip()
     or "tencent/Hy-MT2-1.8B"
 )
+HY_MT_TRANSLATION_CACHE_DIR = os.getenv("HY_MT_TRANSLATION_CACHE_DIR", "").strip()
 HY_MT_TRANSLATION_MODEL_ALIASES = {
     "hy-mt",
     "hy-mt2",
@@ -210,10 +211,15 @@ WHISPERX_MODEL_DIR = os.path.join(_SCRIPT_DIR, "checkpoints", "whisperx")
 WHISPERX_ASR_DOWNLOAD_ROOT = os.path.join(WHISPERX_MODEL_DIR, "faster-whisper")
 WHISPERX_ALIGN_MODEL_DIR = os.path.join(WHISPERX_MODEL_DIR, "align")
 WHISPERX_PYANNOTE_CACHE = os.path.join(WHISPERX_MODEL_DIR, "pyannote")
+if not HY_MT_TRANSLATION_CACHE_DIR:
+    HY_MT_TRANSLATION_CACHE_DIR = os.path.join(WHISPERX_MODEL_DIR, "hy-mt")
+elif not os.path.isabs(HY_MT_TRANSLATION_CACHE_DIR):
+    HY_MT_TRANSLATION_CACHE_DIR = os.path.join(_SCRIPT_DIR, HY_MT_TRANSLATION_CACHE_DIR)
 
 # Ensure directories exist
 for _d in (WHISPERX_MODEL_DIR, WHISPERX_ASR_DOWNLOAD_ROOT,
-           WHISPERX_ALIGN_MODEL_DIR, WHISPERX_PYANNOTE_CACHE):
+           WHISPERX_ALIGN_MODEL_DIR, WHISPERX_PYANNOTE_CACHE,
+           HY_MT_TRANSLATION_CACHE_DIR):
     os.makedirs(_d, exist_ok=True)
 
 # Set env vars *before* any model loading as a fallback for any
@@ -302,11 +308,13 @@ def _load_hy_mt_model() -> Tuple[Any, Any]:
         )
         tokenizer = AutoTokenizer.from_pretrained(
             HY_MT_TRANSLATION_MODEL,
+            cache_dir=HY_MT_TRANSLATION_CACHE_DIR,
             local_files_only=HY_MT_TRANSLATION_LOCAL_FILES_ONLY,
             trust_remote_code=True,
         )
 
         model_kwargs: Dict[str, Any] = {
+            "cache_dir": HY_MT_TRANSLATION_CACHE_DIR,
             "local_files_only": HY_MT_TRANSLATION_LOCAL_FILES_ONLY,
             "trust_remote_code": True,
         }
@@ -573,7 +581,7 @@ def _translate_texts_with_hy_mt(
         )
     except Exception as exc:
         print(f"  [{batch_label}] HY-MT batch failed: {exc}")
-        return translated
+        raise
 
     if len(batch_translated) != len(non_empty_texts):
         print(
