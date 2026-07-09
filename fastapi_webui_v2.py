@@ -65,6 +65,7 @@ import zipfile
 import unicodedata
 import mimetypes
 import wave
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import copy
 import gc
@@ -367,6 +368,9 @@ class AppSettings:
     higgs_start_timeout: float = HIGGS_DEFAULT_START_TIMEOUT
     higgs_request_timeout: float = HIGGS_DEFAULT_REQUEST_TIMEOUT
     higgs_mem_fraction_static: float = 0.30
+    higgs_max_running_requests: int = 100
+    higgs_dtype: str = "bfloat16"
+    higgs_initial_codec_chunk_frames: int = 1
     higgs_max_new_tokens: int = 4096
     higgs_temperature: float = 0.8
     higgs_top_k: int = 50
@@ -406,6 +410,9 @@ class AppSettings:
             higgs_start_timeout=float(getattr(args, "higgs_start_timeout", HIGGS_DEFAULT_START_TIMEOUT)),
             higgs_request_timeout=float(getattr(args, "higgs_request_timeout", HIGGS_DEFAULT_REQUEST_TIMEOUT)),
             higgs_mem_fraction_static=float(getattr(args, "higgs_mem_fraction_static", 0.30)),
+            higgs_max_running_requests=int(getattr(args, "higgs_max_running_requests", 100)),
+            higgs_dtype=str(getattr(args, "higgs_dtype", "bfloat16")),
+            higgs_initial_codec_chunk_frames=int(getattr(args, "higgs_initial_codec_chunk_frames", 1)),
             higgs_max_new_tokens=int(getattr(args, "higgs_max_new_tokens", 4096)),
             higgs_temperature=float(getattr(args, "higgs_temperature", 0.8)),
             higgs_top_k=int(getattr(args, "higgs_top_k", 50)),
@@ -424,8 +431,20 @@ audio_executor = ThreadPoolExecutor(
     max_workers=_env_int("INDEXTTS_AUDIO_WORKERS", 2, min_value=1, max_value=8),
     thread_name_prefix="fastapi_audio",
 )
+HIGGS_DEFAULT_MAX_RUNNING_REQUESTS = _env_int(
+    "HIGGS_TTS_MAX_RUNNING_REQUESTS",
+    100,
+    min_value=1,
+    max_value=256,
+)
+HIGGS_DEFAULT_WORK_CONCURRENCY = _env_int(
+    "HIGGS_TTS_WORK_CONCURRENCY",
+    HIGGS_DEFAULT_MAX_RUNNING_REQUESTS,
+    min_value=1,
+    max_value=256,
+)
 higgs_executor = ThreadPoolExecutor(
-    max_workers=_env_int("HIGGS_HTTP_WORKERS", 100, min_value=1, max_value=256),
+    max_workers=_env_int("HIGGS_HTTP_WORKERS", HIGGS_DEFAULT_WORK_CONCURRENCY, min_value=1, max_value=256),
     thread_name_prefix="higgs_http",
 )
 
@@ -669,7 +688,7 @@ TRANSLATION_TTS_CONCURRENCY = _env_int(
 )
 HIGGS_TTS_WORK_CONCURRENCY = _env_int(
     "HIGGS_TTS_WORK_CONCURRENCY",
-    100,
+    HIGGS_DEFAULT_WORK_CONCURRENCY,
     min_value=1,
     max_value=256,
 )
@@ -3779,6 +3798,24 @@ parser.add_argument(
     default=_env_float("HIGGS_TTS_MEM_FRACTION_STATIC", 0.30, min_value=0.01, max_value=1.0),
     help="SGLang static memory fraction for managed Higgs startup",
 )
+parser.add_argument(
+    "--higgs_max_running_requests",
+    type=int,
+    default=_env_int("HIGGS_TTS_MAX_RUNNING_REQUESTS", 100, min_value=1, max_value=256),
+    help="SGLang max_running_requests for managed Higgs startup",
+)
+parser.add_argument(
+    "--higgs_dtype",
+    type=str,
+    default=os.environ.get("HIGGS_TTS_DTYPE", "bfloat16"),
+    help="SGLang dtype for managed Higgs startup",
+)
+parser.add_argument(
+    "--higgs_initial_codec_chunk_frames",
+    type=int,
+    default=_env_int("HIGGS_TTS_INITIAL_CODEC_CHUNK_FRAMES", 1, min_value=0, max_value=75),
+    help="Initial Higgs streaming chunk size in codec frames; 1 minimizes first-audio latency",
+)
 parser.add_argument("--higgs_max_new_tokens", type=int, default=_env_int("HIGGS_TTS_MAX_NEW_TOKENS", 4096, min_value=1), help="Default Higgs max_new_tokens")
 parser.add_argument("--higgs_temperature", type=float, default=_env_float("HIGGS_TTS_TEMPERATURE", 0.8, min_value=0.0), help="Default Higgs sampling temperature")
 parser.add_argument("--higgs_top_k", type=int, default=_env_int("HIGGS_TTS_TOP_K", 50, min_value=0), help="Default Higgs top_k; 0 disables top_k")
@@ -3832,6 +3869,14 @@ except SystemExit:
         higgs_start_timeout=_env_float("HIGGS_TTS_START_TIMEOUT", HIGGS_DEFAULT_START_TIMEOUT, min_value=1.0),
         higgs_request_timeout=_env_float("HIGGS_TTS_REQUEST_TIMEOUT", HIGGS_DEFAULT_REQUEST_TIMEOUT, min_value=1.0),
         higgs_mem_fraction_static=_env_float("HIGGS_TTS_MEM_FRACTION_STATIC", 0.30, min_value=0.01, max_value=1.0),
+        higgs_max_running_requests=_env_int("HIGGS_TTS_MAX_RUNNING_REQUESTS", 100, min_value=1, max_value=256),
+        higgs_dtype=os.environ.get("HIGGS_TTS_DTYPE", "bfloat16"),
+        higgs_initial_codec_chunk_frames=_env_int(
+            "HIGGS_TTS_INITIAL_CODEC_CHUNK_FRAMES",
+            1,
+            min_value=0,
+            max_value=75,
+        ),
         higgs_max_new_tokens=_env_int("HIGGS_TTS_MAX_NEW_TOKENS", 4096, min_value=1),
         higgs_temperature=_env_float("HIGGS_TTS_TEMPERATURE", 0.8, min_value=0.0),
         higgs_top_k=_env_int("HIGGS_TTS_TOP_K", 50, min_value=0),
@@ -4240,6 +4285,49 @@ def _http_json_audio_post_with_headers_sync(
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"{error_prefix} HTTP {exc.code}: {detail}") from exc
+
+
+def _http_json_audio_stream_to_queue_sync(
+    url: str,
+    payload: Dict[str, Any],
+    timeout: float,
+    loop: asyncio.AbstractEventLoop,
+    queue: "asyncio.Queue[Tuple[str, Any]]",
+    stop_event: threading.Event,
+    *,
+    error_prefix: str = "TTS backend",
+    read_size: int = 65536,
+) -> None:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "audio/pcm, application/octet-stream",
+        },
+        method="POST",
+    )
+
+    def push(kind: str, value: Any = None) -> None:
+        if not stop_event.is_set():
+            loop.call_soon_threadsafe(queue.put_nowait, (kind, value))
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            push("headers", dict(response.headers))
+            reader = getattr(response, "read1", response.read)
+            while not stop_event.is_set():
+                chunk = reader(read_size)
+                if not chunk:
+                    break
+                push("chunk", chunk)
+        push("done")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        push("error", RuntimeError(f"{error_prefix} HTTP {exc.code}: {detail}"))
+    except Exception as exc:
+        push("error", exc)
 
 
 def _http_json_audio_post_sync(url: str, payload: Dict[str, Any], timeout: float) -> bytes:
@@ -4850,6 +4938,14 @@ HIGGS_AUDIO_RESPONSE_SUFFIXES = {
     "audio/wave": "wav",
     "audio/x-wav": "wav",
 }
+HIGGS_REFERENCE_DATA_URL_CACHE_SIZE = _env_int(
+    "HIGGS_REFERENCE_DATA_URL_CACHE_SIZE",
+    256,
+    min_value=0,
+    max_value=4096,
+)
+_higgs_reference_data_url_cache: "OrderedDict[Tuple[str, int, int], str]" = OrderedDict()
+_higgs_reference_data_url_cache_lock = threading.Lock()
 
 
 def _higgs_base_url() -> str:
@@ -4868,9 +4964,25 @@ def _audio_file_data_url(path: str) -> str:
     if not source.is_absolute():
         source = APP_DIR / source
     source = source.resolve()
+    stat = source.stat()
+    cache_key = (str(source), int(stat.st_mtime_ns), int(stat.st_size))
+    if HIGGS_REFERENCE_DATA_URL_CACHE_SIZE > 0:
+        with _higgs_reference_data_url_cache_lock:
+            cached = _higgs_reference_data_url_cache.get(cache_key)
+            if cached is not None:
+                _higgs_reference_data_url_cache.move_to_end(cache_key)
+                return cached
+
     mime = mimetypes.guess_type(source.name)[0] or "audio/wav"
     encoded = base64.b64encode(source.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
+    data_url = f"data:{mime};base64,{encoded}"
+    if HIGGS_REFERENCE_DATA_URL_CACHE_SIZE > 0:
+        with _higgs_reference_data_url_cache_lock:
+            _higgs_reference_data_url_cache[cache_key] = data_url
+            _higgs_reference_data_url_cache.move_to_end(cache_key)
+            while len(_higgs_reference_data_url_cache) > HIGGS_REFERENCE_DATA_URL_CACHE_SIZE:
+                _higgs_reference_data_url_cache.popitem(last=False)
+    return data_url
 
 
 def _header_int(headers: Dict[str, str], names: List[str], default: int) -> int:
@@ -5160,6 +5272,8 @@ class ManagedHiggsSGLangBackend:
         env["MODEL"] = SETTINGS.higgs_model
         env["PORT"] = str(port)
         env["MEM_FRACTION_STATIC"] = f"{float(SETTINGS.higgs_mem_fraction_static):.4f}"
+        env["MAX_RUNNING_REQUESTS"] = str(max(1, int(SETTINGS.higgs_max_running_requests)))
+        env["DTYPE"] = (SETTINGS.higgs_dtype or "bfloat16").strip() or "bfloat16"
         completed = subprocess.run(
             [bash, str(script), command],
             cwd=str(APP_DIR),
@@ -5230,16 +5344,25 @@ class ManagedHiggsSGLangBackend:
         top_p: Optional[float],
         max_new_tokens: Optional[int],
         seed: Optional[int],
+        stream: bool = False,
+        response_format: str = "wav",
+        initial_codec_chunk_frames: Optional[int] = None,
     ) -> Dict[str, Any]:
+        normalized_format = (response_format or "wav").strip().lower()
         payload: Dict[str, Any] = {
             "input": text,
-            "response_format": "wav",
-            "stream": False,
+            "response_format": normalized_format,
+            "stream": bool(stream),
             "max_new_tokens": int(max_new_tokens or SETTINGS.higgs_max_new_tokens),
             "temperature": float(
                 SETTINGS.higgs_temperature if temperature is None else temperature
             ),
         }
+        if stream:
+            if initial_codec_chunk_frames is None:
+                initial_codec_chunk_frames = SETTINGS.higgs_initial_codec_chunk_frames
+            if initial_codec_chunk_frames is not None and int(initial_codec_chunk_frames) >= 0:
+                payload["initial_codec_chunk_frames"] = int(initial_codec_chunk_frames)
         if top_k is None:
             top_k = SETTINGS.higgs_top_k
         if top_p is None:
@@ -5302,6 +5425,89 @@ class ManagedHiggsSGLangBackend:
         )
         return output_path
 
+    async def stream_audio_chunks(
+        self,
+        *,
+        text: str,
+        prompt_wav: Optional[str],
+        reference_text: Optional[str],
+        temperature: Optional[float],
+        top_k: Optional[int],
+        top_p: Optional[float],
+        max_new_tokens: Optional[int],
+        seed: Optional[int],
+    ):
+        self._active_requests += 1
+        worker_future: Optional[asyncio.Future] = None
+        stop_event = threading.Event()
+        try:
+            await self.ensure_ready()
+            payload = self._build_payload(
+                text=text,
+                prompt_wav=prompt_wav,
+                reference_text=reference_text,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                max_new_tokens=max_new_tokens,
+                seed=seed,
+                stream=True,
+                response_format="pcm",
+                initial_codec_chunk_frames=SETTINGS.higgs_initial_codec_chunk_frames,
+            )
+
+            queue: "asyncio.Queue[Tuple[str, Any]]" = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+            headers: Dict[str, str] = {}
+            pending_chunk: Optional[bytes] = None
+            chunk_idx = 0
+
+            async with HIGGS_TTS_WORK_SLOTS:
+                worker_future = loop.run_in_executor(
+                    higgs_executor,
+                    functools.partial(
+                        _http_json_audio_stream_to_queue_sync,
+                        f"{self.base_url}{HIGGS_SPEECH_PATH}",
+                        payload,
+                        max(1.0, float(SETTINGS.higgs_request_timeout)),
+                        loop,
+                        queue,
+                        stop_event,
+                        error_prefix="Higgs SGLang",
+                    ),
+                )
+                while True:
+                    kind, value = await queue.get()
+                    if kind == "headers":
+                        headers = value or {}
+                        continue
+                    if kind == "chunk":
+                        chunk = bytes(value or b"")
+                        if not chunk:
+                            continue
+                        if pending_chunk is not None:
+                            yield chunk_idx, pending_chunk, False, headers
+                            chunk_idx += 1
+                        pending_chunk = chunk
+                        continue
+                    if kind == "done":
+                        if pending_chunk is None:
+                            raise RuntimeError("Higgs SGLang stream finished without audio bytes.")
+                        yield chunk_idx, pending_chunk, True, headers
+                        break
+                    if kind == "error":
+                        raise value
+
+                await worker_future
+        except asyncio.CancelledError:
+            stop_event.set()
+            if worker_future is not None:
+                worker_future.cancel()
+            raise
+        finally:
+            stop_event.set()
+            self._active_requests = max(0, self._active_requests - 1)
+
     async def synthesize_to_file(
         self,
         *,
@@ -5353,9 +5559,9 @@ class ManagedHiggsSGLangBackend:
                         if seed is not None and int(seed) >= 0
                         else ((uuid.uuid4().int & 0x7FFFFFFF) if seed is None else None)
                     )
-                    # Cap parallel chunk requests to avoid overwhelming
-                    # the Higgs backend.  Up to 100 in-flight at once.
-                    _chunk_sem = asyncio.Semaphore(100)
+                    # Keep client-side long-text fanout aligned with the
+                    # backend scheduler's in-flight request budget.
+                    _chunk_sem = asyncio.Semaphore(max(1, HIGGS_TTS_WORK_CONCURRENCY))
 
                     async def _throttled_chunk(coro):
                         async with _chunk_sem:
@@ -5406,6 +5612,11 @@ class ManagedHiggsSGLangBackend:
             "manage_backend": SETTINGS.higgs_manage_backend,
             "manager_script": str(_resolve_higgs_manager_script()),
             "model": SETTINGS.higgs_model,
+            "max_running_requests": SETTINGS.higgs_max_running_requests,
+            "dtype": SETTINGS.higgs_dtype,
+            "initial_codec_chunk_frames": SETTINGS.higgs_initial_codec_chunk_frames,
+            "reference_data_url_cache_entries": len(_higgs_reference_data_url_cache),
+            "reference_data_url_cache_size": HIGGS_REFERENCE_DATA_URL_CACHE_SIZE,
             "active_requests": self._active_requests,
             "started_by_manager": self._started_by_manager,
             "last_start_result": self._last_start_result,
@@ -7790,6 +8001,34 @@ def _encode_streaming_audio_chunk(
             audio_buffer,
             format=response_format,
             bitrate="128k" if response_format == "mp3" else None,
+        )
+        return audio_buffer.getvalue()
+
+
+def _encode_pcm_streaming_audio_chunk(
+    pcm_bytes: bytes,
+    headers: Dict[str, str],
+    response_format: str,
+) -> bytes:
+    normalized_format = (response_format or "pcm").strip().lower()
+    if normalized_format == "pcm":
+        return pcm_bytes
+
+    sample_rate = _header_int(headers, ["x-sample-rate", "x-audio-sample-rate", "sample-rate"], 24000)
+    channels = _header_int(headers, ["x-channels", "x-audio-channels", "channels"], 1)
+    bit_depth = _header_int(headers, ["x-bit-depth", "x-audio-bit-depth", "bit-depth"], 16)
+    sample_width = max(1, bit_depth // 8)
+    audio_segment = AudioSegment(
+        data=pcm_bytes,
+        sample_width=sample_width,
+        frame_rate=sample_rate,
+        channels=channels,
+    )
+    with BytesIO() as audio_buffer:
+        audio_segment.export(
+            audio_buffer,
+            format="wav" if normalized_format == "wav" else normalized_format,
+            bitrate="128k" if normalized_format == "mp3" else None,
         )
         return audio_buffer.getvalue()
 
@@ -19683,6 +19922,89 @@ async def _external_tts_single_audio_stream(
                 await async_remove_file(path)
 
 
+async def _higgs_native_audio_stream(
+    *,
+    text: str,
+    prompt_wav: Optional[str],
+    reference_text: Optional[str],
+    response_format: str,
+    cleanup_paths: Optional[List[Optional[str]]] = None,
+    temperature: Optional[float] = None,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+    max_new_tokens: Optional[int] = None,
+    seed: Optional[int] = None,
+):
+    """Bridge SGLang Omni's native PCM stream into this app's framed stream format."""
+    started = time.perf_counter()
+    cleanup_items = list(cleanup_paths or [])
+    stream_iter = None
+    next_task: Optional[asyncio.Task] = None
+    try:
+        yield _streaming_keepalive_frame(
+            "Higgs SGLang streaming request accepted; backend may still be starting.",
+            elapsed_seconds=0,
+        )
+        stream_iter = higgs_backend_manager.stream_audio_chunks(
+            text=text,
+            prompt_wav=prompt_wav,
+            reference_text=reference_text,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
+            seed=seed,
+        )
+        next_task = asyncio.create_task(stream_iter.__anext__())
+        while True:
+            done, _ = await asyncio.wait(
+                {next_task},
+                timeout=max(1.0, float(EXTERNAL_TTS_STREAM_KEEPALIVE_SECONDS)),
+            )
+            if not done:
+                elapsed = int(time.perf_counter() - started)
+                yield _streaming_keepalive_frame(
+                    f"Higgs SGLang still starting or generating audio ({elapsed}s elapsed).",
+                    elapsed_seconds=elapsed,
+                )
+                continue
+
+            try:
+                chunk_idx, pcm_bytes, is_last, headers = next_task.result()
+            except StopAsyncIteration:
+                break
+
+            audio_bytes = await _run_audio_cpu(
+                _encode_pcm_streaming_audio_chunk,
+                pcm_bytes,
+                headers,
+                response_format,
+            )
+            yield _streaming_audio_frame(chunk_idx, audio_bytes, is_last)
+            if is_last:
+                break
+            next_task = asyncio.create_task(stream_iter.__anext__())
+    except asyncio.CancelledError:
+        if next_task is not None:
+            next_task.cancel()
+        raise
+    except Exception as exc:
+        print(f"[Higgs SGLang] Native streaming error: {exc}")
+        traceback.print_exc()
+        yield f"ERROR:{str(exc)}\n".encode("utf-8")
+    finally:
+        if next_task is not None and not next_task.done():
+            next_task.cancel()
+        if stream_iter is not None:
+            try:
+                await stream_iter.aclose()
+            except Exception:
+                pass
+        for path in cleanup_items:
+            if path:
+                await async_remove_file(path)
+
+
 @app.post("/speak_stream")
 async def speak_stream(req: SpeakRequest):
     """API: Generate speech using registered speaker with streaming"""
@@ -19701,6 +20023,32 @@ async def speak_stream(req: SpeakRequest):
             duration_control_mode == DURATION_CONTROL_FFMPEG
             and int(req.speech_length or 0) > 0
         )
+
+        if (
+            backend == TTS_BACKEND_HIGGS
+            and not force_file_stream
+            and int(req.speech_length or 0) <= 0
+            and not req.speaker_effects
+        ):
+            prompt_wav = await _resolve_external_prompt_audio(
+                spk_audio_prompt="",
+                speaker_preset=req.name,
+                backend_label="Higgs SGLang",
+            )
+            return StreamingResponse(
+                _higgs_native_audio_stream(
+                    text=req.text,
+                    prompt_wav=prompt_wav,
+                    reference_text=None,
+                    response_format=req.response_format,
+                    temperature=req.temperature,
+                    top_k=req.top_k,
+                    top_p=req.top_p,
+                    max_new_tokens=req.max_tokens,
+                ),
+                media_type="application/octet-stream",
+                headers=STREAMING_RESPONSE_HEADERS,
+            )
 
         if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_HIGGS} or force_file_stream:
             result_path = os.path.join("outputs", f"speak_stream_{uuid.uuid4().hex}.wav")
@@ -19819,6 +20167,28 @@ async def clone_voice_stream(
             duration_control_mode == DURATION_CONTROL_FFMPEG
             and int(req.speech_length or 0) > 0
         )
+
+        if (
+            backend == TTS_BACKEND_HIGGS
+            and not force_file_stream
+            and int(req.speech_length or 0) <= 0
+            and not req.speaker_effects
+        ):
+            return StreamingResponse(
+                _higgs_native_audio_stream(
+                    text=req.text,
+                    prompt_wav=tmp_path,
+                    reference_text=req.reference_text,
+                    response_format=req.response_format,
+                    cleanup_paths=[tmp_path],
+                    temperature=req.temperature,
+                    top_k=req.top_k,
+                    top_p=req.top_p,
+                    max_new_tokens=req.max_tokens,
+                ),
+                media_type="application/octet-stream",
+                headers=STREAMING_RESPONSE_HEADERS,
+            )
 
         if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_HIGGS} or force_file_stream:
             result_path = os.path.join("outputs", f"clone_stream_{uuid.uuid4().hex}.wav")
