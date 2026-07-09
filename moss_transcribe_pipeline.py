@@ -126,7 +126,7 @@ MOSS_TRANSCRIBE_LANGUAGE = os.getenv("MOSS_TRANSCRIBE_LANGUAGE", "").strip()
 MOSS_TRANSCRIBE_API_KEY = os.getenv("MOSS_TRANSCRIBE_API_KEY", "").strip()
 MOSS_TRANSCRIBE_CACHE_DIR = os.getenv(
     "MOSS_TRANSCRIBE_CACHE_DIR",
-    os.path.join(_SCRIPT_DIR, "moss_transcribe_cache"),
+    os.path.join(_SCRIPT_DIR, "outputs", "moss_transcribe_cache"),
 )
 MOSS_TRANSCRIBE_CACHE_VERSION = 2
 MOSS_TRANSCRIBE_TRANSLATION_LLM = os.getenv(
@@ -145,12 +145,13 @@ MOSS_TRANSCRIBE_TRANSLATION_MAX_WORKERS = _env_int(
 
 
 _BACKEND_START_LOCK = threading.Lock()
+_SPEAKER_TOKEN_PATTERN = r"(?:S\d+|speaker[\s_-]*\d+|spk[\s_-]*\d+)"
 _SPEAKER_PREFIX_RE = re.compile(
-    r"^\s*\[(?P<speaker>S\d+|speaker\s*\d+|spk[_\s-]*\d+)\]\s*",
+    rf"^\s*(?:\[(?P<bracketed>{_SPEAKER_TOKEN_PATTERN})\]\s*(?:[:：\-–—]\s*)?|(?P<plain>{_SPEAKER_TOKEN_PATTERN})\s*[:：\-–—]\s*)",
     re.IGNORECASE,
 )
 _COMPACT_START_RE = re.compile(
-    r"\[(?P<start>\d+(?:\.\d+)?)\]\[(?P<speaker>S\d+)\]",
+    rf"\[(?P<start>\d+(?:\.\d+)?)\]\s*\[(?P<speaker>{_SPEAKER_TOKEN_PATTERN})\]",
     re.IGNORECASE,
 )
 _TRAILING_TIMESTAMP_RE = re.compile(r"\[(?P<end>\d+(?:\.\d+)?)\]\s*$")
@@ -214,6 +215,7 @@ def _managed_backend_env() -> Dict[str, str]:
         "MEM_FRACTION_STATIC": os.getenv("MOSS_TRANSCRIBE_MEM_FRACTION_STATIC", "0.20"),
         "MAX_RUNNING_REQUESTS": os.getenv("MOSS_TRANSCRIBE_MAX_RUNNING_REQUESTS", "4"),
         "CUDA_GRAPH_MAX_BS": os.getenv("MOSS_TRANSCRIBE_CUDA_GRAPH_MAX_BS", "4"),
+        "MAX_NEW_TOKENS": MOSS_TRANSCRIBE_MAX_NEW_TOKENS,
     }
     for key, value in prefixed_to_script.items():
         env[key] = str(value)
@@ -517,7 +519,7 @@ def _speaker_key(raw_speaker: Any) -> str:
     text = str(raw_speaker or "").strip()
     if not text:
         return "S01"
-    text = text.strip("[]").strip()
+    text = re.sub(r"^[\[\s]+|[\]\s:：\-–—]+$", "", text).strip()
     digits = re.findall(r"\d+", text)
     if digits:
         return f"S{int(digits[0]):02d}"
@@ -542,7 +544,7 @@ def _strip_speaker_prefix(text: str) -> Tuple[str, Optional[str]]:
     match = _SPEAKER_PREFIX_RE.match(value)
     speaker = None
     if match:
-        speaker = match.group("speaker")
+        speaker = match.group("bracketed") or match.group("plain")
         value = value[match.end() :].strip()
     value = _TRAILING_TIMESTAMP_RE.sub("", value).strip()
     return value, speaker
@@ -661,6 +663,34 @@ def _speaker_profiles(speaker_mapping: Dict[str, str]) -> List[Dict[str, Any]]:
         }
         for raw_id, speaker_id in speaker_mapping.items()
     ]
+
+
+def _speaker_profiles_from_segments(segments: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    speaker_ids: List[str] = []
+    for segment in segments:
+        speaker_id = str(segment.get("speaker") or "").strip() or "speaker1"
+        if speaker_id not in speaker_ids:
+            speaker_ids.append(speaker_id)
+    return [
+        {
+            "id": speaker_id,
+            "label": speaker_id.title(),
+            "description": "Detected by MOSS-Transcribe-Diarize pipeline.",
+        }
+        for speaker_id in (speaker_ids or ["speaker1"])
+    ]
+
+
+def _cached_segments(record: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    raw_segments = record.get("segments")
+    if not isinstance(raw_segments, list):
+        return None
+    segments = [
+        segment
+        for segment in raw_segments
+        if isinstance(segment, dict) and (segment.get("source_text") or "").strip()
+    ]
+    return segments or None
 
 
 def _payload_to_segments(
@@ -837,15 +867,21 @@ def translate_audio(
 
     if not force_refresh:
         cached = _load_cache(cache_key)
-        if cached and isinstance(cached.get("segments"), list):
+        cached_segments = _cached_segments(cached) if cached else None
+        if cached_segments:
+            speaker_profiles = cached.get("speaker_profiles")
+            if not isinstance(speaker_profiles, list) or not speaker_profiles:
+                speaker_profiles = _speaker_profiles_from_segments(cached_segments)
             cache_info["hit"] = True
             cache_info["cache_file"] = os.path.basename(_cache_path(cache_key))
             cache_info["created_at"] = cached.get("created_at")
             cache_info["translation_llm_model"] = cached.get("translation_llm_model")
             cache_info["source_language"] = cached.get("source_language")
+            cache_info["segment_count"] = len(cached_segments)
+            cache_info["speaker_count"] = len(speaker_profiles)
             return (
-                cached["segments"],
-                cached.get("speaker_profiles") or [],
+                cached_segments,
+                speaker_profiles,
                 cached.get("raw_text", ""),
                 cache_info,
             )

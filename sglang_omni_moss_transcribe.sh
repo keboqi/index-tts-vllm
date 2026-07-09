@@ -314,6 +314,7 @@ start_server() {
     -e MEM_FRACTION_STATIC="$MEM_FRACTION_STATIC" \
     -e MAX_RUNNING_REQUESTS="$MAX_RUNNING_REQUESTS" \
     -e CUDA_GRAPH_MAX_BS="$CUDA_GRAPH_MAX_BS" \
+    -e MAX_NEW_TOKENS="$MAX_NEW_TOKENS" \
     -e EXTRA_ARGS="$EXTRA_ARGS" \
     -e REPO_IN="$REPO_IN" \
     -e PID_FILE_IN="$PID_FILE_IN" \
@@ -465,6 +466,7 @@ status() {
   echo "Mem frac:  $MEM_FRACTION_STATIC"
   echo "Requests:  $MAX_RUNNING_REQUESTS"
   echo "Graph BS:  $CUDA_GRAPH_MAX_BS"
+  echo "Max toks:  $MAX_NEW_TOKENS"
   echo "Repo:      $PROJECT_ROOT/sglang-omni"
   echo "HF cache:  $HF_CACHE"
   echo "Log:       $PROJECT_ROOT/logs/moss_transcribe_${PORT}.log"
