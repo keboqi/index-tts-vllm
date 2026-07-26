@@ -623,7 +623,7 @@ class PerfLogger:
 GEMINI_API_KEY_ENV_VAR = "GEMINI_API_KEY"
 GOOGLE_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
 GEMINI_MODEL_ENV_VAR = "GEMINI_MODEL_NAME"
-DEFAULT_GEMINI_MODEL_NAME = "gemini-3.5-flash"
+DEFAULT_GEMINI_MODEL_NAME = "gemini-flash-latest"
 JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 COERCE_SPEAKER_SEGMENTS_PATTERN = re.compile(
     r'^\s*(\[[\s\S]*?\])\s*,\s*"segments"\s*:\s*(\[[\s\S]*\])\s*$',
@@ -732,6 +732,7 @@ def _normalize_translate_output_format(_value: Optional[str] = None) -> str:
 
 
 ALLOWED_GEMINI_MODELS = {
+    "gemini-flash-latest",
     "gemini-3.5-flash",
     "gemini-3.1-flash-lite-preview",
     "gemini-2.5-pro",
