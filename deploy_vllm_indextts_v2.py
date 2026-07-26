@@ -37,6 +37,7 @@ STABLE_AUDIO3_REPOS = {
     "small-sfx": "stabilityai/stable-audio-3-small-sfx",
 }
 MOSS_TRANSCRIBE_REPO_ID = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
+HY_MT_TRANSLATION_REPO_ID = "tencent/Hy-MT2-1.8B"
 
 # Create Modal image for IndexTTS v2 with vLLM optimization
 image = (
@@ -85,6 +86,7 @@ image = (
         "MOSS_TRANSCRIBE_DEVICE": "cuda:0",
         "MOSS_TRANSCRIBE_MODEL": "/persistent_app/checkpoints/MOSS-Transcribe-Diarize",
         "MOSS_TRANSCRIBE_SGLANG_URL": "http://127.0.0.1:8003",
+        "HY_MT_TRANSLATION_LOCAL_DIR": "/persistent_app/checkpoints/hy-mt",
         "TORCHINDUCTOR_COMPILE_THREADS": "1",
         "TORCH_NCCL_ENABLE_MONITORING": "0",
         "TORCH_CPP_LOG_LEVEL": "ERROR"
@@ -179,6 +181,7 @@ PERSISTENT_CACHE_DIR = "/persistent_cache"
 MOSS_TRANSCRIBE_PERSISTENT_DIR = (
     f"{PERSISTENT_APP_DIR}/checkpoints/MOSS-Transcribe-Diarize"
 )
+HY_MT_TRANSLATION_PERSISTENT_DIR = f"{PERSISTENT_APP_DIR}/checkpoints/hy-mt"
 CONFUCIUS_PERSISTENT_REPO_DIR = f"{PERSISTENT_APP_DIR}/{CONFUCIUS_APP_SUBDIR}"
 VLLM_PORT = 8000
 CONFUCIUS_PORT = 8001
@@ -551,6 +554,15 @@ snapshot_download(
     local_dir_use_symlinks=False,
 )
 print("MOSS-Transcribe-Diarize download completed: " + moss_target)
+
+hy_mt_target = {HY_MT_TRANSLATION_PERSISTENT_DIR!r}
+print("Downloading HY-MT translation model to persistent storage...")
+snapshot_download(
+    repo_id={HY_MT_TRANSLATION_REPO_ID!r},
+    local_dir=hy_mt_target,
+    local_dir_use_symlinks=False,
+)
+print("HY-MT translation model download completed: " + hy_mt_target)
 """
         ], check=True, capture_output=True, text=True, cwd=str(persistent_app_path))
         
@@ -567,7 +579,12 @@ print("MOSS-Transcribe-Diarize download completed: " + moss_target)
         moss_transcribe_dir = Path(MOSS_TRANSCRIBE_PERSISTENT_DIR)
         moss_transcribe_ready = (
             (moss_transcribe_dir / "config.json").exists()
-            and any(moss_transcribe_dir.glob("*.safetensors"))
+            and any(moss_transcribe_dir.rglob("*.safetensors"))
+        )
+        hy_mt_dir = Path(HY_MT_TRANSLATION_PERSISTENT_DIR)
+        hy_mt_ready = (
+            (hy_mt_dir / "config.json").exists()
+            and any(hy_mt_dir.rglob("*.safetensors"))
         )
         
         # Step 4: List downloaded files for verification
@@ -596,6 +613,10 @@ print("MOSS-Transcribe-Diarize download completed: " + moss_target)
         print(
             f"   MOSS-Transcribe-Diarize: {moss_transcribe_dir} "
             f"({'ready' if moss_transcribe_ready else 'missing'})"
+        )
+        print(
+            f"   HY-MT translation model: {hy_mt_dir} "
+            f"({'ready' if hy_mt_ready else 'missing'})"
         )
 
         confucius_checkpoints_dir = confucius_persistent_path / "checkpoints"
@@ -774,6 +795,8 @@ print("Confucius asset download completed.")
             "voice_design_dir": str(voice_design_dir),
             "moss_transcribe_dir": str(moss_transcribe_dir),
             "moss_transcribe_ready": moss_transcribe_ready,
+            "hy_mt_dir": str(hy_mt_dir),
+            "hy_mt_ready": hy_mt_ready,
             "stable_audio3_root": str(stable_audio_root),
             "stable_audio3_dirs": {key: str(path) for key, path in stable_audio_dirs.items()},
             "vllm_ready": vllm_dir.exists(),
@@ -1398,6 +1421,9 @@ def _configure_persistent_runtime():
         "MOSS_TRANSCRIBE_SGLANG_URL": os.environ.get(
             "MOSS_TRANSCRIBE_SGLANG_URL",
             f"http://127.0.0.1:{MOSS_TRANSCRIBE_PORT}",
+        ),
+        "HY_MT_TRANSLATION_LOCAL_DIR": os.environ.get(
+            "HY_MT_TRANSLATION_LOCAL_DIR", HY_MT_TRANSLATION_PERSISTENT_DIR
         ),
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
         "TORCH_NCCL_ENABLE_MONITORING": "0",
