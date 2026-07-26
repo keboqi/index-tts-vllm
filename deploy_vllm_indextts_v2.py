@@ -140,6 +140,9 @@ image = (
         "pip install 'transformers>=5.6.0,<6' av librosa soundfile soxr",
         "pip install --no-deps "
         "git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git",
+        "cd /app/index-tts-vllm && python -c "
+        "\"from indextts.utils.maskgct.models.tts.maskgct.llama_nar "
+        "import DiffLlama; print('IndexTTS Transformers compatibility check passed')\"",
     )
     # MOSS remote code currently requires Transformers 5.6+. Keep qwen-asr
     # omitted because it pins a conflicting Transformers release.
