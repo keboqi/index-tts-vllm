@@ -1,6 +1,5 @@
 import modal
 import os
-import asyncio
 import json
 import socket
 import shlex
@@ -30,6 +29,12 @@ CONFUCIUS_BIGVGAN_REPO_ID = "nvidia/bigvgan_v2_22khz_80band_256x"
 CONFUCIUS_CAMPPLUS_REPO_ID = "funasr/campplus"
 CONFUCIUS_CAMPPLUS_FILENAME = "campplus_cn_common.bin"
 CONFUCIUS_FASTAPI_CONFIG = "config/inference_config.modal.yaml"
+STABLE_AUDIO3_REPOS = {
+    "medium": "stabilityai/stable-audio-3-medium",
+    "small-music": "stabilityai/stable-audio-3-small-music",
+    "small-sfx": "stabilityai/stable-audio-3-small-sfx",
+}
+MOSS_TRANSCRIBE_REPO_ID = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
 
 # Create Modal image for IndexTTS v2 with vLLM optimization
 image = (
@@ -70,13 +75,21 @@ image = (
         "VLLM_CACHE": "/persistent_cache/vllm_cache",
         "TRITON_CACHE_DIR": "/persistent_cache/triton",
         "VLLM_SERVER_DEV_MODE": "1",
+        # Modal containers do not provide a Docker daemon. Run MOSS directly
+        # through Transformers; Higgs remains externally served.
+        "HIGGS_TTS_MANAGE_BACKEND": "0",
+        "MOSS_TRANSCRIBE_MANAGE_BACKEND": "0",
+        "MOSS_TRANSCRIBE_BACKEND": "python",
+        "MOSS_TRANSCRIBE_DEVICE": "cuda:0",
+        "MOSS_TRANSCRIBE_MODEL": "/persistent_app/checkpoints/MOSS-Transcribe-Diarize",
         "TORCHINDUCTOR_COMPILE_THREADS": "1",
         "TORCH_NCCL_ENABLE_MONITORING": "0",
         "TORCH_CPP_LOG_LEVEL": "ERROR"
     })
     .run_commands("pip install --upgrade pip setuptools wheel")
     .pip_install(
-        "torch", 
+        "torch",
+        "torchvision",
         "torchaudio",
         extra_options="--index-url https://download.pytorch.org/whl/cu130"
     )
@@ -84,6 +97,7 @@ image = (
         "litai",
         "whisperx",
         "nemo_toolkit[asr]",
+        "omnivad",
         "json-repair"
     )
     .run_commands(
@@ -120,9 +134,15 @@ image = (
         "flashinfer-python"
     )
     .run_commands("pip install flash-attn --no-build-isolation")
-    .run_commands("pip install audio-separator")
+    .run_commands("pip install 'audio-separator[gpu]'")
     .run_commands("pip install clearvoice google-genai")
-    .run_commands("pip install qwen-asr omnivad")
+    .run_commands(
+        "pip install 'transformers>=5.6.0,<6' av librosa soundfile soxr",
+        "pip install --no-deps "
+        "git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git",
+    )
+    # MOSS remote code currently requires Transformers 5.6+. Keep qwen-asr
+    # omitted because it pins a conflicting Transformers release.
     .pip_install(
         "yt-dlp[default]",
         "yt-dlp-ejs",
@@ -146,6 +166,9 @@ cache_storage = modal.Volume.from_name("indextts-v2-cache", create_if_missing=Tr
 # Configuration
 PERSISTENT_APP_DIR = "/persistent_app"
 PERSISTENT_CACHE_DIR = "/persistent_cache"
+MOSS_TRANSCRIBE_PERSISTENT_DIR = (
+    f"{PERSISTENT_APP_DIR}/checkpoints/MOSS-Transcribe-Diarize"
+)
 CONFUCIUS_PERSISTENT_REPO_DIR = f"{PERSISTENT_APP_DIR}/{CONFUCIUS_APP_SUBDIR}"
 VLLM_PORT = 8000
 CONFUCIUS_PORT = 8001
@@ -159,7 +182,7 @@ CONFUCIUS_GPU_MEMORY_UTILIZATION = 0.20
 CONFUCIUS_STARTUP_TIMEOUT = 1200
 CONFUCIUS_REQUEST_TIMEOUT = 900
 
-STABLE_AUDIO3_VARIANTS = ("medium", "small-music", "small-sfx")
+STABLE_AUDIO3_VARIANTS = tuple(STABLE_AUDIO3_REPOS)
 
 
 def _ensure_confucius_vllm_patch_compatibility(confucius_repo_path: Path) -> Dict[str, object]:
@@ -258,7 +281,8 @@ def _ensure_confucius_vllm_patch_compatibility(confucius_repo_path: Path) -> Dic
         PERSISTENT_CACHE_DIR: cache_storage
     },
     cpu=4.0,
-    memory=32768
+    memory=32768,
+    secrets=[modal.Secret.from_name("custom-secret")],
 )
 def prepare_model():
     """
@@ -373,7 +397,7 @@ def prepare_model():
             )
             
             if reset_result.returncode == 0:
-                print(f"✅ Git reset successful!")
+                print("✅ Git reset successful!")
                 repo_update_status["success"] = True
                 repo_update_status["message"] = f"Repository updated to origin/{current_branch}"
                 repo_update_status["output"] = reset_result.stdout.strip()
@@ -484,25 +508,56 @@ def prepare_model():
 from huggingface_hub import snapshot_download
 import os
 
-print("Downloading main IndexTTS v2 / Stable Audio 3 model repo...")
+print("Downloading main IndexTTS v2 model repo...")
 snapshot_download(
     repo_id="garyswansrs/index_tts_2_vllm",
     local_dir="{checkpoints_dir}",
     local_dir_use_symlinks=False
 )
-print("Model download completed!")
+print("Main model download completed!")
+
+stable_audio_repos = {STABLE_AUDIO3_REPOS!r}
+stable_audio_root = os.path.join({str(checkpoints_dir)!r}, "stable-audio-3")
+for variant, repo_id in stable_audio_repos.items():
+    target_dir = os.path.join(stable_audio_root, variant)
+    try:
+        print(f"Downloading Stable Audio 3 {{variant}} from {{repo_id}}...")
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=target_dir,
+            local_dir_use_symlinks=False,
+        )
+    except Exception as exc:
+        # Stable Audio repositories are gated. Keep the core TTS deployment
+        # usable and report the missing optional variant in readiness output.
+        print(f"Warning: Stable Audio 3 {{variant}} was not downloaded: {{exc}}")
+
+moss_target = {MOSS_TRANSCRIBE_PERSISTENT_DIR!r}
+print("Downloading MOSS-Transcribe-Diarize to persistent storage...")
+snapshot_download(
+    repo_id={MOSS_TRANSCRIBE_REPO_ID!r},
+    local_dir=moss_target,
+    local_dir_use_symlinks=False,
+)
+print("MOSS-Transcribe-Diarize download completed: " + moss_target)
 """
         ], check=True, capture_output=True, text=True, cwd=str(persistent_app_path))
         
         print("✅ Main model repo download completed successfully!")
         
-        # Step 3b: Voice Design and Stable Audio 3 models are included in checkpoints
+        # Step 3b: Voice Design comes from the main repo; gated Stable Audio
+        # variants are downloaded into their current codebase-defined paths.
         voice_design_dir = checkpoints_dir / "Qwen3-TTS-12Hz-1.7B-VoiceDesign"
         stable_audio_root = checkpoints_dir / "stable-audio-3"
         stable_audio_dirs = {
             key: stable_audio_root / key
             for key in STABLE_AUDIO3_VARIANTS
         }
+        moss_transcribe_dir = Path(MOSS_TRANSCRIBE_PERSISTENT_DIR)
+        moss_transcribe_ready = (
+            (moss_transcribe_dir / "config.json").exists()
+            and any(moss_transcribe_dir.glob("*.safetensors"))
+        )
         
         # Step 4: List downloaded files for verification
         print("🔍 Listing downloaded model files...")
@@ -527,6 +582,10 @@ print("Model download completed!")
             ckpt_ready = (path / "model.safetensors").exists() or (path / "model.ckpt").exists()
             status = "ready" if config_path.exists() and ckpt_ready else "missing"
             print(f"      {key}: {path} ({status})")
+        print(
+            f"   MOSS-Transcribe-Diarize: {moss_transcribe_dir} "
+            f"({'ready' if moss_transcribe_ready else 'missing'})"
+        )
 
         confucius_checkpoints_dir = confucius_persistent_path / "checkpoints"
         confucius_pretrained_dir = confucius_persistent_path / "pretrained"
@@ -687,7 +746,7 @@ print("Confucius asset download completed.")
         
         show_tree(persistent_app_path)
         
-        print(f"\n✅ IndexTTS v2 application and models preparation completed!")
+        print("\n✅ IndexTTS v2 application and models preparation completed!")
         print(f"📁 Persistent app location: {persistent_app_path}")
         print(f"📁 IndexTTS model location: {checkpoints_dir}")
         print(f"📁 Voice Design model location: {voice_design_dir}")
@@ -695,10 +754,15 @@ print("Confucius asset download completed.")
         
         return {
             "status": "success",
-            "message": "IndexTTS v2 application, Stable Audio 3, and models prepared successfully",
+            "message": (
+                "IndexTTS v2 application and core models prepared; "
+                "see stable_audio3_ready for gated optional models"
+            ),
             "app_dir": str(persistent_app_path),
             "model_dir": str(checkpoints_dir),
             "voice_design_dir": str(voice_design_dir),
+            "moss_transcribe_dir": str(moss_transcribe_dir),
+            "moss_transcribe_ready": moss_transcribe_ready,
             "stable_audio3_root": str(stable_audio_root),
             "stable_audio3_dirs": {key: str(path) for key, path in stable_audio_dirs.items()},
             "vllm_ready": vllm_dir.exists(),
@@ -910,7 +974,6 @@ def legacy_serve_without_snapshot():
     Serve the IndexTTS v2 FastAPI application by running python fastapi_webui_v2.py directly.
     """
     import os
-    import sys
     from pathlib import Path
     import subprocess
     
@@ -1040,37 +1103,7 @@ def legacy_serve_without_snapshot():
     # ========================================================================
     print("\n🚀 Starting FastAPI server...")
     
-    # Build the command
-    cmd = [
-        "python",
-        "-u",
-        "fastapi_webui_v2.py",
-        "--gpu_memory_utilization",
-        str(GPU_MEMORY_UTILIZATION),
-        "--qwenemo_gpu_memory_utilization",
-        str(QWENEMO_GPU_MEMORY_UTILIZATION),
-        "--tts_backend",
-        DEFAULT_TTS_BACKEND,
-        "--confucius_repo_dir",
-        str(persistent_app_path / CONFUCIUS_APP_SUBDIR),
-        "--confucius_host",
-        "127.0.0.1",
-        "--confucius_port",
-        str(CONFUCIUS_PORT),
-        "--confucius_start_command",
-        _build_confucius_start_command(persistent_app_path / CONFUCIUS_APP_SUBDIR),
-        "--confucius_start_timeout",
-        str(CONFUCIUS_STARTUP_TIMEOUT),
-        "--confucius_request_timeout",
-        str(CONFUCIUS_REQUEST_TIMEOUT),
-        "--confucius_vllm_gpu_memory_utilization",
-        str(CONFUCIUS_GPU_MEMORY_UTILIZATION),
-        "--confucius_attach_stdio",
-        "--confucius_keepalive_interval",
-        "60",
-        "--confucius_unhealthy_grace",
-        "30",
-    ]
+    cmd = _build_webui_command(persistent_app_path)
     
     print(f"   Command: {' '.join(cmd)}")
     print(f"   Working dir: {os.getcwd()}\n")
@@ -1189,6 +1222,91 @@ def _build_confucius_start_command(confucius_repo_path: Path) -> str:
     return " ".join(shlex.quote(str(part)) for part in parts)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _build_webui_command(persistent_app_path: Path) -> List[str]:
+    """Build one launch command shared by snapshot and legacy entry points."""
+    higgs_server_url = (
+        os.environ.get("HIGGS_TTS_SGLANG_URL", "http://127.0.0.1:8002").strip()
+        or "http://127.0.0.1:8002"
+    )
+    higgs_manage_flag = (
+        "--higgs_manage_backend"
+        if _env_flag("HIGGS_TTS_MANAGE_BACKEND", False)
+        else "--no-higgs_manage_backend"
+    )
+
+    return [
+        "python",
+        "-u",
+        "fastapi_webui_v2.py",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(VLLM_PORT),
+        "--model_dir",
+        "checkpoints",
+        "--gpu_memory_utilization",
+        str(GPU_MEMORY_UTILIZATION),
+        "--qwenemo_gpu_memory_utilization",
+        str(QWENEMO_GPU_MEMORY_UTILIZATION),
+        "--tts_backend",
+        DEFAULT_TTS_BACKEND,
+        "--confucius_repo_dir",
+        str(persistent_app_path / CONFUCIUS_APP_SUBDIR),
+        "--confucius_host",
+        "127.0.0.1",
+        "--confucius_port",
+        str(CONFUCIUS_PORT),
+        "--confucius_start_command",
+        _build_confucius_start_command(persistent_app_path / CONFUCIUS_APP_SUBDIR),
+        "--confucius_start_timeout",
+        str(CONFUCIUS_STARTUP_TIMEOUT),
+        "--confucius_request_timeout",
+        str(CONFUCIUS_REQUEST_TIMEOUT),
+        "--confucius_vllm_gpu_memory_utilization",
+        str(CONFUCIUS_GPU_MEMORY_UTILIZATION),
+        "--confucius_attach_stdio",
+        "--confucius_keepalive_interval",
+        "60",
+        "--confucius_unhealthy_grace",
+        "30",
+        "--higgs_server_url",
+        higgs_server_url,
+        "--higgs_model",
+        os.environ.get("HIGGS_TTS_MODEL", "bosonai/higgs-audio-v3-tts-4b"),
+        higgs_manage_flag,
+        "--higgs_manager_script",
+        os.environ.get("HIGGS_TTS_MANAGER_SCRIPT", "sglang_omni_higgs.sh"),
+        "--higgs_start_timeout",
+        os.environ.get("HIGGS_TTS_START_TIMEOUT", "3600"),
+        "--higgs_request_timeout",
+        os.environ.get("HIGGS_TTS_REQUEST_TIMEOUT", "1800"),
+        "--higgs_mem_fraction_static",
+        os.environ.get("HIGGS_TTS_MEM_FRACTION_STATIC", "0.30"),
+        "--higgs_max_running_requests",
+        os.environ.get("HIGGS_TTS_MAX_RUNNING_REQUESTS", "100"),
+        "--higgs_dtype",
+        os.environ.get("HIGGS_TTS_DTYPE", "bfloat16"),
+        "--higgs_initial_codec_chunk_frames",
+        os.environ.get("HIGGS_TTS_INITIAL_CODEC_CHUNK_FRAMES", "1"),
+        "--higgs_max_new_tokens",
+        os.environ.get("HIGGS_TTS_MAX_NEW_TOKENS", "4096"),
+        "--higgs_temperature",
+        os.environ.get("HIGGS_TTS_TEMPERATURE", "0.8"),
+        "--higgs_top_k",
+        os.environ.get("HIGGS_TTS_TOP_K", "50"),
+        "--higgs_top_p",
+        os.environ.get("HIGGS_TTS_TOP_P", "0.0"),
+        "--use_torch_compile",
+    ]
+
+
 def _configure_persistent_runtime():
     from pathlib import Path
 
@@ -1209,6 +1327,19 @@ def _configure_persistent_runtime():
         "TORCHINDUCTOR_COMPILE_THREADS": "1",
         "VLLM_SERVER_DEV_MODE": "1",
         "INDEXTTS_ENABLE_VLLM_SLEEP_MODE": "1",
+        "HIGGS_TTS_MANAGE_BACKEND": os.environ.get("HIGGS_TTS_MANAGE_BACKEND", "0"),
+        "MOSS_TRANSCRIBE_MANAGE_BACKEND": os.environ.get(
+            "MOSS_TRANSCRIBE_MANAGE_BACKEND", "0"
+        ),
+        "MOSS_TRANSCRIBE_BACKEND": os.environ.get(
+            "MOSS_TRANSCRIBE_BACKEND", "python"
+        ),
+        "MOSS_TRANSCRIBE_DEVICE": os.environ.get(
+            "MOSS_TRANSCRIBE_DEVICE", "cuda:0"
+        ),
+        "MOSS_TRANSCRIBE_MODEL": os.environ.get(
+            "MOSS_TRANSCRIBE_MODEL", MOSS_TRANSCRIBE_PERSISTENT_DIR
+        ),
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
         "TORCH_NCCL_ENABLE_MONITORING": "0",
         "TORCH_CPP_LOG_LEVEL": "ERROR",
@@ -1386,43 +1517,7 @@ class IndexTTSVllmServer:
     def start(self):
         persistent_app_path = _configure_persistent_runtime()
 
-        cmd = [
-            "python",
-            "-u",
-            "fastapi_webui_v2.py",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            str(VLLM_PORT),
-            "--model_dir",
-            "checkpoints",
-            "--gpu_memory_utilization",
-            str(GPU_MEMORY_UTILIZATION),
-            "--qwenemo_gpu_memory_utilization",
-            str(QWENEMO_GPU_MEMORY_UTILIZATION),
-            "--tts_backend",
-            DEFAULT_TTS_BACKEND,
-            "--confucius_repo_dir",
-            str(persistent_app_path / CONFUCIUS_APP_SUBDIR),
-            "--confucius_host",
-            "127.0.0.1",
-            "--confucius_port",
-            str(CONFUCIUS_PORT),
-            "--confucius_start_command",
-            _build_confucius_start_command(persistent_app_path / CONFUCIUS_APP_SUBDIR),
-            "--confucius_start_timeout",
-            str(CONFUCIUS_STARTUP_TIMEOUT),
-            "--confucius_request_timeout",
-            str(CONFUCIUS_REQUEST_TIMEOUT),
-            "--confucius_vllm_gpu_memory_utilization",
-            str(CONFUCIUS_GPU_MEMORY_UTILIZATION),
-            "--confucius_attach_stdio",
-            "--confucius_keepalive_interval",
-            "60",
-            "--confucius_unhealthy_grace",
-            "30",
-            "--use_torch_compile",
-        ]
+        cmd = _build_webui_command(persistent_app_path)
         print(f"Starting FastAPI server: {' '.join(cmd)}")
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"

@@ -1,10 +1,10 @@
 """
-MOSS-Transcribe-Diarize pipeline backed by SGLang-Omni.
+MOSS-Transcribe-Diarize pipeline backed by native Transformers or SGLang-Omni.
 
-This module talks to an OpenAI-compatible SGLang-Omni server exposing
-``/v1/audio/transcriptions`` and adapts MOSS diarized output into the same
-``(segments, speaker_profiles, raw_text, cache_info)`` tuple used by the other
-local transcription pipelines.
+This module can run the official model directly with Transformers or talk to an
+OpenAI-compatible server exposing ``/v1/audio/transcriptions``. It adapts MOSS
+diarized output into the same ``(segments, speaker_profiles, raw_text,
+cache_info)`` tuple used by the other local transcription pipelines.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -90,6 +91,10 @@ MOSS_TRANSCRIBE_MODEL = (
     os.getenv("MOSS_TRANSCRIBE_MODEL", "OpenMOSS-Team/MOSS-Transcribe-Diarize").strip()
     or "OpenMOSS-Team/MOSS-Transcribe-Diarize"
 )
+MOSS_TRANSCRIBE_BACKEND = (
+    os.getenv("MOSS_TRANSCRIBE_BACKEND", "auto").strip().lower() or "auto"
+)
+MOSS_TRANSCRIBE_DEVICE = os.getenv("MOSS_TRANSCRIBE_DEVICE", "auto").strip() or "auto"
 MOSS_TRANSCRIBE_SGLANG_URL = (
     os.getenv("MOSS_TRANSCRIBE_SGLANG_URL", "http://127.0.0.1:8003").strip()
     or "http://127.0.0.1:8003"
@@ -145,6 +150,9 @@ MOSS_TRANSCRIBE_TRANSLATION_MAX_WORKERS = _env_int(
 
 
 _BACKEND_START_LOCK = threading.Lock()
+_PYTHON_MODEL_LOCK = threading.Lock()
+_PYTHON_INFERENCE_LOCK = threading.Lock()
+_PYTHON_RUNTIME: Optional[Tuple[Any, Any, Any, Any]] = None
 _SPEAKER_TOKEN_PATTERN = r"(?:S\d+|speaker[\s_-]*\d+|spk[\s_-]*\d+)"
 _SPEAKER_PREFIX_RE = re.compile(
     rf"^\s*(?:\[(?P<bracketed>{_SPEAKER_TOKEN_PATTERN})\]\s*(?:[:：\-–—]\s*)?|(?P<plain>{_SPEAKER_TOKEN_PATTERN})\s*[:：\-–—]\s*)",
@@ -198,6 +206,16 @@ def _resolve_bash() -> Optional[str]:
 
 
 def is_moss_transcribe_available() -> bool:
+    if MOSS_TRANSCRIBE_BACKEND in {"python", "transformers", "auto"}:
+        try:
+            import torch  # noqa: F401
+            import transformers  # noqa: F401
+            import moss_transcribe_diarize  # noqa: F401
+
+            return True
+        except ImportError:
+            if MOSS_TRANSCRIBE_BACKEND != "auto":
+                return False
     if _check_health(timeout=0.5):
         return True
     if not MOSS_TRANSCRIBE_MANAGE_BACKEND:
@@ -310,6 +328,7 @@ def _cache_key(
         [
             f"v{MOSS_TRANSCRIBE_CACHE_VERSION}",
             audio_hash,
+            f"backend={MOSS_TRANSCRIBE_BACKEND}",
             f"url={MOSS_TRANSCRIBE_SGLANG_URL}",
             f"model={MOSS_TRANSCRIBE_MODEL}",
             f"mime={input_mime_type or ''}",
@@ -465,6 +484,104 @@ def _transcribe_with_sglang(
     if not isinstance(payload, dict):
         payload = {"response": payload}
     return payload
+
+
+def _load_python_runtime() -> Tuple[Any, Any, Any, Any]:
+    """Lazily load one native Transformers runtime per worker process."""
+    global _PYTHON_RUNTIME
+    if _PYTHON_RUNTIME is not None:
+        return _PYTHON_RUNTIME
+    with _PYTHON_MODEL_LOCK:
+        if _PYTHON_RUNTIME is not None:
+            return _PYTHON_RUNTIME
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoProcessor
+            from moss_transcribe_diarize.inference_utils import resolve_device
+        except ImportError as exc:
+            raise RuntimeError(
+                "Native MOSS inference requires the official "
+                "`moss-transcribe-diarize` package and Transformers runtime."
+            ) from exc
+
+        device = resolve_device(MOSS_TRANSCRIBE_DEVICE)
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        print(f"[MOSS] Loading {MOSS_TRANSCRIBE_MODEL} on {device} ({dtype}).")
+        model = AutoModelForCausalLM.from_pretrained(
+            MOSS_TRANSCRIBE_MODEL,
+            trust_remote_code=True,
+            dtype="auto",
+        ).to(dtype=dtype).to(device).eval()
+        processor = AutoProcessor.from_pretrained(
+            MOSS_TRANSCRIBE_MODEL,
+            trust_remote_code=True,
+        )
+        _PYTHON_RUNTIME = (model, processor, device, dtype)
+        return _PYTHON_RUNTIME
+
+
+def _transcribe_with_python(
+    audio_bytes: bytes,
+    *,
+    input_mime_type: Optional[str],
+) -> Dict[str, Any]:
+    """Run MOSS in-process without a Docker daemon or serving sidecar."""
+    from moss_transcribe_diarize.inference_utils import (
+        build_transcription_messages,
+        generate_transcription,
+    )
+
+    model, processor, device, dtype = _load_python_runtime()
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=f".{_mime_extension(input_mime_type)}",
+            delete=False,
+        ) as handle:
+            handle.write(audio_bytes)
+            temp_path = handle.name
+        messages = build_transcription_messages(
+            temp_path,
+            prompt=MOSS_TRANSCRIBE_PROMPT,
+        )
+        max_new_tokens = (
+            int(MOSS_TRANSCRIBE_MAX_NEW_TOKENS)
+            if MOSS_TRANSCRIBE_MAX_NEW_TOKENS
+            else None
+        )
+        with _PYTHON_INFERENCE_LOCK:
+            result = generate_transcription(
+                model,
+                processor,
+                messages,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                device=device,
+                dtype=dtype,
+            )
+        return result if isinstance(result, dict) else {"text": str(result)}
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+def _transcribe(audio_bytes: bytes, *, input_mime_type: Optional[str]) -> Dict[str, Any]:
+    backend = MOSS_TRANSCRIBE_BACKEND
+    if backend in {"python", "transformers"}:
+        return _transcribe_with_python(audio_bytes, input_mime_type=input_mime_type)
+    if backend in {"sglang", "http", "server"}:
+        _ensure_backend_ready()
+        return _transcribe_with_sglang(audio_bytes, input_mime_type=input_mime_type)
+    if backend != "auto":
+        raise RuntimeError(
+            f"Unsupported MOSS_TRANSCRIBE_BACKEND={backend!r}; use auto, python, or http."
+        )
+    if _check_health(timeout=0.5):
+        return _transcribe_with_sglang(audio_bytes, input_mime_type=input_mime_type)
+    return _transcribe_with_python(audio_bytes, input_mime_type=input_mime_type)
 
 
 def _as_seconds(value: Any) -> Optional[float]:
@@ -858,6 +975,7 @@ def translate_audio(
         "force_refresh": bool(force_refresh),
         "pipeline": "moss_transcribe",
         "moss_model": MOSS_TRANSCRIBE_MODEL,
+        "moss_backend": MOSS_TRANSCRIBE_BACKEND,
         "sglang_url": MOSS_TRANSCRIBE_SGLANG_URL,
         "response_format": MOSS_TRANSCRIBE_RESPONSE_FORMAT,
         "max_new_tokens": MOSS_TRANSCRIBE_MAX_NEW_TOKENS,
@@ -887,9 +1005,8 @@ def translate_audio(
             )
 
     try:
-        _ensure_backend_ready()
-        print("[MOSS] Sending audio to SGLang-Omni transcription endpoint...")
-        payload = _transcribe_with_sglang(
+        print(f"[MOSS] Transcribing audio with {MOSS_TRANSCRIBE_BACKEND} backend...")
+        payload = _transcribe(
             audio_bytes,
             input_mime_type=input_mime_type,
         )
@@ -916,6 +1033,7 @@ def translate_audio(
         raw_output = {
             "pipeline": "moss_transcribe",
             "moss_model": MOSS_TRANSCRIBE_MODEL,
+            "moss_backend": MOSS_TRANSCRIBE_BACKEND,
             "sglang_url": MOSS_TRANSCRIBE_SGLANG_URL,
             "max_new_tokens": MOSS_TRANSCRIBE_MAX_NEW_TOKENS,
             "source_language": source_language,
