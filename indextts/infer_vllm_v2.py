@@ -76,8 +76,37 @@ def _apply_transformers_config_patch():
     except Exception as e:
         print(f"Warning: Could not apply json.load patch: {e}")
 
+
+def _apply_transformers_tokenizer_patch():
+    """Restore the Transformers 4 tokenizer API still used by vLLM."""
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+        if hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):
+            return
+
+        @property
+        def all_special_tokens_extended(self):
+            tokens = []
+            special_tokens_map = getattr(self, "special_tokens_map", {}) or {}
+            for value in special_tokens_map.values():
+                values = value if isinstance(value, (list, tuple)) else [value]
+                for token in values:
+                    if token is not None and token not in tokens:
+                        tokens.append(token)
+            return tokens
+
+        PreTrainedTokenizerBase.all_special_tokens_extended = (
+            all_special_tokens_extended
+        )
+        print("✓ Restored tokenizer.all_special_tokens_extended for vLLM")
+    except Exception as e:
+        print(f"Warning: Could not apply tokenizer compatibility patch: {e}")
+
+
 # Apply patch immediately at import time
 _apply_transformers_config_patch()
+_apply_transformers_tokenizer_patch()
 
 from vllm import SamplingParams, TokensPrompt
 from vllm.engine.arg_utils import AsyncEngineArgs

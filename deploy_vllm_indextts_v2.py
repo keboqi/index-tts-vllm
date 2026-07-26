@@ -23,6 +23,8 @@ CONFUCIUS_IMAGE_DIR = "/app/Confucius4-TTS"
 CONFUCIUS_APP_SUBDIR = "Confucius4-TTS"
 CONFUCIUS_VENV_DIR = "/opt/confucius4tts-venv"
 CONFUCIUS_PYTHON = f"{CONFUCIUS_VENV_DIR}/bin/python"
+MOSS_TRANSCRIBE_VENV_DIR = "/opt/moss-transcribe-venv"
+MOSS_TRANSCRIBE_PYTHON = f"{MOSS_TRANSCRIBE_VENV_DIR}/bin/python"
 CONFUCIUS_MODEL_REPO_ID = "netease-youdao/Confucius4-TTS"
 CONFUCIUS_W2V_REPO_ID = "facebook/w2v-bert-2.0"
 CONFUCIUS_BIGVGAN_REPO_ID = "nvidia/bigvgan_v2_22khz_80band_256x"
@@ -79,9 +81,10 @@ image = (
         # through Transformers; Higgs remains externally served.
         "HIGGS_TTS_MANAGE_BACKEND": "0",
         "MOSS_TRANSCRIBE_MANAGE_BACKEND": "0",
-        "MOSS_TRANSCRIBE_BACKEND": "python",
+        "MOSS_TRANSCRIBE_BACKEND": "http",
         "MOSS_TRANSCRIBE_DEVICE": "cuda:0",
         "MOSS_TRANSCRIBE_MODEL": "/persistent_app/checkpoints/MOSS-Transcribe-Diarize",
+        "MOSS_TRANSCRIBE_SGLANG_URL": "http://127.0.0.1:8003",
         "TORCHINDUCTOR_COMPILE_THREADS": "1",
         "TORCH_NCCL_ENABLE_MONITORING": "0",
         "TORCH_CPP_LOG_LEVEL": "ERROR"
@@ -137,8 +140,12 @@ image = (
     .run_commands("pip install 'audio-separator[gpu]'")
     .run_commands("pip install clearvoice google-genai")
     .run_commands(
-        "pip install 'transformers>=5.6.0,<6' av librosa soundfile soxr",
-        "pip install --no-deps "
+        f"python -m venv --system-site-packages {MOSS_TRANSCRIBE_VENV_DIR}",
+        f"{MOSS_TRANSCRIBE_PYTHON} -m pip install --upgrade pip setuptools wheel",
+        f"{MOSS_TRANSCRIBE_PYTHON} -m pip install "
+        "'transformers>=5.6.0,<6' av librosa soundfile soxr "
+        "fastapi uvicorn python-multipart",
+        f"{MOSS_TRANSCRIBE_PYTHON} -m pip install --no-deps "
         "git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git",
         "cd /app/index-tts-vllm && python -c "
         "\"from indextts.utils.maskgct.models.tts.maskgct.llama_nar "
@@ -175,6 +182,7 @@ MOSS_TRANSCRIBE_PERSISTENT_DIR = (
 CONFUCIUS_PERSISTENT_REPO_DIR = f"{PERSISTENT_APP_DIR}/{CONFUCIUS_APP_SUBDIR}"
 VLLM_PORT = 8000
 CONFUCIUS_PORT = 8001
+MOSS_TRANSCRIBE_PORT = 8003
 SNAPSHOT_STARTUP_TIMEOUT = 1800
 SNAPSHOT_REQUEST_TIMEOUT = 900
 INTERNAL_TOKEN_ENV = "INDEXTTS_INTERNAL_TOKEN"
@@ -1174,6 +1182,50 @@ def _wait_ready(proc: subprocess.Popen, *, timeout_seconds: int) -> None:
     )
 
 
+def _start_moss_transcribe_server(persistent_app_path: Path) -> subprocess.Popen:
+    """Start the isolated pure-Python MOSS service (no Docker daemon)."""
+    server_script = persistent_app_path / "moss_transcribe_server.py"
+    if not server_script.exists():
+        raise FileNotFoundError(f"MOSS server script not found: {server_script}")
+    if not Path(MOSS_TRANSCRIBE_PYTHON).exists():
+        raise FileNotFoundError(
+            f"MOSS virtual environment Python not found: {MOSS_TRANSCRIBE_PYTHON}"
+        )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(persistent_app_path)
+    env["PYTHONUNBUFFERED"] = "1"
+    cmd = [
+        MOSS_TRANSCRIBE_PYTHON,
+        "-m",
+        "uvicorn",
+        "moss_transcribe_server:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(MOSS_TRANSCRIBE_PORT),
+    ]
+    print(f"Starting isolated MOSS transcription server: {' '.join(cmd)}")
+    return subprocess.Popen(cmd, cwd=str(persistent_app_path), env=env)
+
+
+def _wait_moss_ready(proc: subprocess.Popen, *, timeout_seconds: int = 120) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    url = f"http://127.0.0.1:{MOSS_TRANSCRIBE_PORT}/v1/models"
+    last_error = None
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"MOSS transcription server exited with code {proc.returncode}")
+        try:
+            with urllib.request.urlopen(url, timeout=3) as response:
+                if 200 <= response.status < 300:
+                    print("MOSS transcription server is ready.")
+                    return
+        except (OSError, urllib.error.URLError, TimeoutError) as exc:
+            last_error = exc
+            time.sleep(1)
+    raise TimeoutError(f"Timed out waiting for MOSS server. Last error: {last_error}")
+
+
 def _build_confucius_start_command(confucius_repo_path: Path) -> str:
     confucius_config_path = confucius_repo_path / CONFUCIUS_FASTAPI_CONFIG
     confucius_vllm_dir = confucius_repo_path / "checkpoints" / "t2s-vllm"
@@ -1335,13 +1387,17 @@ def _configure_persistent_runtime():
             "MOSS_TRANSCRIBE_MANAGE_BACKEND", "0"
         ),
         "MOSS_TRANSCRIBE_BACKEND": os.environ.get(
-            "MOSS_TRANSCRIBE_BACKEND", "python"
+            "MOSS_TRANSCRIBE_BACKEND", "http"
         ),
         "MOSS_TRANSCRIBE_DEVICE": os.environ.get(
             "MOSS_TRANSCRIBE_DEVICE", "cuda:0"
         ),
         "MOSS_TRANSCRIBE_MODEL": os.environ.get(
             "MOSS_TRANSCRIBE_MODEL", MOSS_TRANSCRIBE_PERSISTENT_DIR
+        ),
+        "MOSS_TRANSCRIBE_SGLANG_URL": os.environ.get(
+            "MOSS_TRANSCRIBE_SGLANG_URL",
+            f"http://127.0.0.1:{MOSS_TRANSCRIBE_PORT}",
         ),
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
         "TORCH_NCCL_ENABLE_MONITORING": "0",
@@ -1520,6 +1576,9 @@ class IndexTTSVllmServer:
     def start(self):
         persistent_app_path = _configure_persistent_runtime()
 
+        self.moss_server_proc = _start_moss_transcribe_server(persistent_app_path)
+        _wait_moss_ready(self.moss_server_proc)
+
         cmd = _build_webui_command(persistent_app_path)
         print(f"Starting FastAPI server: {' '.join(cmd)}")
         env = dict(os.environ)
@@ -1546,6 +1605,7 @@ class IndexTTSVllmServer:
 
     @modal.enter(snap=False)
     def wake_up(self):
+        _wait_moss_ready(self.moss_server_proc)
         print("Waking vLLM engines after memory snapshot restore...")
         _call_local_json(
             "/internal/snapshot/wake",
@@ -1561,8 +1621,10 @@ class IndexTTSVllmServer:
 
     @modal.exit()
     def stop(self):
-        proc = getattr(self, "server_proc", None)
-        if proc is not None and proc.poll() is None:
+        for proc_name in ("server_proc", "moss_server_proc"):
+            proc = getattr(self, proc_name, None)
+            if proc is None or proc.poll() is not None:
+                continue
             proc.terminate()
             try:
                 proc.wait(timeout=30)
