@@ -5,40 +5,18 @@
 # IndexTTS-vLLM
 </div>
 
-quick start
+## Quick start
 
 ```bash
-conda update -n base -c defaults conda
-conda install -c conda-forge libstdcxx-ng
-conda install -c conda-forge sox
-pip install whisperx
-pip install "nemo_toolkit[asr]"
-pip install json-repair
 git clone https://github.com/keboqi/index-tts-vllm
-git clone https://github.com/keboqi/Confucius4-TTS
 cd index-tts-vllm
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
-pip install -r requirements.txt
-pip install alias-free-torch dill einops-exts huggingface_hub importlib-resources nnAudio PyWavelets safetensors scipy soxr torchsde tqdm transformers v-diffusion-pytorch vector-quantize-pytorch
-pip install --no-deps --ignore-requires-python "git+https://github.com/Stability-AI/stable-audio-tools.git"
-pip install -U "yt-dlp[default]"
-pip install -U yt-dlp-ejs
-pip install -U bgutil-ytdlp-pot-provider
-pip install pydub
-pip install flashinfer-python
-pip install flash-attn --no-build-isolation --no-cache-dir
-pip install audio-separator
-pip install clearvoice
-pip install google-genai
-pip install qwen-asr
-pip install omnivad
-pip install sentencepiece
-pip install "numpy<2"
-sudo apt install ffmpeg
-hf download garyswansrs/index_tts_2_vllm --local-dir checkpoints
-export YTDLP_NODE_PATH="$(node -p 'process.execPath')"
-python fastapi_webui_v2.py --use_torch_compile --confucius_repo_dir ../Confucius4-TTS
+bash quickstart.sh
 ```
+
+The executable [quickstart.sh](quickstart.sh) installs the system and Python
+dependencies, creates an isolated environment, downloads the model weights,
+and starts the WebUI. Run `bash quickstart.sh --setup-only` to install
+everything without starting the server.
 
 `fastapi_webui_v2.py` remains the stable launcher, while the application shell
 is organized under `indextts_web/`. See [ARCHITECTURE.md](ARCHITECTURE.md) for
