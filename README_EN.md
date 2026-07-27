@@ -40,6 +40,11 @@ export YTDLP_NODE_PATH="$(node -p 'process.execPath')"
 python fastapi_webui_v2.py --use_torch_compile --confucius_repo_dir ../Confucius4-TTS
 ```
 
+`fastapi_webui_v2.py` remains the stable launcher, while the application shell
+is organized under `indextts_web/`. See [ARCHITECTURE.md](ARCHITECTURE.md) for
+the router, service, backend, translation, and frontend boundaries. Older
+launchers are cataloged in [LEGACY_ENTRYPOINTS.md](LEGACY_ENTRYPOINTS.md).
+
 `Confucius4-TTS` and `Higgs Audio SGLang` are optional and lazy-loaded. The default TTS backend remains IndexTTS; when the UI or API selects `tts_backend=confucius` or `tts_backend=higgs`, `fastapi_webui_v2.py` starts and manages the selected external TTS service on demand. Default local ports are WebUI `8000`, Confucius `8001`, and Higgs SGLang `8002`. The WebUI automatically uses the streaming transport for these external backends so cold starts can emit keepalive frames through Cloudflare/local tunnels instead of timing out silently.
 
 ```bash
@@ -61,7 +66,7 @@ By leveraging vLLM's PagedAttention and continuous batching, this implementation
 ---
 
 ## Web UI Modules
-The modern Web UI [index_new.html](file:///d:/repo/index_tts_2/index-tts-vllm/index_new.html) is built around 7 key functional modules:
+The modern Web UI [index_new.html](index_new.html) is built around 7 key functional modules:
 
 1. **🎵 Speech Synthesis (Voice Studio)**
    - Generate speech using registered speaker presets.
@@ -134,6 +139,9 @@ Install the core requirements and specialized libraries for advanced features:
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 
 pip install -r requirements.txt
+
+# Optional video download, separation, and enhancement integrations
+pip install -r requirements-optional.txt
 
 # For optimized GPU inference
 pip install flashinfer-python flash-attn --no-build-isolation
@@ -241,7 +249,22 @@ Higgs does not expose native duration control, so translate/edit requests genera
 
 ## API Reference
 
-The FastAPI server [fastapi_webui_v2.py](file:///d:/repo/index_tts_2/index-tts-vllm/fastapi_webui_v2.py) exposes a rich, asynchronous REST API.
+The FastAPI server [fastapi_webui_v2.py](fastapi_webui_v2.py) exposes a rich, asynchronous REST API.
+
+### Development checks
+
+Install the development tools and run the CPU-only contract suite:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+ruff check indextts_web tests fastapi_webui_v2.py tools/extract_*.py tools/split_translation_asset.py
+```
+
+The route inventory, streaming frame protocol, settings coercion, session
+repository, file containment, FFmpeg command construction, backend adapters,
+and externalized frontend assets are covered without requiring CUDA or
+checkpoints. GPU smoke tests should still run in the deployment environment.
 
 ### 🎙️ Speech Generation
 

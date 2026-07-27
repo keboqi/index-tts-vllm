@@ -1,0 +1,22 @@
+vllm==0.10.2
+fastapi
+uvicorn
+python-multipart
+descript-audiotools==0.7.2
+matplotlib==3.8.2
+omegaconf
+sentencepiece
+soundfile
+librosa
+pydub
+pedalboard
+gradio
+ninja
+modelscope
+munch==4.0.0
+google-genai>=0.3.0
+qwen-tts
+
+WeTextProcessing; platform_machine != "Darwin"
+wetext; platform_system == "Darwin"
+

@@ -1,6 +1,11 @@
 __pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
 .vscode
 .venv/
+.env
+.env.local
 
 outputs/
 temp.py

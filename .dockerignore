@@ -2,6 +2,11 @@
 __pycache__
 .git
 .gitignore
+.env
+.env.local
 *.pyc
 
 checkpoints
+outputs
+speaker_presets
+prompts

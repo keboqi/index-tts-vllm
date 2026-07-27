@@ -9,6 +9,7 @@ VLLM_USE_MODELSCOPE=${VLLM_USE_MODELSCOPE:-1}
 DOWNLOAD_MODEL=${DOWNLOAD_MODEL:-1}
 CONVERT_MODEL=${CONVERT_MODEL:-1}
 PORT=${PORT:-8001}
+APP_SERVER=${APP_SERVER:-web}
 
 echo "Starting IndexTTS server..."
 echo "Model directory: $MODEL_DIR"
@@ -29,7 +30,11 @@ check_model_exists() {
     fi
     
     # Check for essential model files
-    if [ ! -f "$MODEL_DIR/config.yaml" ] || [ ! -f "$MODEL_DIR/gpt.pth" ] || [ ! -f "$MODEL_DIR/bigvgan_generator.pth" ]; then
+    if [ ! -f "$MODEL_DIR/config.yaml" ] || \
+       [ ! -f "$MODEL_DIR/gpt.pth" ] || \
+       [ ! -f "$MODEL_DIR/bpe.model" ] || \
+       [ ! -f "$MODEL_DIR/s2mel.pth" ] || \
+       [ ! -f "$MODEL_DIR/wav2vec2bert_stats.pt" ]; then
         echo "Essential model files not found in $MODEL_DIR"
         return 1
     fi
@@ -135,6 +140,17 @@ else
     echo "Model conversion disabled (CONVERT_MODEL=0)"
 fi
 
-# Start the API server
-echo "Starting IndexTTS API server on port $PORT..."
-VLLM_USE_V1=0 python3 api_server.py --model_dir "$MODEL_DIR" --port "$PORT" --gpu_memory_utilization="$GPU_MEMORY_UTILIZATION"
+# Start the selected compatibility entry point.
+if [ "$APP_SERVER" = "legacy-api" ]; then
+    echo "Starting legacy IndexTTS API server on port $PORT..."
+    exec env VLLM_USE_V1=0 python3 api_server.py \
+        --model_dir "$MODEL_DIR" \
+        --port "$PORT" \
+        --gpu_memory_utilization="$GPU_MEMORY_UTILIZATION"
+fi
+
+echo "Starting modular IndexTTS WebUI/API server on port $PORT..."
+exec python3 fastapi_webui_v2.py \
+    --model_dir "$MODEL_DIR" \
+    --port "$PORT" \
+    --gpu_memory_utilization="$GPU_MEMORY_UTILIZATION"

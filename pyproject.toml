@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "index-tts-vllm-web"
+version = "0.1.0"
+description = "FastAPI application and vLLM integrations for IndexTTS"
+readme = "README_EN.md"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.27",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.9",
+]
+
+[project.scripts]
+indextts-web = "indextts_web.main:main"
+
+[tool.setuptools.packages.find]
+include = ["indextts_web*"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+    "contract: API and persisted-format compatibility checks",
+    "gpu: tests that require CUDA and model checkpoints",
+    "integration: tests that require external programs or services",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = [
+    "checkpoints",
+    "indextts",
+    "legacy_fastapi_webui_v2.py",
+    "tools/i18n",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+ignore = ["E501"]

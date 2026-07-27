@@ -1,0 +1,9 @@
+# Install this file only when the corresponding optional WebUI features are
+# required. qwen-asr is intentionally excluded because its Transformers pin
+# currently conflicts with qwen-tts; use the separate ASR environment described
+# in README_EN.md.
+audio-separator
+clearvoice
+json-repair
+yt-dlp[default]
+
