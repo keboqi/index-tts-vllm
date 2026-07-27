@@ -77,6 +77,30 @@ def _split_javascript(source: str) -> dict[str, str]:
         end = positions[index + 1][1] if index + 1 < len(positions) else len(script)
         prefix = '"use strict";\n\n'
         assets[name] = prefix + script[start:end].strip() + "\n"
+
+    early_initializer = (
+        "\n        updateFfmpegCommands();\n\n"
+        "        function updateParallelSettingsVisibility()"
+    )
+    if early_initializer not in assets["translation-state.js"]:
+        raise RuntimeError("could not relocate the deferred FFmpeg command initializer")
+    assets["translation-state.js"] = assets["translation-state.js"].replace(
+        early_initializer,
+        "\n        function updateParallelSettingsVisibility()",
+        1,
+    )
+    bootstrap_marker = (
+        "function init() {\n"
+        "            bindRangeOutputs();\n"
+        "            bindDelegatedActions();\n"
+    )
+    if bootstrap_marker not in assets["bootstrap.js"]:
+        raise RuntimeError("could not find the frontend bootstrap initializer")
+    assets["bootstrap.js"] = assets["bootstrap.js"].replace(
+        bootstrap_marker,
+        bootstrap_marker + "            updateFfmpegCommands();\n",
+        1,
+    )
     return assets
 
 
@@ -117,7 +141,8 @@ def main() -> None:
         "<head>",
         '<head>\n'
         '    <meta name="chunk-split-min-silence-ms" '
-        'content="{{CHUNK_SPLIT_MIN_SILENCE_MS}}">',
+        'content="{{CHUNK_SPLIT_MIN_SILENCE_MS}}">\n'
+        '    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">',
         1,
     )
     HTML_PATH.write_text(html, encoding="utf-8", newline="\n")

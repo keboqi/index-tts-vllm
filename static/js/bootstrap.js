@@ -3,6 +3,7 @@
 function init() {
             bindRangeOutputs();
             bindDelegatedActions();
+            updateFfmpegCommands();
             initDurationControlControls();
             const voicePresetSelect = document.getElementById('voiceDesignPreset');
             if (voicePresetSelect) {

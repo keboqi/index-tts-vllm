@@ -955,8 +955,6 @@
                 }
             });
         }
-        updateFfmpegCommands();
-
         function updateParallelSettingsVisibility() {
             if (!translateParallelToggle || !translateParallelSettings) {
                 return;

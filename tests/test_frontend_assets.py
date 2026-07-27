@@ -26,6 +26,42 @@ class FrontendAssetTests(unittest.TestCase):
         for script in (ROOT / "static" / "js").glob("*.js"):
             self.assertNotIn("{{CHUNK_SPLIT_MIN_SILENCE_MS}}", script.read_text(encoding="utf-8"))
 
+    def test_ffmpeg_initializer_runs_after_translation_modules_load(self):
+        html = (ROOT / "index_new.html").read_text(encoding="utf-8")
+        state = (ROOT / "static" / "js" / "translation-state.js").read_text(
+            encoding="utf-8"
+        )
+        chunks = (ROOT / "static" / "js" / "translation-chunks.js").read_text(
+            encoding="utf-8"
+        )
+        bootstrap = (ROOT / "static" / "js" / "bootstrap.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn(
+            "\n        updateFfmpegCommands();\n\n"
+            "        function updateParallelSettingsVisibility()",
+            state,
+        )
+        self.assertIn("function updateFfmpegCommands(options = {})", chunks)
+        self.assertIn(
+            "function init() {\n"
+            "            bindRangeOutputs();\n"
+            "            bindDelegatedActions();\n"
+            "            updateFfmpegCommands();",
+            bootstrap,
+        )
+        script_sources = re.findall(r'<script[^>]+\bsrc="([^"]+)"', html)
+        self.assertLess(
+            script_sources.index("/static/js/translation-chunks.js"),
+            script_sources.index("/static/js/bootstrap.js"),
+        )
+
+    def test_favicon_is_a_static_asset(self):
+        html = (ROOT / "index_new.html").read_text(encoding="utf-8")
+        self.assertIn('href="/static/favicon.svg"', html)
+        self.assertTrue((ROOT / "static" / "favicon.svg").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
