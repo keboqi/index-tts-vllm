@@ -123,6 +123,7 @@ from indextts_web.contracts import (
     audio_chunk_frame,
     keepalive_frame,
 )
+from indextts_web.infrastructure.callables import filter_supported_keyword_arguments
 from indextts_web.services.tts.base import SynthesisRequest
 from indextts_web.services.tts.factory import build_backend_registry
 from indextts_web.services.translation.subtitles import (
@@ -1095,13 +1096,24 @@ def _get_audio_separator_sync(
         f"🎛️ Initializing audio-separator with model: {model_filename} "
         f"(format={AUDIO_SEPARATOR_RAW_OUTPUT_FORMAT}, use_soundfile={resolved_use_soundfile})"
     )
+    separator_kwargs, ignored_options = filter_supported_keyword_arguments(
+        AudioSeparator,
+        {
+            "log_level": logging.INFO,
+            "model_file_dir": AUDIO_SEPARATOR_MODEL_DIR,
+            "output_dir": AUDIO_SEPARATOR_CACHE_DIR,
+            "output_format": AUDIO_SEPARATOR_RAW_OUTPUT_FORMAT,
+            "use_soundfile": resolved_use_soundfile,
+            "use_autocast": True,
+        },
+    )
+    if ignored_options:
+        print(
+            "ℹ️ Installed audio-separator does not support constructor option(s) "
+            f"{', '.join(ignored_options)}; continuing with library defaults."
+        )
     _audio_separator = AudioSeparator(
-        log_level=logging.INFO,
-        model_file_dir=AUDIO_SEPARATOR_MODEL_DIR,
-        output_dir=AUDIO_SEPARATOR_CACHE_DIR,  # Fixed output directory
-        output_format=AUDIO_SEPARATOR_RAW_OUTPUT_FORMAT,
-        use_soundfile=resolved_use_soundfile,
-        use_autocast=True,  # Faster GPU inference
+        **separator_kwargs,
     )
     _audio_separator.load_model(model_filename=model_filename)
     _audio_separator_model_name = model_key

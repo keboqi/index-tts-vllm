@@ -10,6 +10,7 @@ cache_info)`` tuple used by the other local transcription pipelines.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import math
 import mimetypes
@@ -526,10 +527,18 @@ def _transcribe_with_python(
     input_mime_type: Optional[str],
 ) -> Dict[str, Any]:
     """Run MOSS in-process without a Docker daemon or serving sidecar."""
-    from moss_transcribe_diarize.inference_utils import (
-        build_transcription_messages,
-        generate_transcription,
-    )
+    try:
+        from moss_transcribe_diarize.inference_utils import (
+            build_transcription_messages,
+            generate_transcription,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "Native MOSS inference requires the official "
+            "`moss_transcribe_diarize` source package. Clone "
+            "https://github.com/OpenMOSS/MOSS-Transcribe-Diarize and install it "
+            "with `pip install -e .`, or use the SGLang backend."
+        ) from exc
 
     model, processor, device, dtype = _load_python_runtime()
     temp_path = ""
@@ -568,6 +577,13 @@ def _transcribe_with_python(
                 pass
 
 
+def _python_backend_available() -> bool:
+    try:
+        return importlib.util.find_spec("moss_transcribe_diarize") is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def _transcribe(audio_bytes: bytes, *, input_mime_type: Optional[str]) -> Dict[str, Any]:
     backend = MOSS_TRANSCRIBE_BACKEND
     if backend in {"python", "transformers"}:
@@ -581,7 +597,33 @@ def _transcribe(audio_bytes: bytes, *, input_mime_type: Optional[str]) -> Dict[s
         )
     if _check_health(timeout=0.5):
         return _transcribe_with_sglang(audio_bytes, input_mime_type=input_mime_type)
-    return _transcribe_with_python(audio_bytes, input_mime_type=input_mime_type)
+    if MOSS_TRANSCRIBE_MANAGE_BACKEND:
+        try:
+            _ensure_backend_ready()
+        except Exception as server_error:
+            if _python_backend_available():
+                print(
+                    "[MOSS] Managed SGLang startup failed; using installed "
+                    f"native Python backend instead: {server_error}"
+                )
+                return _transcribe_with_python(
+                    audio_bytes,
+                    input_mime_type=input_mime_type,
+                )
+            raise RuntimeError(
+                "MOSS auto backend could not start the managed SGLang server, "
+                "and the native `moss_transcribe_diarize` fallback is not "
+                "installed. Start `bash sglang_omni_moss_transcribe.sh start`, "
+                "or install the official MOSS-Transcribe-Diarize source "
+                f"package. Managed backend error: {server_error}"
+            ) from server_error
+        return _transcribe_with_sglang(audio_bytes, input_mime_type=input_mime_type)
+
+    if _python_backend_available():
+        return _transcribe_with_python(audio_bytes, input_mime_type=input_mime_type)
+
+    _ensure_backend_ready()
+    return _transcribe_with_sglang(audio_bytes, input_mime_type=input_mime_type)
 
 
 def _as_seconds(value: Any) -> Optional[float]:
