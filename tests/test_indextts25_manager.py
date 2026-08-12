@@ -1,3 +1,4 @@
+import base64
 import io
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from pathlib import Path
 from indextts_web.config import AppSettings
 from indextts_web.services.tts.index25_manager import (
     ManagedIndexTTS25Backend,
+    audio_reference,
     allocate_durations,
     fit_wav_duration,
     join_wav,
@@ -72,6 +74,15 @@ class IndexTTS25ManagerTests(unittest.TestCase):
         self.assertEqual(payload["extra_params"]["lang"], "en")
         self.assertEqual(payload["extra_params"]["target_duration_ms"], 1200)
         self.assertTrue(payload["extra_params"]["use_emo_text"])
+
+    def test_short_wav_reference_is_padded_to_one_second(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prompt = Path(directory) / "short.wav"
+            prompt.write_bytes(wav_bytes(frames=11025))
+            reference = audio_reference(str(prompt), use_cache=False)
+        encoded = reference.partition(",")[2]
+        with wave.open(io.BytesIO(base64.b64decode(encoded)), "rb") as source:
+            self.assertEqual(source.getnframes(), source.getframerate())
 
     def test_language_contract_rejects_untested_languages(self):
         self.assertEqual(ManagedIndexTTS25Backend.resolve_language("Arabic", "hello"), "ar")
