@@ -12,8 +12,11 @@ HY_MT_TRANSLATION_LOCAL_DIR="${HY_MT_TRANSLATION_LOCAL_DIR:-${MODEL_DIR}/hy-mt}"
 export HY_MT_TRANSLATION_MODEL
 export HY_MT_TRANSLATION_LOCAL_DIR
 CONFUCIUS_REPO_DIR="${CONFUCIUS_REPO_DIR:-../Confucius4-TTS}"
+INDEXTTS25_REPO_DIR="${INDEXTTS25_REPO_DIR:-../index-tts-2.5-vllm-omni-experiment}"
 INSTALL_SYSTEM_DEPS="${INSTALL_SYSTEM_DEPS:-1}"
 INSTALL_CONFUCIUS="${INSTALL_CONFUCIUS:-1}"
+INSTALL_INDEXTTS25="${INSTALL_INDEXTTS25:-1}"
+UPDATE_EXTERNAL_REPOS="${UPDATE_EXTERNAL_REPOS:-1}"
 DOWNLOAD_MODEL="${DOWNLOAD_MODEL:-1}"
 DOWNLOAD_HY_MT_MODEL="${DOWNLOAD_HY_MT_MODEL:-1}"
 RUN_SERVER="${RUN_SERVER:-1}"
@@ -79,17 +82,64 @@ ensure_uv() {
     fi
 }
 
-ensure_confucius_checkout() {
-    if [[ "${INSTALL_CONFUCIUS}" != "1" || -d "${CONFUCIUS_REPO_DIR}" ]]; then
+ensure_git_checkout() {
+    local name="$1"
+    local url="$2"
+    local repo_dir="$3"
+    local install_enabled="$4"
+
+    if [[ "${install_enabled}" != "1" ]]; then
+        log "${name} provisioning disabled"
         return
     fi
     if ! command -v git >/dev/null 2>&1; then
-        printf 'git is required to clone the optional Confucius4-TTS backend.\n' >&2
+        printf 'git is required to provision the optional %s backend.\n' "${name}" >&2
         exit 1
     fi
 
-    log "Cloning optional Confucius4-TTS backend"
-    git clone https://github.com/keboqi/Confucius4-TTS "${CONFUCIUS_REPO_DIR}"
+    if [[ ! -e "${repo_dir}" ]]; then
+        log "Cloning optional ${name} backend"
+        git clone "${url}" "${repo_dir}"
+        return
+    fi
+    if [[ ! -d "${repo_dir}/.git" ]]; then
+        printf '%s exists but is not a Git checkout: %s\n' "${name}" "${repo_dir}" >&2
+        exit 1
+    fi
+    if [[ "${UPDATE_EXTERNAL_REPOS}" != "1" ]]; then
+        log "Using existing ${name} checkout without updating: ${repo_dir}"
+        return
+    fi
+    if [[ -n "$(git -C "${repo_dir}" status --porcelain --untracked-files=no)" ]]; then
+        printf 'Cannot safely update %s because it has local changes: %s\n' "${name}" "${repo_dir}" >&2
+        exit 1
+    fi
+
+    log "Updating optional ${name} backend"
+    git -C "${repo_dir}" pull --ff-only
+}
+
+ensure_confucius_checkout() {
+    ensure_git_checkout \
+        "Confucius4-TTS" \
+        "https://github.com/keboqi/Confucius4-TTS" \
+        "${CONFUCIUS_REPO_DIR}" \
+        "${INSTALL_CONFUCIUS}"
+}
+
+ensure_indextts25_checkout() {
+    ensure_git_checkout \
+        "IndexTTS 2.5 vLLM-Omni" \
+        "https://github.com/keboqi/indextts-2.5-vllm-omni-experiment.git" \
+        "${INDEXTTS25_REPO_DIR}" \
+        "${INSTALL_INDEXTTS25}"
+
+    if [[ "${INSTALL_INDEXTTS25}" == "1" ]] && \
+       [[ ! -f "${INDEXTTS25_REPO_DIR}/experiments/indextts25_backend_compat/serve_api.sh" ]]; then
+        printf 'IndexTTS 2.5 checkout is missing its API launcher after provisioning: %s\n' \
+            "${INDEXTTS25_REPO_DIR}" >&2
+        exit 1
+    fi
 }
 
 ensure_venv() {
@@ -173,6 +223,7 @@ download_model() {
 ensure_system_dependencies
 ensure_uv
 ensure_confucius_checkout
+ensure_indextts25_checkout
 ensure_venv
 activate_venv
 install_python_dependencies
@@ -206,4 +257,5 @@ exec "${VENV_DIR}/bin/python" fastapi_webui_v2.py \
     --model_dir "${MODEL_DIR}" \
     --port "${SERVER_PORT}" \
     --confucius_repo_dir "${CONFUCIUS_REPO_DIR}" \
+    --indextts25_repo_dir "${INDEXTTS25_REPO_DIR}" \
     "$@"

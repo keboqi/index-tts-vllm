@@ -6,6 +6,14 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class BootstrapContractTests(unittest.TestCase):
+    def test_quickstart_provisions_and_updates_external_backends(self):
+        source = (ROOT / "quickstart.sh").read_text(encoding="utf-8")
+        self.assertIn('git -C "${repo_dir}" pull --ff-only', source)
+        self.assertIn("ensure_confucius_checkout", source)
+        self.assertIn("ensure_indextts25_checkout", source)
+        self.assertIn("https://github.com/keboqi/indextts-2.5-vllm-omni-experiment.git", source)
+        self.assertIn('--indextts25_repo_dir "${INDEXTTS25_REPO_DIR}"', source)
+
     def test_public_launcher_stays_thin(self):
         source = (ROOT / "fastapi_webui_v2.py").read_text(encoding="utf-8")
         nonempty = [line for line in source.splitlines() if line.strip()]

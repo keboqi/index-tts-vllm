@@ -14,9 +14,13 @@ bash quickstart.sh
 ```
 
 The executable [quickstart.sh](quickstart.sh) installs the system and Python
-dependencies, creates an isolated environment, downloads the model weights,
-and starts the WebUI. Run `bash quickstart.sh --setup-only` to install
-everything without starting the server.
+dependencies, clones or fast-forward updates the optional Confucius4-TTS and
+IndexTTS 2.5 vLLM-Omni sibling repositories, creates an isolated environment,
+downloads the model weights, and starts the WebUI. Run
+`bash quickstart.sh --setup-only` to install everything without starting the
+server. Set `UPDATE_EXTERNAL_REPOS=0` to keep existing external checkouts
+unchanged, or `INSTALL_CONFUCIUS=0` / `INSTALL_INDEXTTS25=0` to disable
+provisioning an optional backend.
 
 `fastapi_webui_v2.py` remains the stable launcher, while the application shell
 is organized under `indextts_web/`. See [ARCHITECTURE.md](ARCHITECTURE.md) for
@@ -211,14 +215,13 @@ The Confucius backend supports more target languages for speech generation and t
 
 ### IndexTTS 2.5 vLLM-Omni Backend
 
-Clone the tested integration repository next to this application, then select `IndexTTS 2.5 (vLLM-Omni)` in the UI:
+The quickstart script provisions the tested integration repository next to
+this application automatically. Then select `IndexTTS 2.5 (vLLM-Omni)` in the
+UI. For a custom checkout location, set `INDEXTTS25_REPO_DIR`:
 
 ```bash
-cd ..
-git clone https://github.com/keboqi/indextts-2.5-vllm-omni-experiment.git
-cd index-tts-vllm
-python fastapi_webui_v2.py \
-  --indextts25_repo_dir ../index-tts-2.5-vllm-omni-experiment
+INDEXTTS25_REPO_DIR=/path/to/index-tts-2.5-vllm-omni-experiment \
+  bash quickstart.sh
 ```
 
 The first `index25` request incrementally creates the isolated Python 3.11 environment, downloads the 2.5 checkpoint and its Wav2Vec2-BERT, CAMPPlus, and BigVGAN dependencies, then starts the OpenAI-compatible vLLM-Omni API. Supported synthesis/translation languages are Chinese, English, Japanese, Spanish, and Arabic. Speaker presets and uploaded references are encoded as cached data URLs; emotion text/audio, sampling overrides, seeded sentence batching, native duration control, exact WAV duration fitting, and streaming keepalives are supported. The model itself is non-streaming, so streaming endpoints emit progress keepalives followed by the completed audio.
