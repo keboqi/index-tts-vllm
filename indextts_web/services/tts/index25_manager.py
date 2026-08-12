@@ -27,7 +27,6 @@ from indextts_web.config import AppSettings
 
 INDEXTTS25_BACKEND = "index25"
 INDEXTTS25_LANGUAGES = ("zh", "en", "ja", "es", "ar")
-INDEXTTS25_MIN_REFERENCE_AUDIO_MS = 1000
 _TEXT_BOUNDARY = re.compile(r"(?<=[.!?。！？；;])\s*")
 _LANGUAGE_ALIASES = {
     "arabic": "ar",
@@ -51,32 +50,9 @@ _LANGUAGE_ALIASES = {
 def _cached_audio_reference(path_value: str, mtime_ns: int, size: int) -> str:
     del mtime_ns, size
     path = Path(path_value)
-    audio_bytes, mime = _reference_audio_bytes(path)
-    encoded = base64.b64encode(audio_bytes).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
-
-
-def _reference_audio_bytes(path: Path) -> tuple[bytes, str]:
-    """Read a reference and pad short WAV input to IndexTTS 2.5's minimum."""
     mime = mimetypes.guess_type(path.name)[0] or "audio/wav"
-    raw = path.read_bytes()
-    try:
-        with wave.open(io.BytesIO(raw), "rb") as source:
-            params = source.getparams()
-            frames = source.readframes(source.getnframes())
-    except (EOFError, wave.Error):
-        return raw, mime
-
-    minimum_frames = round(params.framerate * INDEXTTS25_MIN_REFERENCE_AUDIO_MS / 1000)
-    if params.nframes >= minimum_frames:
-        return raw, "audio/wav"
-    frame_width = params.nchannels * params.sampwidth
-    padded = frames.ljust(minimum_frames * frame_width, b"\x00")
-    output = io.BytesIO()
-    with wave.open(output, "wb") as target:
-        target.setparams(params)
-        target.writeframes(padded)
-    return output.getvalue(), "audio/wav"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
 
 
 def audio_reference(value: str, *, use_cache: bool = True) -> str:
@@ -86,8 +62,8 @@ def audio_reference(value: str, *, use_cache: bool = True) -> str:
     stat = path.stat()
     if use_cache:
         return _cached_audio_reference(str(path), stat.st_mtime_ns, stat.st_size)
-    audio_bytes, mime = _reference_audio_bytes(path)
-    encoded = base64.b64encode(audio_bytes).decode("ascii")
+    mime = mimetypes.guess_type(path.name)[0] or "audio/wav"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{encoded}"
 
 

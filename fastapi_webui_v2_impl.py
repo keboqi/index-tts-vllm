@@ -11758,8 +11758,21 @@ async def _synthesize_tts_to_file(
     max_new_tokens: Optional[int] = None,
     seed: Optional[int] = None,
 ) -> str:
+    from indextts_web.services.tts.reference_audio import ensure_minimum_reference_duration
+
     backend = _normalize_tts_backend(tts_backend, SETTINGS.tts_backend)
     duration_control_mode = _normalize_duration_control(duration_control)
+    reference_cache_dir = ROOT_OUTPUT_DIR / "reference_audio_cache"
+    spk_audio_prompt = await asyncio.to_thread(
+        ensure_minimum_reference_duration,
+        spk_audio_prompt or None,
+        cache_dir=reference_cache_dir,
+    ) or ""
+    emo_audio_prompt = await asyncio.to_thread(
+        ensure_minimum_reference_duration,
+        emo_audio_prompt,
+        cache_dir=reference_cache_dir,
+    )
     global TTS_BACKEND_REGISTRY
     if TTS_BACKEND_REGISTRY is None:
         TTS_BACKEND_REGISTRY = build_backend_registry(sys.modules[__name__])
