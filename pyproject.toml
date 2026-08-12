@@ -38,7 +38,7 @@ line-length = 120
 extend-exclude = [
     "checkpoints",
     "indextts",
-    "legacy_fastapi_webui_v2.py",
+    "fastapi_webui_v2_impl.py",
     "tools/i18n",
 ]
 

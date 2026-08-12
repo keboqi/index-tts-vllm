@@ -35,6 +35,5 @@ def from_legacy(module: ModuleType) -> SchemaInventory:
         ),
         video=_models(module, ("VideoInfoRequest", "VideoDownloadRequest", "VideoReplaceAudioRequest")),
         speakers=_models(module, ("VoiceDesignRequest", "SaveDesignedVoiceRequest")),
-        utilities=_models(module, ("HiggsTextEnhanceRequest", "CookieImportCurlRequest")),
+        utilities=_models(module, ("CookieImportCurlRequest",)),
     )
-

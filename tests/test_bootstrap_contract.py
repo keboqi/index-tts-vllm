@@ -12,8 +12,8 @@ class BootstrapContractTests(unittest.TestCase):
         self.assertLessEqual(len(nonempty), 10)
         self.assertIn("from indextts_web.main import app, main", source)
 
-    def test_legacy_module_has_no_top_level_directory_creation(self):
-        source = (ROOT / "legacy_fastapi_webui_v2.py").read_text(encoding="utf-8-sig")
+    def test_implementation_module_has_no_top_level_directory_creation(self):
+        source = (ROOT / "fastapi_webui_v2_impl.py").read_text(encoding="utf-8-sig")
         tree = ast.parse(source)
         violations = []
         for node in tree.body:
@@ -24,7 +24,7 @@ class BootstrapContractTests(unittest.TestCase):
         self.assertEqual(violations, [])
 
     def test_runtime_directories_are_lifespan_owned(self):
-        source = (ROOT / "legacy_fastapi_webui_v2.py").read_text(encoding="utf-8-sig")
+        source = (ROOT / "fastapi_webui_v2_impl.py").read_text(encoding="utf-8-sig")
         tree = ast.parse(source)
         lifespan = next(
             node
@@ -41,4 +41,3 @@ class BootstrapContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -4,7 +4,7 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "legacy_fastapi_webui_v2.py"
+SOURCE = ROOT / "fastapi_webui_v2_impl.py"
 
 
 def replace_between(text: str, start: str, end: str, replacement: str) -> str:

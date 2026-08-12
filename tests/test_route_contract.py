@@ -13,7 +13,6 @@ EXPECTED_ROUTES = {
     ("GET", "/"),
     ("POST", "/api/estimate_duration"),
     ("POST", "/api/clear_outputs"),
-    ("POST", "/api/higgs/enhance_text"),
     ("GET", "/api/prompt_templates"),
     ("GET", "/api/stable-audio/status"),
     ("GET", "/api/stable-audio/models"),
@@ -71,7 +70,7 @@ EXPECTED_ROUTES = {
 
 
 def source_routes():
-    source = (ROOT / "legacy_fastapi_webui_v2.py").read_text(encoding="utf-8-sig")
+    source = (ROOT / "fastapi_webui_v2_impl.py").read_text(encoding="utf-8-sig")
     tree = ast.parse(source)
     routes = set()
     for node in tree.body:
@@ -89,7 +88,7 @@ def source_routes():
 class RouteContractTests(unittest.TestCase):
     def test_legacy_route_inventory_is_stable(self):
         self.assertEqual(source_routes(), EXPECTED_ROUTES)
-        self.assertEqual(len(EXPECTED_ROUTES), 60)
+        self.assertEqual(len(EXPECTED_ROUTES), 59)
 
     def test_every_compatibility_route_has_one_feature_group(self):
         grouped = {path: route_group(path) for _method, path in EXPECTED_ROUTES}

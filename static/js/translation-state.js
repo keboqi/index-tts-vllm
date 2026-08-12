@@ -86,19 +86,27 @@
             ['Malay', 'Malay'],
             ['Vietnamese', 'Vietnamese'],
         ]);
+        const INDEXTTS25_DESTINATION_LANGUAGES = Object.freeze([
+            ['', 'Select...'],
+            ['Chinese', 'Chinese'],
+            ['English', 'English'],
+            ['Japanese', 'Japanese'],
+            ['Spanish', 'Spanish'],
+            ['Arabic', 'Arabic'],
+        ]);
         const TRANSLATE_DESTINATION_LANGUAGES_BY_BACKEND = Object.freeze({
             index: Object.freeze([
                 ['', 'Select...'],
                 ['English', 'English'],
                 ['Chinese', 'Chinese'],
             ]),
+            index25: INDEXTTS25_DESTINATION_LANGUAGES,
             confucius: MULTILINGUAL_TTS_DESTINATION_LANGUAGES,
-            higgs: MULTILINGUAL_TTS_DESTINATION_LANGUAGES,
         });
         const DEFAULT_TRANSLATE_DESTINATION_BY_BACKEND = Object.freeze({
             index: 'Chinese',
+            index25: 'Chinese',
             confucius: 'Chinese',
-            higgs: 'Chinese',
         });
 
         function readTranslatePersistentSettings() {
@@ -503,7 +511,8 @@
             syncDefaultEmotionWeightDisplay();
         }
         function syncTranslateTtsBackendControls() {
-            const usesIndexEmotionControls = !translateTtsBackendEl || translateTtsBackendEl.value === 'index';
+            const selectedBackend = translateTtsBackendEl ? translateTtsBackendEl.value : 'index';
+            const usesIndexEmotionControls = selectedBackend === 'index' || selectedBackend === 'index25';
             syncTranslateDestinationLanguageOptions();
             if (translateDefaultEmotionWeightInput) {
                 translateDefaultEmotionWeightInput.disabled = !usesIndexEmotionControls;

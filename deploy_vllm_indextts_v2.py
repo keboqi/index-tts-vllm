@@ -31,6 +31,16 @@ CONFUCIUS_BIGVGAN_REPO_ID = "nvidia/bigvgan_v2_22khz_80band_256x"
 CONFUCIUS_CAMPPLUS_REPO_ID = "funasr/campplus"
 CONFUCIUS_CAMPPLUS_FILENAME = "campplus_cn_common.bin"
 CONFUCIUS_FASTAPI_CONFIG = "config/inference_config.modal.yaml"
+INDEXTTS25_REPO_URL = "https://github.com/keboqi/indextts-2.5-vllm-omni-experiment.git"
+INDEXTTS25_IMAGE_DIR = "/app/index-tts-2.5-vllm-omni-experiment"
+INDEXTTS25_APP_SUBDIR = "index-tts-2.5-vllm-omni-experiment"
+INDEXTTS25_VENV_DIR = "/opt/indextts25-venv"
+INDEXTTS25_PYTHON = f"{INDEXTTS25_VENV_DIR}/bin/python"
+INDEXTTS25_VLLM = f"{INDEXTTS25_VENV_DIR}/bin/vllm"
+INDEXTTS25_MODEL_REPO_ID = "IndexTeam/IndexTTS-2.5"
+INDEXTTS25_W2V_REPO_ID = "facebook/w2v-bert-2.0"
+INDEXTTS25_CAMPPLUS_REPO_ID = "funasr/campplus"
+INDEXTTS25_BIGVGAN_REPO_ID = "nvidia/bigvgan_v2_22khz_80band_256x"
 STABLE_AUDIO3_REPOS = {
     "medium": "stabilityai/stable-audio-3-medium",
     "small-music": "stabilityai/stable-audio-3-small-music",
@@ -79,8 +89,7 @@ image = (
         "TRITON_CACHE_DIR": "/persistent_cache/triton",
         "VLLM_SERVER_DEV_MODE": "1",
         # Modal containers do not provide a Docker daemon. Run MOSS directly
-        # through Transformers; Higgs remains externally served.
-        "HIGGS_TTS_MANAGE_BACKEND": "0",
+        # through Transformers.
         "MOSS_TRANSCRIBE_MANAGE_BACKEND": "0",
         "MOSS_TRANSCRIBE_BACKEND": "http",
         "MOSS_TRANSCRIBE_DEVICE": "cuda:0",
@@ -121,6 +130,22 @@ image = (
         f"cd {CONFUCIUS_IMAGE_DIR} && {CONFUCIUS_PYTHON} -m pip install --force-reinstall -r requirements-cu128.txt",
         f"cd {CONFUCIUS_IMAGE_DIR} && {CONFUCIUS_PYTHON} -m pip install -r requirements-vllm.txt",
         f"{CONFUCIUS_PYTHON} -m pip install \"numpy<2\" \"torchcodec==0.9.*\"",
+    )
+    .run_commands(
+        "pip install uv",
+        f"git clone {INDEXTTS25_REPO_URL} {INDEXTTS25_IMAGE_DIR}",
+        "uv python install 3.11",
+        f"uv venv --python 3.11 --seed {INDEXTTS25_VENV_DIR}",
+        f"uv pip install --python {INDEXTTS25_PYTHON} 'vllm==0.27.0' --torch-backend=auto",
+        f"uv pip install --python {INDEXTTS25_PYTHON} -e '{INDEXTTS25_IMAGE_DIR}[indextts2]'",
+        f"uv pip install --python {INDEXTTS25_PYTHON} -e "
+        f"'{INDEXTTS25_IMAGE_DIR}/experiments/indextts25_backend_compat'",
+        f"uv pip install --python {INDEXTTS25_PYTHON} 'huggingface_hub[cli]'",
+        f"{INDEXTTS25_PYTHON} "
+        f"{INDEXTTS25_IMAGE_DIR}/experiments/indextts25_backend_compat/src/"
+        "indextts25_compat/patch_flashinfer.py",
+        f"{INDEXTTS25_PYTHON} -c \"import flashinfer.comm; "
+        "print('IndexTTS 2.5 FlashInfer compatibility check passed')\"",
     )
     .run_commands(
         # The PyPI stable-audio-tools wheel is too old for Stable Audio 3
@@ -183,8 +208,12 @@ MOSS_TRANSCRIBE_PERSISTENT_DIR = (
 )
 HY_MT_TRANSLATION_PERSISTENT_DIR = f"{PERSISTENT_APP_DIR}/checkpoints/hy-mt"
 CONFUCIUS_PERSISTENT_REPO_DIR = f"{PERSISTENT_APP_DIR}/{CONFUCIUS_APP_SUBDIR}"
+INDEXTTS25_PERSISTENT_REPO_DIR = f"{PERSISTENT_APP_DIR}/{INDEXTTS25_APP_SUBDIR}"
+INDEXTTS25_PERSISTENT_MODEL_DIR = f"{PERSISTENT_APP_DIR}/checkpoints/IndexTTS-2.5"
+INDEXTTS25_PERSISTENT_DATA_DIR = f"{PERSISTENT_CACHE_DIR}/indextts25"
 VLLM_PORT = 8000
 CONFUCIUS_PORT = 8001
+INDEXTTS25_PORT = 8092
 MOSS_TRANSCRIBE_PORT = 8003
 SNAPSHOT_STARTUP_TIMEOUT = 1800
 SNAPSHOT_REQUEST_TIMEOUT = 900
@@ -195,6 +224,8 @@ QWENEMO_GPU_MEMORY_UTILIZATION = 0.05
 CONFUCIUS_GPU_MEMORY_UTILIZATION = 0.20
 CONFUCIUS_STARTUP_TIMEOUT = 1200
 CONFUCIUS_REQUEST_TIMEOUT = 900
+INDEXTTS25_STARTUP_TIMEOUT = 1800
+INDEXTTS25_REQUEST_TIMEOUT = 900
 
 STABLE_AUDIO3_VARIANTS = tuple(STABLE_AUDIO3_REPOS)
 
@@ -301,9 +332,9 @@ def _ensure_confucius_vllm_patch_compatibility(confucius_repo_path: Path) -> Dic
 def prepare_model():
     """
     CPU function to:
-    1. Copy IndexTTS and Confucius4-TTS code into persistent storage
-    2. Update both applications from their integration remotes
-    3. Download IndexTTS, Qwen3 Voice Design, Stable Audio 3, and
+    1. Copy IndexTTS, Confucius4-TTS, and IndexTTS 2.5 Omni code into persistent storage
+    2. Update the primary applications from their integration remotes
+    3. Download IndexTTS 2.0/2.5, Qwen3 Voice Design, Stable Audio 3, and
        Confucius4-TTS assets into persistent storage/cache
     4. Convert the Confucius T2S checkpoint into a vLLM-loadable directory
     
@@ -320,6 +351,8 @@ def prepare_model():
     source_app_path = Path("/app/index-tts-vllm")
     confucius_source_path = Path(CONFUCIUS_IMAGE_DIR)
     confucius_persistent_path = persistent_app_path / CONFUCIUS_APP_SUBDIR
+    indextts25_source_path = Path(INDEXTTS25_IMAGE_DIR)
+    indextts25_persistent_path = persistent_app_path / INDEXTTS25_APP_SUBDIR
     
     if not persistent_app_path.exists() or len(list(persistent_app_path.iterdir())) == 0:
         print("📂 Copying application to persistent storage...")
@@ -356,6 +389,14 @@ def prepare_model():
                 print(f"   Copied Confucius file: {item.name}")
     else:
         print(f"Confucius4-TTS already exists in persistent storage: {confucius_persistent_path}")
+
+    print(f"Synchronizing IndexTTS 2.5 vLLM-Omni code: {indextts25_persistent_path}")
+    shutil.copytree(
+        indextts25_source_path,
+        indextts25_persistent_path,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns(".venv-indextts25", "models", "runtime", "__pycache__"),
+    )
 
     # Step 2: Update the application with latest code from git (force override local changes)
     print("\n📥 Step 2: Updating application from git repository (force override)...")
@@ -519,7 +560,7 @@ def prepare_model():
         result = subprocess.run([
             "python", "-c", 
             f"""
-from huggingface_hub import snapshot_download
+from huggingface_hub import hf_hub_download, snapshot_download
 import os
 
 print("Downloading main IndexTTS v2 model repo...")
@@ -529,6 +570,33 @@ snapshot_download(
     local_dir_use_symlinks=False
 )
 print("Main model download completed!")
+
+indextts25_target = {INDEXTTS25_PERSISTENT_MODEL_DIR!r}
+print("Downloading IndexTTS 2.5 vLLM-Omni model bundle...")
+snapshot_download(
+    repo_id={INDEXTTS25_MODEL_REPO_ID!r},
+    local_dir=indextts25_target,
+    local_dir_use_symlinks=False,
+)
+snapshot_download(
+    repo_id={INDEXTTS25_W2V_REPO_ID!r},
+    local_dir=os.path.join(indextts25_target, "w2v-bert-2.0"),
+    allow_patterns=["config.json", "model.safetensors", "preprocessor_config.json"],
+    local_dir_use_symlinks=False,
+)
+hf_hub_download(
+    repo_id={INDEXTTS25_CAMPPLUS_REPO_ID!r},
+    filename="campplus_cn_common.bin",
+    local_dir=indextts25_target,
+    local_dir_use_symlinks=False,
+)
+snapshot_download(
+    repo_id={INDEXTTS25_BIGVGAN_REPO_ID!r},
+    local_dir=os.path.join(indextts25_target, "bigvgan"),
+    allow_patterns=["config.json", "bigvgan_generator.pt"],
+    local_dir_use_symlinks=False,
+)
+print("IndexTTS 2.5 model and external runtime assets are ready.")
 
 stable_audio_repos = {STABLE_AUDIO3_REPOS!r}
 stable_audio_root = os.path.join({str(checkpoints_dir)!r}, "stable-audio-3")
@@ -585,6 +653,26 @@ print("HY-MT translation model download completed: " + hy_mt_target)
         hy_mt_ready = (
             (hy_mt_dir / "config.json").exists()
             and any(hy_mt_dir.rglob("*.safetensors"))
+        )
+        indextts25_model_dir = Path(INDEXTTS25_PERSISTENT_MODEL_DIR)
+        indextts25_required_files = (
+            "config.yaml",
+            "gpt.pth",
+            "codec.pth",
+            "s2mel.pth",
+            "wav2vec2bert_stats.pt",
+            "multilingual_zh_ja_yue_char_del.tiktoken",
+            "qwen0.6bemo4-merge/config.json",
+            "qwen0.6bemo4-merge/model.safetensors",
+            "w2v-bert-2.0/config.json",
+            "w2v-bert-2.0/model.safetensors",
+            "campplus_cn_common.bin",
+            "bigvgan/config.json",
+            "bigvgan/bigvgan_generator.pt",
+        )
+        indextts25_ready = all(
+            (indextts25_model_dir / relative_path).is_file()
+            for relative_path in indextts25_required_files
         )
         
         # Step 4: List downloaded files for verification
@@ -819,6 +907,12 @@ print("Confucius asset download completed.")
                 "ready": confucius_ready,
                 "vllm_ready": confucius_vllm_ready,
             },
+            "index25": {
+                "repo_dir": str(indextts25_persistent_path),
+                "model_dir": str(indextts25_model_dir),
+                "data_dir": INDEXTTS25_PERSISTENT_DATA_DIR,
+                "ready": indextts25_ready,
+            },
         }
         
     except subprocess.CalledProcessError as e:
@@ -878,6 +972,7 @@ def clear_cache():
         "/persistent_cache/vllm_cache",
         "/persistent_cache/torch_compile_cache",  # torch.compile artifacts
         "/persistent_cache/confucius",
+        INDEXTTS25_PERSISTENT_DATA_DIR,
         "/persistent_cache/triton",
     ]
     
@@ -1049,6 +1144,7 @@ def legacy_serve_without_snapshot():
         "/persistent_cache/vllm_cache",
         "/persistent_cache/torch_compile_cache",
         "/persistent_cache/confucius",
+        INDEXTTS25_PERSISTENT_DATA_DIR,
         "/persistent_cache/triton",
     ]
     
@@ -1300,25 +1396,40 @@ def _build_confucius_start_command(confucius_repo_path: Path) -> str:
     return " ".join(shlex.quote(str(part)) for part in parts)
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw_value = os.environ.get(name)
-    if raw_value is None:
-        return default
-    return raw_value.strip().lower() not in {"", "0", "false", "no", "off"}
+def _build_indextts25_start_command(indextts25_repo_path: Path) -> str:
+    deploy_config = indextts25_repo_path / "vllm_omni" / "deploy" / "indextts2_5.yaml"
+    data_dir = Path(INDEXTTS25_PERSISTENT_DATA_DIR)
+    parts = [
+        "env",
+        "FLASHINFER_DISABLE_VERSION_CHECK=1",
+        f"PYTHONPATH={indextts25_repo_path}",
+        f"HF_HOME={data_dir / 'cache' / 'huggingface'}",
+        f"SPEAKER_SAMPLES_DIR={data_dir / 'speakers'}",
+        f"SPEAKER_CACHE_DIR={data_dir / 'cache' / 'speaker-conditioning'}",
+        "SPEAKER_CACHE_VERSION=indextts25-v1",
+        f"TORCHINDUCTOR_CACHE_DIR={data_dir / 'cache' / 'torchinductor'}",
+        f"TRITON_CACHE_DIR={data_dir / 'cache' / 'triton'}",
+        f"CUDA_CACHE_PATH={data_dir / 'cache' / 'cuda'}",
+        INDEXTTS25_VLLM,
+        "serve",
+        INDEXTTS25_PERSISTENT_MODEL_DIR,
+        "--omni",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(INDEXTTS25_PORT),
+        "--served-model-name",
+        INDEXTTS25_MODEL_REPO_ID,
+        "--trust-remote-code",
+        "--log-stats",
+        "--deploy-config",
+        str(deploy_config),
+    ]
+    return " ".join(shlex.quote(str(part)) for part in parts)
 
 
 def _build_webui_command(persistent_app_path: Path) -> List[str]:
     """Build one launch command shared by snapshot and legacy entry points."""
-    higgs_server_url = (
-        os.environ.get("HIGGS_TTS_SGLANG_URL", "http://127.0.0.1:8002").strip()
-        or "http://127.0.0.1:8002"
-    )
-    higgs_manage_flag = (
-        "--higgs_manage_backend"
-        if _env_flag("HIGGS_TTS_MANAGE_BACKEND", False)
-        else "--no-higgs_manage_backend"
-    )
-
     return [
         "python",
         "-u",
@@ -1354,33 +1465,31 @@ def _build_webui_command(persistent_app_path: Path) -> List[str]:
         "60",
         "--confucius_unhealthy_grace",
         "30",
-        "--higgs_server_url",
-        higgs_server_url,
-        "--higgs_model",
-        os.environ.get("HIGGS_TTS_MODEL", "bosonai/higgs-audio-v3-tts-4b"),
-        higgs_manage_flag,
-        "--higgs_manager_script",
-        os.environ.get("HIGGS_TTS_MANAGER_SCRIPT", "sglang_omni_higgs.sh"),
-        "--higgs_start_timeout",
-        os.environ.get("HIGGS_TTS_START_TIMEOUT", "3600"),
-        "--higgs_request_timeout",
-        os.environ.get("HIGGS_TTS_REQUEST_TIMEOUT", "1800"),
-        "--higgs_mem_fraction_static",
-        os.environ.get("HIGGS_TTS_MEM_FRACTION_STATIC", "0.30"),
-        "--higgs_max_running_requests",
-        os.environ.get("HIGGS_TTS_MAX_RUNNING_REQUESTS", "100"),
-        "--higgs_dtype",
-        os.environ.get("HIGGS_TTS_DTYPE", "bfloat16"),
-        "--higgs_initial_codec_chunk_frames",
-        os.environ.get("HIGGS_TTS_INITIAL_CODEC_CHUNK_FRAMES", "1"),
-        "--higgs_max_new_tokens",
-        os.environ.get("HIGGS_TTS_MAX_NEW_TOKENS", "4096"),
-        "--higgs_temperature",
-        os.environ.get("HIGGS_TTS_TEMPERATURE", "0.8"),
-        "--higgs_top_k",
-        os.environ.get("HIGGS_TTS_TOP_K", "50"),
-        "--higgs_top_p",
-        os.environ.get("HIGGS_TTS_TOP_P", "0.0"),
+        "--indextts25_repo_dir",
+        str(persistent_app_path / INDEXTTS25_APP_SUBDIR),
+        "--indextts25_model_dir",
+        INDEXTTS25_PERSISTENT_MODEL_DIR,
+        "--indextts25_data_dir",
+        INDEXTTS25_PERSISTENT_DATA_DIR,
+        "--indextts25_host",
+        "127.0.0.1",
+        "--indextts25_port",
+        str(INDEXTTS25_PORT),
+        "--indextts25_served_model_name",
+        INDEXTTS25_MODEL_REPO_ID,
+        "--indextts25_start_command",
+        _build_indextts25_start_command(persistent_app_path / INDEXTTS25_APP_SUBDIR),
+        "--indextts25_start_timeout",
+        str(INDEXTTS25_STARTUP_TIMEOUT),
+        "--indextts25_request_timeout",
+        str(INDEXTTS25_REQUEST_TIMEOUT),
+        "--indextts25_attach_stdio",
+        "--indextts25_keepalive_interval",
+        "60",
+        "--indextts25_unhealthy_grace",
+        "30",
+        "--indextts25_max_parallel_segments",
+        "100",
         "--use_torch_compile",
     ]
 
@@ -1405,7 +1514,6 @@ def _configure_persistent_runtime():
         "TORCHINDUCTOR_COMPILE_THREADS": "1",
         "VLLM_SERVER_DEV_MODE": "1",
         "INDEXTTS_ENABLE_VLLM_SLEEP_MODE": "1",
-        "HIGGS_TTS_MANAGE_BACKEND": os.environ.get("HIGGS_TTS_MANAGE_BACKEND", "0"),
         "MOSS_TRANSCRIBE_MANAGE_BACKEND": os.environ.get(
             "MOSS_TRANSCRIBE_MANAGE_BACKEND", "0"
         ),
@@ -1443,6 +1551,7 @@ def _configure_persistent_runtime():
         "/persistent_cache/vllm_cache",
         "/persistent_cache/torch_compile_cache",
         "/persistent_cache/confucius",
+        INDEXTTS25_PERSISTENT_DATA_DIR,
         "/persistent_cache/triton",
     ]
     for cache_dir in cache_dirs:
@@ -1522,6 +1631,47 @@ def _configure_persistent_runtime():
             + "; ".join(missing_confucius_paths)
         )
 
+    indextts25_repo_path = persistent_app_path / INDEXTTS25_APP_SUBDIR
+    indextts25_model_path = Path(INDEXTTS25_PERSISTENT_MODEL_DIR)
+    required_indextts25_paths = {
+        "repo": indextts25_repo_path,
+        "deploy_config": indextts25_repo_path / "vllm_omni" / "deploy" / "indextts2_5.yaml",
+        "venv_python": Path(INDEXTTS25_PYTHON),
+        "vllm": Path(INDEXTTS25_VLLM),
+        "config": indextts25_model_path / "config.yaml",
+        "gpt": indextts25_model_path / "gpt.pth",
+        "codec": indextts25_model_path / "codec.pth",
+        "s2mel": indextts25_model_path / "s2mel.pth",
+        "wav2vec": indextts25_model_path / "w2v-bert-2.0" / "model.safetensors",
+        "campplus": indextts25_model_path / "campplus_cn_common.bin",
+        "bigvgan": indextts25_model_path / "bigvgan" / "bigvgan_generator.pt",
+    }
+    missing_indextts25_paths = [
+        f"{name}: {path}"
+        for name, path in required_indextts25_paths.items()
+        if not path.exists()
+    ]
+    if missing_indextts25_paths:
+        raise FileNotFoundError(
+            "IndexTTS 2.5 vLLM-Omni persistent setup is incomplete. Run prepare_model first. "
+            + "; ".join(missing_indextts25_paths)
+        )
+
+    indextts25_data_path = Path(INDEXTTS25_PERSISTENT_DATA_DIR)
+    for relative_path in (
+        "logs",
+        "speakers",
+        "cache/huggingface",
+        "cache/speaker-conditioning",
+        "cache/torchinductor",
+        "cache/triton",
+        "cache/cuda",
+    ):
+        (indextts25_data_path / relative_path).mkdir(parents=True, exist_ok=True)
+    print(f"IndexTTS 2.5 vLLM-Omni repo: {indextts25_repo_path}")
+    print(f"IndexTTS 2.5 model: {indextts25_model_path}")
+    print(f"IndexTTS 2.5 isolated environment: {INDEXTTS25_VENV_DIR}")
+
     for path in (
         confucius_output_dir,
         confucius_compile_cache_dir,
@@ -1578,8 +1728,8 @@ def _configure_persistent_runtime():
 @app.cls(
     image=image,
     gpu="RTX-PRO-6000",  # 96GB Blackwell; use "L40S" if you want Ada/L40S instead.
-    cpu=4.0,
-    memory=8124,
+    cpu=8.0,
+    memory=32768,
     timeout=3600,
     scaledown_window=300,
     volumes={

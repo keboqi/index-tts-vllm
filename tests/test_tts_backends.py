@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 from indextts_web.services.tts.base import SynthesisRequest
 from indextts_web.services.tts.confucius import ConfuciusBackend
-from indextts_web.services.tts.higgs import HiggsBackend
 from indextts_web.services.tts.index import IndexBackend
+from indextts_web.services.tts.index25 import IndexTTS25Backend
 from indextts_web.services.tts.registry import BackendRegistry
 
 
@@ -85,22 +85,16 @@ class BackendAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_external_backend_request_mapping(self):
         confucius = FakeExternalManager()
-        higgs = FakeExternalManager()
 
         async def resolve_confucius(**_kwargs):
             return "confucius.wav"
-
-        async def resolve_external(**_kwargs):
-            return "higgs.wav"
 
         async def postprocess(_path, _duration):
             return None
 
         legacy = SimpleNamespace(
             confucius_backend_manager=confucius,
-            higgs_backend_manager=higgs,
             _resolve_confucius_prompt_audio=resolve_confucius,
-            _resolve_external_prompt_audio=resolve_external,
             _postprocess_ffmpeg_duration=postprocess,
         )
         request = SynthesisRequest(
@@ -111,12 +105,36 @@ class BackendAdapterTests(unittest.IsolatedAsyncioTestCase):
             sampling={"temperature": 0.4, "top_k": 9},
         )
         await ConfuciusBackend(legacy).synthesize(request)
-        await HiggsBackend(legacy).synthesize(request)
         self.assertEqual(confucius.kwargs["prompt_wav"], "confucius.wav")
         self.assertEqual(confucius.kwargs["speech_length"], 1000)
-        self.assertEqual(higgs.kwargs["prompt_wav"], "higgs.wav")
-        self.assertEqual(higgs.kwargs["temperature"], 0.4)
-        self.assertEqual(higgs.kwargs["top_k"], 9)
+
+    async def test_indextts25_backend_maps_native_controls(self):
+        manager = FakeExternalManager()
+
+        async def resolve_indextts25(**_kwargs):
+            return "speaker.wav"
+
+        legacy = SimpleNamespace(
+            indextts25_backend_manager=manager,
+            _resolve_indextts25_prompt_audio=resolve_indextts25,
+            _postprocess_ffmpeg_duration=lambda *_args: None,
+        )
+        request = SynthesisRequest(
+            text="hello",
+            output_path=Path("output.wav"),
+            speaker_preset="voice",
+            language="en",
+            target_duration_ms=1500,
+            emotion_text="happy",
+            emotion_weight=0.7,
+            seed=41,
+            sampling={"temperature": 0.6, "max_new_tokens": 700},
+        )
+        await IndexTTS25Backend(legacy).synthesize(request)
+        self.assertEqual(manager.kwargs["prompt_wav"], "speaker.wav")
+        self.assertEqual(manager.kwargs["speech_length"], 1500)
+        self.assertEqual(manager.kwargs["emotion_text"], "happy")
+        self.assertEqual(manager.kwargs["sampling"]["max_new_tokens"], 700)
 
     async def test_registry_rejects_unknown_backend(self):
         legacy = SimpleNamespace()

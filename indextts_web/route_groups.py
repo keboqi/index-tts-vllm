@@ -11,7 +11,6 @@ def route_group(path: str) -> str | None:
     if path in {
         "/api/estimate_duration",
         "/api/clear_outputs",
-        "/api/higgs/enhance_text",
         "/api/prompt_templates",
     }:
         return "utilities"
@@ -34,4 +33,3 @@ def route_group(path: str) -> str | None:
     if path in {"/speak", "/clone_voice", "/server_info", "/speak_stream", "/clone_voice_stream"}:
         return "tts"
     return None
-

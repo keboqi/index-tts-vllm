@@ -44,14 +44,12 @@ class InfrastructureTests(unittest.TestCase):
         self.assertEqual(command[-5:], ["input.wav", "-vn", "-b:a", "128k", "output.mp3"])
         self.assertEqual(timeout, 600)
 
-    def test_concurrency_budget_preserves_nested_higgs_defaults(self):
+    def test_concurrency_budget_bounds_translation_to_index_capacity(self):
         with patch.dict(
             "os.environ",
             {
                 "INDEXTTS_GPU_WORK_CONCURRENCY": "8",
                 "TRANSLATION_TTS_CONCURRENCY": "40",
-                "HIGGS_TTS_MAX_RUNNING_REQUESTS": "12",
-                "HIGGS_TTS_WORK_CONCURRENCY": "10",
             },
             clear=True,
         ):
@@ -59,7 +57,6 @@ class InfrastructureTests(unittest.TestCase):
         try:
             self.assertEqual(budget.index_tts_requests, 8)
             self.assertEqual(budget.translation_tts_requests, 8)
-            self.assertEqual(budget.higgs_workers, 10)
         finally:
             budget.shutdown()
 

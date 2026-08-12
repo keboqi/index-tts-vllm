@@ -5,31 +5,6 @@
         const ttsForm = document.getElementById('ttsForm');
         const generateBtn = document.getElementById('generateBtn');
         const generateBtnDefaultHtml = generateBtn ? generateBtn.innerHTML : '';
-        const synthesisTextInput = document.getElementById('text');
-        const copyHiggsEnhancePromptBtn = document.getElementById('copyHiggsEnhancePromptBtn');
-        const generateHiggsEnhancedBtn = document.getElementById('generateHiggsEnhancedBtn');
-        const useHiggsEnhancedBtn = document.getElementById('useHiggsEnhancedBtn');
-        const higgsEnhancedText = document.getElementById('higgsEnhancedText');
-        const toggleHiggsEnhancerBtn = document.getElementById('toggleHiggsEnhancerBtn');
-        if (synthesisTextInput) {
-            synthesisTextInput.addEventListener('input', updateHiggsEnhancePromptPreview);
-        }
-        if (toggleHiggsEnhancerBtn) {
-            toggleHiggsEnhancerBtn.addEventListener('click', toggleHiggsEnhancer);
-        }
-        if (copyHiggsEnhancePromptBtn) {
-            copyHiggsEnhancePromptBtn.addEventListener('click', copyHiggsEnhancePrompt);
-        }
-        if (generateHiggsEnhancedBtn) {
-            generateHiggsEnhancedBtn.addEventListener('click', generateHiggsEnhancedText);
-        }
-        if (useHiggsEnhancedBtn) {
-            useHiggsEnhancedBtn.addEventListener('click', useHiggsEnhancedText);
-        }
-        if (higgsEnhancedText) {
-            higgsEnhancedText.addEventListener('input', updateHiggsEnhancePromptPreview);
-        }
-        updateHiggsEnhancePromptPreview();
         if (ttsForm) {
             ttsForm.addEventListener('submit', async function (e) {
                 e.preventDefault();

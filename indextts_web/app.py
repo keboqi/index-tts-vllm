@@ -18,13 +18,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_ROOT = PROJECT_ROOT / "static"
 
 
-def load_legacy_module() -> ModuleType:
-    """Load the current production implementation only during app assembly."""
-    return import_module("legacy_fastapi_webui_v2")
+def load_production_module() -> ModuleType:
+    """Load the production implementation only during app assembly."""
+    return import_module("fastapi_webui_v2_impl")
 
 
 def create_app(*, legacy: ModuleType | None = None) -> FastAPI:
-    production = load_legacy_module() if legacy is None else legacy
+    production = load_production_module() if legacy is None else legacy
     runtime = RuntimeContainer.from_legacy(production)
 
     @asynccontextmanager

@@ -7,7 +7,7 @@ import ast
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SOURCE = ROOT / "legacy_fastapi_webui_v2.py"
+SOURCE = ROOT / "fastapi_webui_v2_impl.py"
 
 REPLACEMENTS = {
     "_parse_srt_timestamp_to_ms": "return parse_subtitle_timestamp(timestamp)",

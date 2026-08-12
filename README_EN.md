@@ -23,7 +23,7 @@ is organized under `indextts_web/`. See [ARCHITECTURE.md](ARCHITECTURE.md) for
 the router, service, backend, translation, and frontend boundaries. Older
 launchers are cataloged in [LEGACY_ENTRYPOINTS.md](LEGACY_ENTRYPOINTS.md).
 
-`Confucius4-TTS` and `Higgs Audio SGLang` are optional and lazy-loaded. The default TTS backend remains IndexTTS; when the UI or API selects `tts_backend=confucius` or `tts_backend=higgs`, `fastapi_webui_v2.py` starts and manages the selected external TTS service on demand. Default local ports are WebUI `8000`, Confucius `8001`, and Higgs SGLang `8002`. The WebUI automatically uses the streaming transport for these external backends so cold starts can emit keepalive frames through Cloudflare/local tunnels instead of timing out silently.
+`IndexTTS 2.5 vLLM-Omni` and `Confucius4-TTS` are optional, lazy-loaded backends. The default remains IndexTTS 2.0. Selecting `tts_backend=index25` starts the tested vLLM-Omni pipeline in its own Python 3.11 environment on port `8092`; selecting `confucius` starts Confucius on port `8001`. External backends use keepalive streaming frames during cold starts. On a shared GPU, the application sleeps the 2.0/Confucius vLLM engines before starting 2.5 and stops the 2.5 server before another backend is woken.
 
 ```bash
 npx localtunnel --port 8000
@@ -176,19 +176,16 @@ python fastapi_webui_v2.py [OPTIONS]
 - `--use_torch_compile` (flag): Enable `torch.compile` for faster BF16 model execution on supported CUDA GPUs.
 - `--gpu_memory_utilization` (float): IndexTTS2 vLLM GPU memory utilization limit (default: `0.15`).
 - `--qwenemo_gpu_memory_utilization` (float): QwenEmotion vLLM GPU memory utilization limit (default: `0.05`).
-- `--tts_backend` (`index`, `confucius`, or `higgs`): Default synthesis backend. The server default is `index`.
+- `--tts_backend` (`index`, `index25`, or `confucius`): Default synthesis backend. The server default is `index`.
 - `--confucius_repo_dir` (string): Path to a sibling `Confucius4-TTS` checkout used for lazy startup (default: `../Confucius4-TTS`).
 - `--confucius_host` / `--confucius_port`: Host and port for the managed Confucius FastAPI backend (default: `127.0.0.1:8001`).
 - `--confucius_start_command` (string): Optional custom command for starting Confucius instead of the built-in launcher.
 - `--confucius_start_timeout` / `--confucius_request_timeout`: Startup and synthesis request timeouts in seconds (defaults: `1800` / `900`).
-- `--higgs_server_url`: URL for the managed or external Higgs SGLang endpoint (default: `http://127.0.0.1:8002`).
-- `--higgs_manager_script`: Docker manager script copied into this repo from `higgs_tts_gradio` (default: `sglang_omni_higgs.sh`).
-- `--higgs_manage_backend` / `--no-higgs_manage_backend`: Start/stop Higgs SGLang lazily from the WebUI, or require a manually managed endpoint.
-- `--higgs_start_timeout` / `--higgs_request_timeout`: Startup and synthesis request timeouts in seconds (defaults: `3600` / `1800`).
-- `--higgs_max_running_requests`: Managed SGLang `max_running_requests` (default: `100`; lower this if your GPU starts queueing or OOMing).
-- `--higgs_dtype`: Managed SGLang dtype (default: `bfloat16`).
-- `--higgs_initial_codec_chunk_frames`: Initial Higgs streaming window size in codec frames (default: `1` for lower first-audio latency).
-- `HIGGS_REFERENCE_DATA_URL_CACHE_SIZE` (env): Number of local Higgs reference-audio data URLs to cache before sending requests to SGLang (default: `256`).
+- `--indextts25_repo_dir`: Path to the sibling `index-tts-2.5-vllm-omni-experiment` checkout.
+- `--indextts25_model_dir` / `--indextts25_data_dir`: Optional model and persistent runtime/cache paths. The launcher defaults to the experiment repository's `models/IndexTTS-2.5` and `runtime/indextts25` directories.
+- `--indextts25_host` / `--indextts25_port`: Managed vLLM-Omni API address (default: `127.0.0.1:8092`).
+- `--indextts25_start_command`: Optional pre-provisioned/remote launch command. Without it, the manager calls the experiment's API-only launcher, which creates `.venv-indextts25` with Python 3.11.
+- `--indextts25_start_timeout` / `--indextts25_request_timeout`: Cold-start and synthesis timeouts (defaults: `3600` / `900`). The cold-start window includes first-time environment and model setup.
 - `EXTERNAL_TTS_STREAM_KEEPALIVE_SECONDS` (env): Heartbeat interval for external-backend stream responses (default: `15`).
 - `--verbose` (flag): Enable verbose logging output in the console.
 
@@ -212,16 +209,19 @@ python fastapi_webui_v2.py \
 
 The Confucius backend supports more target languages for speech generation and translate/edit workflows (`en`, `zh`, `ja`, `ko`, `de`, `fr`, `es`, `id`, `it`, `th`, `pt`, `ru`, `ms`, `vi`). When `tts_backend=confucius`, IndexTTS text-based emotion controls are ignored. Speaker presets are saved after enhancement/trimming so the processed reference audio can be reused as Confucius `prompt_wav`.
 
-### Higgs Audio SGLang Backend
+### IndexTTS 2.5 vLLM-Omni Backend
 
-The Higgs integration reuses `sglang_omni_higgs.sh` from `higgs_tts_gradio`, with defaults adjusted for this WebUI so it uses container name `index-tts-higgs-sglang` and port `8002`. On the first `tts_backend=higgs` request, the WebUI can run:
+Clone the tested integration repository next to this application, then select `IndexTTS 2.5 (vLLM-Omni)` in the UI:
+
 ```bash
-bash sglang_omni_higgs.sh start
+cd ..
+git clone https://github.com/keboqi/indextts-2.5-vllm-omni-experiment.git
+cd index-tts-vllm
+python fastapi_webui_v2.py \
+  --indextts25_repo_dir ../index-tts-2.5-vllm-omni-experiment
 ```
 
-The endpoint is OpenAI-style `/v1/audio/speech` through SGLang Omni. Managed startup defaults to BF16, `max_running_requests=100`, and SGLang Omni's CUDA Graph path. The shared synthesis path used by `/speak`, `/clone_voice`, and the translate/audiobook generation flow caches serialized local reference audio before sending requests to SGLang, so repeated speaker presets avoid repeated file reads/base64 encoding while preserving stable reference bytes for SGLang's own reference/prefix caches. The `/speak_stream` and `/clone_voice_stream` endpoints use Higgs native PCM streaming when no duration post-process or speaker effects are requested, then wrap those PCM chunks in the WebUI's existing `CHUNK` frame format. Requests that need FFmpeg duration matching or speaker effects still use the full-file fallback so post-processing stays exact.
-
-Higgs does not expose native duration control, so translate/edit requests generate speech first and then post-process the WAV with FFmpeg time-stretching plus exact trim/pad matching before segment assembly. The WebUI also has a persistent global Duration Control switch: `Original` keeps IndexTTS/Confucius native duration behavior while Higgs uses FFmpeg, and `Force FFmpeg` makes all backends synthesize without native timing and then use FFmpeg duration matching. API calls can set `duration_control` to `original` or `ffmpeg` (default behavior is `original`). Higgs also does not auto-chunk long text, so the adapter uses the same IndexTTS tokenizer splitting mechanism before sending chunks to SGLang, concatenates the generated WAV chunks, then applies duration matching once to the combined audio. IndexTTS emotion text/weight controls are ignored for Higgs.
+The first `index25` request incrementally creates the isolated Python 3.11 environment, downloads the 2.5 checkpoint and its Wav2Vec2-BERT, CAMPPlus, and BigVGAN dependencies, then starts the OpenAI-compatible vLLM-Omni API. Supported synthesis/translation languages are Chinese, English, Japanese, Spanish, and Arabic. Speaker presets and uploaded references are encoded as cached data URLs; emotion text/audio, sampling overrides, seeded sentence batching, native duration control, exact WAV duration fitting, and streaming keepalives are supported. The model itself is non-streaming, so streaming endpoints emit progress keepalives followed by the completed audio.
 
 ---
 
@@ -255,7 +255,7 @@ Synthesize speech from text using an existing speaker preset.
   - `emotion_weight` (float, optional): Intensity 0.0-1.0 (default: `0.6`).
   - `diffusion_steps` (int, optional): Quality steps (default: `10`).
   - `max_text_tokens_per_sentence` (int, optional): Text split threshold (default: `120`).
-  - `tts_backend` (`index`, `confucius`, or `higgs`, optional): Override the server default backend.
+  - `tts_backend` (`index`, `index25`, or `confucius`, optional): Override the server default backend.
   - `duration_control` (`original` or `ffmpeg`, optional): Force FFmpeg post-process duration matching when set to `ffmpeg`.
   - `language` (string, optional): External backend language code/label; auto-detected when omitted where supported.
 - **Response**: `audio/mpeg` binary audio data (MP3).
@@ -266,7 +266,7 @@ Clone a voice using an uploaded reference audio file (zero-shot synthesis).
   - `text` (string, required): Text to synthesize.
   - `reference_audio_file` (file, required): Audio file containing the target voice.
   - `emotion_text`, `emotion_weight`, `diffusion_steps`, `max_text_tokens_per_sentence`: Optional settings.
-  - `tts_backend` (`index`, `confucius`, or `higgs`, optional): Override the server default backend.
+  - `tts_backend` (`index`, `index25`, or `confucius`, optional): Override the server default backend.
   - `language` (string, optional): External backend language code/label; auto-detected when omitted where supported.
 - **Response**: `audio/mpeg` binary audio data (MP3).
 
@@ -358,7 +358,7 @@ Translate a full speech audio file into another language.
   - `enhancement_model` (string, optional): MossFormer/FRCRN model choice.
   - `super_resolution_voice` (bool, optional): Enable 48kHz upsampling.
   - `merge_backing_track` (bool, optional): Merge backend instrumental track (default: `true`).
-  - `tts_backend` (`index`, `confucius`, or `higgs`, optional): Use IndexTTS, Confucius4-TTS, or Higgs SGLang for generated speech.
+  - `tts_backend` (`index`, `index25`, or `confucius`, optional): Select the synthesis backend.
   - `transcription_pipeline` (string, optional): 'moss_transcribe' (default), 'gemini', 'whisperx', 'qwen_omnivad', or 'parakeet'.
   - `translation_llm_model` (string, optional): Translation LLM.
 - **Response**: `audio/mpeg` binary translated audio with `X-Translation-Segments` headers containing detailed segment metadata.
@@ -374,7 +374,7 @@ Synthesize final translated audio using modified segment metadata and speaker as
   - `session_id` (string, required): Session ID.
   - `segments` (array of objects, required): Edited segments with translation text, timings, and speaker assignments.
   - `speaker_overrides` (object, optional): Map of speaker IDs to presets.
-  - `tts_backend` (`index`, `confucius`, or `higgs`, optional): Override the session/server backend for this generation.
+  - `tts_backend` (`index`, `index25`, or `confucius`, optional): Override the session/server backend for this generation.
 - **Response**: `text/event-stream` SSE progress events, culminating in `complete` with audio output URLs.
 
 #### 4. POST `/api/translate_segment_preview`
@@ -382,7 +382,7 @@ Quickly test-generate a single edited segment.
 - **Request Body (JSON)**:
   - `session_id` (string, required): Session ID.
   - `segment` (object, required): A single segment definition.
-  - `tts_backend` (`index`, `confucius`, or `higgs`, optional): Override the session/server backend for the preview.
+  - `tts_backend` (`index`, `index25`, or `confucius`, optional): Override the session/server backend for the preview.
 - **Response**: JSON containing the temporary preview URL.
 
 #### 5. GET `/api/segment_preview/{session_id}/{segment_index}`

@@ -1,7 +1,7 @@
 # Application architecture
 
 The WebUI/API uses a compatibility-preserving modular shell. Existing HTTP
-contracts remain implemented by `legacy_fastapi_webui_v2.py` while the public
+contracts remain implemented by `fastapi_webui_v2_impl.py` while the public
 entry point, settings, runtime services, routers, and frontend assets live in
 small modules that can be migrated independently.
 
@@ -12,7 +12,7 @@ small modules that can be migrated independently.
 - `indextts_web.main` owns Uvicorn startup.
 - `indextts_web.app.create_app()` assembles the application, feature routers,
   static assets, health endpoint, runtime container, and lifespan.
-- `legacy_fastapi_webui_v2.py` is the compatibility implementation. New code
+- `fastapi_webui_v2_impl.py` is the production compatibility implementation. New code
   should not add endpoints or infrastructure helpers to this file.
 
 Importing `indextts_web`, `indextts_web.config`, or the service contracts does
@@ -33,8 +33,11 @@ unclassified or assigned to multiple feature groups.
 
 `RuntimeContainer` exposes services through `app.state.runtime`.
 
-The TTS registry owns backend selection. IndexTTS, Confucius, and Higgs
-implement one `SynthesisRequest` contract and publish backend capabilities.
+The TTS registry owns backend selection. IndexTTS 2.0, the isolated IndexTTS
+2.5 vLLM-Omni service, and Confucius implement one `SynthesisRequest` contract
+and publish backend capabilities. `index25_manager.py` owns the 2.5 subprocess,
+OpenAI-compatible speech payloads, sentence batching, and WAV assembly without
+importing the vLLM-Omni environment into the WebUI process.
 The production shared synthesis function delegates through this registry.
 
 The translation package defines a stage-oriented `TranslationOrchestrator`, a
@@ -77,7 +80,7 @@ CPU-only checks do not need FastAPI, CUDA, or model checkpoints:
 ```bash
 python -m unittest discover -s tests -v
 ruff check indextts_web tests fastapi_webui_v2.py tools/extract_*.py tools/split_translation_asset.py
-python -m compileall -q indextts_web tests fastapi_webui_v2.py legacy_fastapi_webui_v2.py
+python -m compileall -q indextts_web tests fastapi_webui_v2.py fastapi_webui_v2_impl.py
 ```
 
 Run `node --check` over `static/js/*.js`, then run the GPU smoke suite in the

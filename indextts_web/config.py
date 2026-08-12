@@ -7,7 +7,7 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-TTS_BACKENDS = ("confucius", "higgs", "index")
+TTS_BACKENDS = ("confucius", "index", "index25")
 
 
 def env_flag(environ: Mapping[str, str], name: str, default: bool) -> bool:
@@ -76,20 +76,22 @@ class AppSettings:
     confucius_keepalive_interval: float = 60.0
     confucius_unhealthy_grace: float = 30.0
     confucius_vllm_gpu_memory_utilization: float = 0.15
-    higgs_server_url: str = "http://127.0.0.1:8002"
-    higgs_model: str = "bosonai/higgs-audio-v3-tts-4b"
-    higgs_manage_backend: bool = True
-    higgs_manager_script: str = "sglang_omni_higgs.sh"
-    higgs_start_timeout: float = 3600.0
-    higgs_request_timeout: float = 1800.0
-    higgs_mem_fraction_static: float = 0.30
-    higgs_max_running_requests: int = 100
-    higgs_dtype: str = "bfloat16"
-    higgs_initial_codec_chunk_frames: int = 1
-    higgs_max_new_tokens: int = 4096
-    higgs_temperature: float = 0.8
-    higgs_top_k: int = 50
-    higgs_top_p: float = 0.0
+    indextts25_repo_dir: str = "../index-tts-2.5-vllm-omni-experiment"
+    indextts25_model_dir: str = ""
+    indextts25_data_dir: str = ""
+    indextts25_host: str = "127.0.0.1"
+    indextts25_port: int = 8092
+    indextts25_served_model_name: str = "IndexTeam/IndexTTS-2.5"
+    indextts25_start_command: str = ""
+    indextts25_start_shell: bool = True
+    indextts25_detach_process: bool = True
+    indextts25_attach_stdio: bool = False
+    indextts25_log_dir: str = ""
+    indextts25_start_timeout: float = 3600.0
+    indextts25_request_timeout: float = 900.0
+    indextts25_keepalive_interval: float = 60.0
+    indextts25_unhealthy_grace: float = 30.0
+    indextts25_max_parallel_segments: int = 100
 
     @classmethod
     def from_namespace(cls, namespace: argparse.Namespace) -> AppSettings:
@@ -169,59 +171,63 @@ def build_parser(environ: Mapping[str, str] | None = None) -> argparse.ArgumentP
             maximum=1.0,
         ),
     )
-    parser.add_argument("--higgs_server_url", default=env.get("HIGGS_TTS_SGLANG_URL", "http://127.0.0.1:8002"))
-    parser.add_argument("--higgs_model", default=env.get("HIGGS_TTS_MODEL", "bosonai/higgs-audio-v3-tts-4b"))
     parser.add_argument(
-        "--higgs_manage_backend",
+        "--indextts25_repo_dir",
+        default="../index-tts-2.5-vllm-omni-experiment",
+    )
+    parser.add_argument("--indextts25_model_dir", default=env.get("INDEXTTS25_MODEL_DIR", ""))
+    parser.add_argument("--indextts25_data_dir", default=env.get("INDEXTTS25_DATA_DIR", ""))
+    parser.add_argument("--indextts25_host", default=env.get("INDEXTTS25_HOST", "127.0.0.1"))
+    parser.add_argument(
+        "--indextts25_port",
+        type=int,
+        default=env_int(env, "INDEXTTS25_PORT", 8092, maximum=65535),
+    )
+    parser.add_argument(
+        "--indextts25_served_model_name",
+        default=env.get("INDEXTTS25_SERVED_MODEL_NAME", "IndexTeam/IndexTTS-2.5"),
+    )
+    parser.add_argument("--indextts25_start_command", default="")
+    parser.add_argument(
+        "--indextts25_start_shell",
         action=argparse.BooleanOptionalAction,
-        default=env_flag(env, "HIGGS_TTS_MANAGE_BACKEND", True),
+        default=env_flag(env, "INDEXTTS25_START_SHELL", True),
     )
-    parser.add_argument("--higgs_manager_script", default=env.get("HIGGS_TTS_MANAGER_SCRIPT", "sglang_omni_higgs.sh"))
     parser.add_argument(
-        "--higgs_start_timeout",
+        "--indextts25_detach_process",
+        action=argparse.BooleanOptionalAction,
+        default=env_flag(env, "INDEXTTS25_DETACH_PROCESS", True),
+    )
+    parser.add_argument(
+        "--indextts25_attach_stdio",
+        action=argparse.BooleanOptionalAction,
+        default=env_flag(env, "INDEXTTS25_ATTACH_STDIO", False),
+    )
+    parser.add_argument("--indextts25_log_dir", default=env.get("INDEXTTS25_LOG_DIR", ""))
+    parser.add_argument(
+        "--indextts25_start_timeout",
         type=float,
-        default=env_float(env, "HIGGS_TTS_START_TIMEOUT", 3600.0, minimum=1.0),
+        default=env_float(env, "INDEXTTS25_START_TIMEOUT", 3600.0, minimum=1.0),
     )
     parser.add_argument(
-        "--higgs_request_timeout",
+        "--indextts25_request_timeout",
         type=float,
-        default=env_float(env, "HIGGS_TTS_REQUEST_TIMEOUT", 1800.0, minimum=1.0),
+        default=env_float(env, "INDEXTTS25_REQUEST_TIMEOUT", 900.0, minimum=1.0),
     )
     parser.add_argument(
-        "--higgs_mem_fraction_static",
+        "--indextts25_keepalive_interval",
         type=float,
-        default=env_float(env, "HIGGS_TTS_MEM_FRACTION_STATIC", 0.30, minimum=0.01, maximum=1.0),
+        default=env_float(env, "INDEXTTS25_KEEPALIVE_INTERVAL", 60.0, minimum=0.0),
     )
     parser.add_argument(
-        "--higgs_max_running_requests",
+        "--indextts25_unhealthy_grace",
+        type=float,
+        default=env_float(env, "INDEXTTS25_UNHEALTHY_GRACE", 30.0, minimum=1.0),
+    )
+    parser.add_argument(
+        "--indextts25_max_parallel_segments",
         type=int,
-        default=env_int(env, "HIGGS_TTS_MAX_RUNNING_REQUESTS", 100, minimum=1, maximum=256),
-    )
-    parser.add_argument("--higgs_dtype", default=env.get("HIGGS_TTS_DTYPE", "bfloat16"))
-    parser.add_argument(
-        "--higgs_initial_codec_chunk_frames",
-        type=int,
-        default=env_int(env, "HIGGS_TTS_INITIAL_CODEC_CHUNK_FRAMES", 1, minimum=0, maximum=75),
-    )
-    parser.add_argument(
-        "--higgs_max_new_tokens",
-        type=int,
-        default=env_int(env, "HIGGS_TTS_MAX_NEW_TOKENS", 4096, minimum=1),
-    )
-    parser.add_argument(
-        "--higgs_temperature",
-        type=float,
-        default=env_float(env, "HIGGS_TTS_TEMPERATURE", 0.8, minimum=0.0),
-    )
-    parser.add_argument(
-        "--higgs_top_k",
-        type=int,
-        default=env_int(env, "HIGGS_TTS_TOP_K", 50, minimum=0),
-    )
-    parser.add_argument(
-        "--higgs_top_p",
-        type=float,
-        default=env_float(env, "HIGGS_TTS_TOP_P", 0.0, minimum=0.0, maximum=1.0),
+        default=env_int(env, "INDEXTTS25_MAX_PARALLEL_SEGMENTS", 100, maximum=256),
     )
     return parser
 

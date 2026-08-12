@@ -18,18 +18,19 @@ class ConfigTests(unittest.TestCase):
                 "--port",
                 "9000",
                 "--tts_backend",
-                "higgs",
-                "--higgs_top_k",
-                "12",
-                "--no-higgs_manage_backend",
+                "confucius",
+                "--confucius_port",
+                "8124",
+                "--indextts25_port",
+                "8125",
             ],
             environ={},
         )
         self.assertIsInstance(settings, AppSettings)
         self.assertEqual(settings.port, 9000)
-        self.assertEqual(settings.tts_backend, "higgs")
-        self.assertEqual(settings.higgs_top_k, 12)
-        self.assertFalse(settings.higgs_manage_backend)
+        self.assertEqual(settings.tts_backend, "confucius")
+        self.assertEqual(settings.confucius_port, 8124)
+        self.assertEqual(settings.indextts25_port, 8125)
 
     def test_unknown_args_can_be_ignored_by_embedding_hosts(self):
         settings = load_settings(["--port", "8123", "--host-owned-flag"], allow_unknown=True)
@@ -38,4 +39,3 @@ class ConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

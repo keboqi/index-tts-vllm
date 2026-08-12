@@ -68,7 +68,7 @@ async function handleRegularRequest(text, speaker, emotionText, emotionWeight, d
                         `;
                 // Show enhanced status message with emotion info
                 let statusMessage = `Speech generated in ${duration}s! 🚀`;
-                if (ttsBackend === 'index' && emotionText && emotionText.trim()) {
+                if ((ttsBackend === 'index' || ttsBackend === 'index25') && emotionText && emotionText.trim()) {
                     statusMessage += ` 😊 Emotion: "${emotionText}" (${emotionWeight})`;
                 }
                 statusMessage += formatSpeakerEffectsStatus(speakerEffects);
@@ -371,7 +371,7 @@ async function handleRegularRequest(text, speaker, emotionText, emotionWeight, d
                             `;
 
                             let statusMessage = `✅ Streaming complete! First chunk: ${firstChunkDuration}s, Total: ${totalGenTime}s (${chunkCount} chunks)`;
-                            if (ttsBackend === 'index' && emotionText && emotionText.trim()) {
+                            if ((ttsBackend === 'index' || ttsBackend === 'index25') && emotionText && emotionText.trim()) {
                                 statusMessage += ` 😊 Emotion: "${emotionText}" (${emotionWeight})`;
                             }
                             statusMessage += formatSpeakerEffectsStatus(speakerEffects);
