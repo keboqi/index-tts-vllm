@@ -28,6 +28,12 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
+# Do not auto-import unrelated third-party vLLM plugins installed in this
+# shared environment. In particular, NeMo registers ``nemo_speechlm``, whose
+# optional dependency chain includes ``peft``. IndexTTS registers its model
+# directly and does not need any vLLM plugin. Respect an explicit allowlist.
+os.environ.setdefault("VLLM_PLUGINS", "")
+
 # Patch transformers to fix 'dict' object has no attribute 'model_type' error
 # This must be done before vLLM imports its tokenizer
 def _apply_transformers_config_patch():

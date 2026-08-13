@@ -1,4 +1,13 @@
 
+import os
+
+# vLLM loads every discovered third-party plugin when VLLM_PLUGINS is unset.
+# NeMo's optional ``nemo_speechlm`` plugin is unrelated to IndexTTS and may
+# import optional packages (for example ``peft``) that are intentionally not
+# installed in this environment.  An empty allowlist disables auto-loading;
+# callers that genuinely need a plugin can still set VLLM_PLUGINS explicitly.
+os.environ.setdefault("VLLM_PLUGINS", "")
+
 import torch
 import time
 from typing import Any, List, Optional, Tuple, Union
