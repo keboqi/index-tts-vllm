@@ -1,3 +1,4 @@
+import asyncio
 import io
 import tempfile
 import unittest
@@ -95,6 +96,37 @@ class IndexTTS25ManagerTests(unittest.TestCase):
         self.assertEqual(ManagedIndexTTS25Backend.resolve_language("auto", "こんにちは"), "ja")
         with self.assertRaisesRegex(ValueError, "unsupported IndexTTS 2.5 language"):
             ManagedIndexTTS25Backend.resolve_language("French", "bonjour")
+
+    def test_sleep_and_wake_use_omni_stages_without_stopping_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            calls = []
+
+            async def healthy(timeout=1.0):
+                del timeout
+                return {"model_loaded": True}
+
+            def post(path, payload, timeout):
+                calls.append((path, payload, timeout))
+                return {"status": "SUCCESS"}
+
+            manager.health = healthy
+            manager._post_json_sync = post
+            asyncio.run(manager.sleep_vllm())
+            self.assertTrue(manager._vllm_sleeping)
+            self.assertEqual(calls[0][0], "/v1/omni/sleep")
+            self.assertEqual(calls[0][1], {"stage_ids": [0, 1], "level": 1})
+
+            asyncio.run(manager.wake_vllm())
+            self.assertFalse(manager._vllm_sleeping)
+            self.assertEqual(calls[1][0], "/v1/omni/wakeup")
+            self.assertEqual(calls[1][1], {"stage_ids": [0, 1]})
+
+    def test_non_wakeable_level_two_sleep_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self.manager(directory)
+            with self.assertRaisesRegex(ValueError, "level 1"):
+                asyncio.run(manager.sleep_vllm(level=2))
 
 
 if __name__ == "__main__":

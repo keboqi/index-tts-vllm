@@ -215,6 +215,7 @@ class ManagedIndexTTS25Backend:
         self._last_exit_at: float | None = None
         self._last_start_command: list[str] = []
         self._active_requests = 0
+        self._vllm_sleeping = False
         self._lock = asyncio.Lock()
         self._segment_slots = asyncio.Semaphore(max(1, settings.indextts25_max_parallel_segments))
 
@@ -376,6 +377,7 @@ class ManagedIndexTTS25Backend:
         self._started_at = time.monotonic()
         self._last_exit_code = None
         self._last_exit_at = None
+        self._vllm_sleeping = False
         print(f"[IndexTTS 2.5] Lazy-started vLLM-Omni on {self.base_url}; log: {self._log_path}")
 
     def _stop_sync(self, reason: str, force: bool = False) -> None:
@@ -399,7 +401,26 @@ class ManagedIndexTTS25Backend:
         self._started_at = None
         self._last_health = None
         self._last_ready_at = None
+        self._vllm_sleeping = False
         self._close_log_handle()
+
+    def _post_json_sync(self, path: str, payload: Mapping[str, Any], timeout: float) -> dict[str, Any]:
+        data = json.dumps(dict(payload)).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=data,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"IndexTTS 2.5 vLLM-Omni HTTP {exc.code}: {detail}") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError(f"IndexTTS 2.5 vLLM-Omni returned invalid JSON from {path}")
+        return result
 
     def _health_sync(self, timeout: float) -> dict[str, Any] | None:
         try:
@@ -433,6 +454,10 @@ class ManagedIndexTTS25Backend:
             self._want_running = True
             health = await self.health(1.0)
             if health and health.get("model_loaded"):
+                if self._vllm_sleeping:
+                    if self.prepare_gpu is not None:
+                        await self.prepare_gpu()
+                    await self._wake_locked()
                 return health
             if health is not None and not self.process_running():
                 raise RuntimeError(
@@ -465,6 +490,49 @@ class ManagedIndexTTS25Backend:
         async with self._lock:
             self._want_running = False
             await asyncio.to_thread(self._stop_sync, reason, False)
+
+    async def _wake_locked(self) -> None:
+        if not self._vllm_sleeping:
+            return
+        result = await asyncio.to_thread(
+            self._post_json_sync,
+            "/v1/omni/wakeup",
+            {"stage_ids": [0, 1]},
+            max(30.0, float(self.settings.indextts25_start_timeout)),
+        )
+        if result.get("status") not in {"SUCCESS", "SKIPPED"}:
+            raise RuntimeError(f"IndexTTS 2.5 wake failed: {result}")
+        self._vllm_sleeping = False
+        print("[IndexTTS 2.5] Woke vLLM-Omni stages without restarting the process.")
+
+    async def sleep_vllm(self, level: int = 1) -> None:
+        """Offload both Omni stages while retaining the server process."""
+        if level != 1:
+            raise ValueError("IndexTTS 2.5 supports wakeable sleep only at level 1")
+        async with self._lock:
+            if self._vllm_sleeping:
+                return
+            if self._active_requests > 0:
+                raise RuntimeError("IndexTTS 2.5 has active requests and cannot sleep yet")
+            health = await self.health(1.0)
+            if not health or not health.get("model_loaded"):
+                if self.process_running():
+                    raise RuntimeError("IndexTTS 2.5 is running but is not healthy enough to sleep")
+                return
+            result = await asyncio.to_thread(
+                self._post_json_sync,
+                "/v1/omni/sleep",
+                {"stage_ids": [0, 1], "level": 1},
+                30.0,
+            )
+            if result.get("status") != "SUCCESS":
+                raise RuntimeError(f"IndexTTS 2.5 sleep failed: {result}")
+            self._vllm_sleeping = True
+            print("[IndexTTS 2.5] Slept vLLM-Omni stages without stopping the process.")
+
+    async def wake_vllm(self) -> None:
+        """Restore both Omni stages without rebuilding the server process."""
+        await self.ensure_ready()
 
     @staticmethod
     def resolve_language(language: str | None, text: str) -> str:
@@ -635,6 +703,7 @@ class ManagedIndexTTS25Backend:
             "managed_pid": self._process.pid if self.process_running() else None,
             "managed_process_running": self.process_running(),
             "healthy": bool(health and health.get("model_loaded")),
+            "vllm_sleeping": self._vllm_sleeping,
             "health": health,
             "active_requests": self._active_requests,
             "max_parallel_segments": self.settings.indextts25_max_parallel_segments,

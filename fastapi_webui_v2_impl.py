@@ -3756,7 +3756,7 @@ def _loaded_model_inventory() -> List[Dict[str, Any]]:
             "key": "indextts25_omni",
             "name": "IndexTTS 2.5 vLLM-Omni",
             "kind": "TTS Backend",
-            "state": "loaded",
+            "state": "sleeping" if indextts25_backend_manager._vllm_sleeping else "loaded",
         })
     for key in stable_audio3_manager.status().get("loaded_models", []):
         models.append({"key": f"stable_audio:{key}", "name": f"Stable Audio 3 ({key})", "kind": "Stable Audio", "state": "loaded"})
@@ -4287,7 +4287,7 @@ class ManagedConfuciusBackend:
     async def ensure_ready(self) -> Dict[str, Any]:
         omni_manager = globals().get("indextts25_backend_manager")
         if omni_manager is not None and omni_manager.process_running():
-            await omni_manager.stop("switching to Confucius4-TTS")
+            await omni_manager.sleep_vllm()
         async with self._lock:
             self._want_running = True
             health = await self.health(timeout=1.0)
@@ -11349,7 +11349,7 @@ class TTSManager:
     async def ensure_awake(self) -> None:
         """Wake any manually slept vLLM engines before IndexTTS inference."""
         if indextts25_backend_manager.process_running():
-            await indextts25_backend_manager.stop("switching to IndexTTS 2.0")
+            await indextts25_backend_manager.sleep_vllm()
         if not (self._indextts_vllm_sleeping or self._emotion_vllm_sleeping):
             return
         tts = self.get_tts()
@@ -12903,7 +12903,7 @@ async def api_models_unload(request: Request):
             await confucius_backend_manager.sleep_vllm()
             removed.append("confucius_vllm")
         if model_key in {"all", "indextts25_omni"} and indextts25_backend_manager.process_running():
-            await indextts25_backend_manager.stop("model manager unload")
+            await indextts25_backend_manager.sleep_vllm()
             removed.append("indextts25_omni")
         if model_key == "all" or model_key not in {
             "indextts_vllm", "emotion_vllm", "confucius_vllm", "indextts25_omni"
@@ -12935,7 +12935,7 @@ async def api_models_wake(request: Request):
         elif model_key == "confucius_vllm":
             await confucius_backend_manager.wake_vllm()
         elif model_key == "indextts25_omni":
-            await indextts25_backend_manager.ensure_ready()
+            await indextts25_backend_manager.wake_vllm()
     return JSONResponse(
         content={
             "status": "success",
