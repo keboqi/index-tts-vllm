@@ -27,7 +27,9 @@ from indextts_web.config import AppSettings
 
 INDEXTTS25_BACKEND = "index25"
 INDEXTTS25_LANGUAGES = ("zh", "en", "ja", "es", "ar")
+INDEXTTS25_MODEL_HOP_LENGTH = 256
 _TEXT_BOUNDARY = re.compile(r"(?<=[.!?。！？；;])\s*")
+_TEXT_TOKEN_UNIT = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9]+|[^\s]")
 _LANGUAGE_ALIASES = {
     "arabic": "ar",
     "ar": "ar",
@@ -67,6 +69,23 @@ def audio_reference(value: str, *, use_cache: bool = True) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
+def text_token_units(text: str) -> int:
+    """Estimate token weight without loading the backend tokenizer."""
+    units = 0
+    for match in _TEXT_TOKEN_UNIT.finditer(text):
+        token = match.group(0)
+        if token.isascii() and token.isalnum():
+            units += max(1, (len(token) + 3) // 4)
+        else:
+            units += 1
+    return max(1, units) if text.strip() else 0
+
+
+def _join_text_pieces(left: str, right: str) -> str:
+    separator = " " if left[-1:].isascii() and right[:1].isascii() else ""
+    return f"{left}{separator}{right}"
+
+
 def split_text(text: str, max_tokens: int) -> list[str]:
     value = text.strip()
     if not value:
@@ -84,7 +103,17 @@ def split_text(text: str, max_tokens: int) -> list[str]:
                 " ".join(words[index : index + max_tokens])
                 for index in range(0, len(words), max_tokens)
             )
-    return result
+    # Match IndexTTS 2.0: merge adjacent short sentences so clause startup
+    # cadence and punctuation pauses do not consume separate hard budgets.
+    merged: list[str] = []
+    for piece in result:
+        if merged:
+            candidate = _join_text_pieces(merged[-1], piece)
+            if text_token_units(candidate) <= max_tokens:
+                merged[-1] = candidate
+                continue
+        merged.append(piece)
+    return merged
 
 
 def allocate_durations(texts: list[str], total_ms: int, silence_ms: int) -> list[int]:
@@ -95,7 +124,10 @@ def allocate_durations(texts: list[str], total_ms: int, silence_ms: int) -> list
     available = total_ms - max(0, len(texts) - 1) * silence_ms
     if available < len(texts):
         raise ValueError("target duration is shorter than requested inter-sentence silence")
-    weights = [max(1, len(text)) for text in texts]
+    # IndexTTS 2.0 distributes duration by tokenizer length. This lightweight
+    # estimate avoids character-count bias before the remote 2.5 tokenizer
+    # performs the authoritative tokenization.
+    weights = [text_token_units(text) for text in texts]
     weight_sum = sum(weights)
     durations = [max(1, round(available * weight / weight_sum)) for weight in weights]
     durations[-1] += available - sum(durations)
@@ -127,7 +159,12 @@ def join_wav(chunks: list[bytes], silence_ms: int = 0) -> bytes:
     return output.getvalue()
 
 
-def fit_wav_duration(wav_bytes: bytes, target_ms: int) -> bytes:
+def fit_wav_duration(
+    wav_bytes: bytes,
+    target_ms: int,
+    *,
+    max_adjustment_frames: int | None = None,
+) -> bytes:
     source_io = io.BytesIO(wav_bytes)
     output = io.BytesIO()
     with wave.open(source_io, "rb") as source:
@@ -135,6 +172,13 @@ def fit_wav_duration(wav_bytes: bytes, target_ms: int) -> bytes:
         raw = source.readframes(source.getnframes())
     frame_width = params.nchannels * params.sampwidth
     target_frames = round(params.framerate * target_ms / 1000)
+    actual_frames = len(raw) // frame_width
+    if max_adjustment_frames is not None and abs(actual_frames - target_frames) > max_adjustment_frames:
+        raise ValueError(
+            "IndexTTS 2.5 native duration mismatch exceeds one model hop: "
+            f"actual_frames={actual_frames}, target_frames={target_frames}, "
+            f"allowed_frames={max_adjustment_frames}"
+        )
     target_bytes = target_frames * frame_width
     fitted = raw[:target_bytes].ljust(target_bytes, b"\x00")
     with wave.open(output, "wb") as target:
@@ -563,7 +607,16 @@ class ManagedIndexTTS25Backend:
             self._active_requests = max(0, self._active_requests - 1)
         audio = join_wav(chunks, max(0, int(interval_silence)))
         if speech_length > 0:
-            audio = fit_wav_duration(audio, int(speech_length))
+            try:
+                # S2Mel duration is quantized to a 256-sample hop. Correct only
+                # that rounding residue; never crop substantive speech.
+                audio = fit_wav_duration(
+                    audio,
+                    int(speech_length),
+                    max_adjustment_frames=INDEXTTS25_MODEL_HOP_LENGTH,
+                )
+            except ValueError as exc:
+                print(f"[IndexTTS 2.5] Keeping complete native audio: {exc}")
         output = Path(output_path)
         await asyncio.to_thread(output.parent.mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread(output.write_bytes, audio)

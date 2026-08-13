@@ -6,6 +6,7 @@ from pathlib import Path
 
 from indextts_web.config import AppSettings
 from indextts_web.services.tts.index25_manager import (
+    INDEXTTS25_MODEL_HOP_LENGTH,
     ManagedIndexTTS25Backend,
     allocate_durations,
     fit_wav_duration,
@@ -40,12 +41,28 @@ class IndexTTS25ManagerTests(unittest.TestCase):
     def test_split_duration_and_exact_wav_contract(self):
         texts = split_text("One. Two words! Three.", 120)
         durations = allocate_durations(texts, 1800, 100)
-        self.assertEqual(texts, ["One.", "Two words!", "Three."])
-        self.assertEqual(sum(durations) + 200, 1800)
+        self.assertEqual(texts, ["One. Two words! Three."])
+        self.assertEqual(sum(durations), 1800)
         joined = join_wav([wav_bytes(), wav_bytes()], 100)
         fitted = fit_wav_duration(joined, 250)
         with wave.open(io.BytesIO(fitted), "rb") as source:
             self.assertEqual(source.getnframes(), round(22050 * 0.25))
+
+    def test_split_merges_short_chinese_clauses_like_v2(self):
+        text = "去海外后，人们几乎都是外国人；因为他们本身就是外国人，所以可能会按照对方的方式来改变自己。"
+        self.assertEqual(split_text(text, 120), [text])
+
+    def test_duration_allocation_uses_token_weight_not_raw_characters(self):
+        durations = allocate_durations(["internationalization", "你好"], 1200, 0)
+        self.assertEqual(durations, [857, 343])
+
+    def test_bounded_wav_fit_rejects_substantive_crop(self):
+        with self.assertRaisesRegex(ValueError, "exceeds one model hop"):
+            fit_wav_duration(
+                wav_bytes(frames=2205),
+                50,
+                max_adjustment_frames=INDEXTTS25_MODEL_HOP_LENGTH,
+            )
 
     def test_payload_matches_vllm_omni_speech_contract(self):
         with tempfile.TemporaryDirectory() as directory:
