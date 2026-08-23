@@ -32,11 +32,15 @@ CONFUCIUS_CAMPPLUS_REPO_ID = "funasr/campplus"
 CONFUCIUS_CAMPPLUS_FILENAME = "campplus_cn_common.bin"
 CONFUCIUS_FASTAPI_CONFIG = "config/inference_config.modal.yaml"
 INDEXTTS25_REPO_URL = "https://github.com/keboqi/indextts-2.5-vllm-omni-experiment.git"
+# Pin the backend checkout so Modal's image cache is invalidated deliberately
+# whenever the tested IndexTTS 2.5 integration revision changes.
+INDEXTTS25_REPO_REF = "0a7d9aaeb9a0516c124669966aeed907e29b811d"
 INDEXTTS25_IMAGE_DIR = "/app/index-tts-2.5-vllm-omni-experiment"
 INDEXTTS25_APP_SUBDIR = "index-tts-2.5-vllm-omni-experiment"
 INDEXTTS25_VENV_DIR = "/opt/indextts25-venv"
 INDEXTTS25_PYTHON = f"{INDEXTTS25_VENV_DIR}/bin/python"
 INDEXTTS25_VLLM = f"{INDEXTTS25_VENV_DIR}/bin/vllm"
+INDEXTTS25_TORCH_BACKEND = "cu130"
 INDEXTTS25_MODEL_REPO_ID = "IndexTeam/IndexTTS-2.5"
 INDEXTTS25_W2V_REPO_ID = "facebook/w2v-bert-2.0"
 INDEXTTS25_CAMPPLUS_REPO_ID = "funasr/campplus"
@@ -134,9 +138,14 @@ image = (
     .run_commands(
         "pip install uv",
         f"git clone {INDEXTTS25_REPO_URL} {INDEXTTS25_IMAGE_DIR}",
+        f"git -C {INDEXTTS25_IMAGE_DIR} fetch origin {INDEXTTS25_REPO_REF}",
+        f"git -C {INDEXTTS25_IMAGE_DIR} checkout --detach {INDEXTTS25_REPO_REF}",
         "uv python install 3.11",
         f"uv venv --python 3.11 --seed {INDEXTTS25_VENV_DIR}",
-        f"uv pip install --python {INDEXTTS25_PYTHON} 'vllm==0.27.0' --torch-backend=auto",
+        # Image builders have no GPU, so auto detection installs CPU-only
+        # PyTorch. Select the CUDA wheel explicitly for the CUDA 13 image.
+        f"uv pip install --python {INDEXTTS25_PYTHON} 'vllm==0.27.0' "
+        f"--torch-backend={INDEXTTS25_TORCH_BACKEND}",
         f"uv pip install --python {INDEXTTS25_PYTHON} -e '{INDEXTTS25_IMAGE_DIR}[indextts2]'",
         f"uv pip install --python {INDEXTTS25_PYTHON} -e "
         f"'{INDEXTTS25_IMAGE_DIR}/experiments/indextts25_backend_compat'",
@@ -144,8 +153,14 @@ image = (
         f"{INDEXTTS25_PYTHON} "
         f"{INDEXTTS25_IMAGE_DIR}/experiments/indextts25_backend_compat/src/"
         "indextts25_compat/patch_flashinfer.py",
-        f"{INDEXTTS25_PYTHON} -c \"import flashinfer.comm; "
-        "print('IndexTTS 2.5 FlashInfer compatibility check passed')\"",
+        # Importing flashinfer initializes CUDA and cannot run in Modal's
+        # GPU-less image builder. The patcher above validates its target; here
+        # verify that the installed Torch wheel has CUDA support without
+        # initializing a CUDA device.
+        f"{INDEXTTS25_PYTHON} -c \"import importlib.metadata, torch; "
+        "assert torch.version.cuda, 'IndexTTS 2.5 installed CPU-only Torch'; "
+        "print('IndexTTS 2.5 CUDA Torch:', torch.version.cuda, "
+        "'FlashInfer:', importlib.metadata.version('flashinfer-python'))\"",
     )
     .run_commands(
         # The PyPI stable-audio-tools wheel is too old for Stable Audio 3
@@ -391,11 +406,23 @@ def prepare_model():
         print(f"Confucius4-TTS already exists in persistent storage: {confucius_persistent_path}")
 
     print(f"Synchronizing IndexTTS 2.5 vLLM-Omni code: {indextts25_persistent_path}")
+
+    def ignore_indextts25_runtime_artifacts(directory: str, names: List[str]) -> set[str]:
+        """Exclude generated data without dropping nested source packages named models."""
+        ignored = {"__pycache__"}.intersection(names)
+        if Path(directory).resolve() == indextts25_source_path.resolve():
+            ignored.update(
+                name
+                for name in (".venv-indextts25", "models", "runtime")
+                if name in names
+            )
+        return ignored
+
     shutil.copytree(
         indextts25_source_path,
         indextts25_persistent_path,
         dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns(".venv-indextts25", "models", "runtime", "__pycache__"),
+        ignore=ignore_indextts25_runtime_artifacts,
     )
 
     # Step 2: Update the application with latest code from git (force override local changes)
@@ -666,6 +693,7 @@ print("HY-MT translation model download completed: " + hy_mt_target)
             "qwen0.6bemo4-merge/model.safetensors",
             "w2v-bert-2.0/config.json",
             "w2v-bert-2.0/model.safetensors",
+            "w2v-bert-2.0/preprocessor_config.json",
             "campplus_cn_common.bin",
             "bigvgan/config.json",
             "bigvgan/bigvgan_generator.pt",
@@ -1421,6 +1449,7 @@ def _build_indextts25_start_command(indextts25_repo_path: Path) -> str:
         "--served-model-name",
         INDEXTTS25_MODEL_REPO_ID,
         "--trust-remote-code",
+        "--enable-sleep-mode",
         "--log-stats",
         "--deploy-config",
         str(deploy_config),
@@ -1636,6 +1665,9 @@ def _configure_persistent_runtime():
     required_indextts25_paths = {
         "repo": indextts25_repo_path,
         "deploy_config": indextts25_repo_path / "vllm_omni" / "deploy" / "indextts2_5.yaml",
+        "omni_model_package": (
+            indextts25_repo_path / "vllm_omni" / "model_executor" / "models" / "__init__.py"
+        ),
         "venv_python": Path(INDEXTTS25_PYTHON),
         "vllm": Path(INDEXTTS25_VLLM),
         "config": indextts25_model_path / "config.yaml",
@@ -1643,6 +1675,9 @@ def _configure_persistent_runtime():
         "codec": indextts25_model_path / "codec.pth",
         "s2mel": indextts25_model_path / "s2mel.pth",
         "wav2vec": indextts25_model_path / "w2v-bert-2.0" / "model.safetensors",
+        "wav2vec_preprocessor": (
+            indextts25_model_path / "w2v-bert-2.0" / "preprocessor_config.json"
+        ),
         "campplus": indextts25_model_path / "campplus_cn_common.bin",
         "bigvgan": indextts25_model_path / "bigvgan" / "bigvgan_generator.pt",
     }
