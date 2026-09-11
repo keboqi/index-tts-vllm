@@ -241,6 +241,7 @@ class IndexTTS2:
             }
             if _vllm_sleep_mode_enabled():
                 engine_kwargs["enable_sleep_mode"] = True
+                engine_kwargs["worker_cls"] = "indextts_web.infrastructure.vllm_worker.RecoverableSleepWorker"
             engine_args = AsyncEngineArgs(**engine_kwargs)
             engine = AsyncLLM.from_engine_args(engine_args)
             print(f"⏱️ GPT vLLM engine initialized in {_time.time() - _start:.2f}s")
@@ -1190,6 +1191,7 @@ class QwenEmotion:
         }
         if _vllm_sleep_mode_enabled():
             engine_kwargs["enable_sleep_mode"] = True
+            engine_kwargs["worker_cls"] = "indextts_web.infrastructure.vllm_worker.RecoverableSleepWorker"
         engine_args = AsyncEngineArgs(**engine_kwargs)
         self.model = AsyncLLM.from_engine_args(engine_args)
         self.max_model_len = engine_kwargs.get("max_model_len", 2048)

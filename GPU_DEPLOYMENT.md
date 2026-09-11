@@ -179,6 +179,31 @@ Sleep/unload releases model allocations; a small CUDA context may remain in
 the running service. Redeploy to install the updated service and UI; existing
 checkpoints do not need another `prepare_model` run.
 
+## IndexTTS sleep/wake and shared VRAM
+
+Model Manager's IndexTTS vLLM and Qwen Emotion controls release the respective
+engine's weights and KV cache. They do not unload the separate IndexTTS speech,
+conditioning, and vocoder models. The displayed GPU usage covers all processes;
+the action result reports the measured increase in free VRAM in MiB.
+
+HY-MT translation weights are now listed in Model Manager and included in
+Unload All. On L4/L40S, waking IndexTTS sleeps MOSS, unloads HY-MT and the audio
+separator, and clears the WebUI's unused CUDA cache. Both manual and automatic
+wake reserve room for all sleeping core engines, so waking GPT alone cannot
+consume the room needed by emotion on the next synthesis request. If other
+models still occupy too much VRAM, wake returns an actionable error before
+allocating. MOSS and separator jobs share the GPU coordinator; manual memory
+changes wait for active tracked work, including on the large GPU profile.
+
+Both core engines use a worker adapter for the pinned vLLM 0.10.2 allocator.
+It checks the actual sleeping allocations before wake, keeps CPU weight backups
+until the entire wake succeeds, and rolls back earlier mappings if a later
+allocation fails. This addresses the partial allocation failure in the
+[upstream allocator's wake loop](https://github.com/vllm-project/vllm/blob/v0.10.2/vllm/device_allocator/cumem.py).
+A failed wake aborts the synthesis batch instead of retrying for each segment.
+Redeploy to replace any workers already damaged by an earlier failed wake;
+`prepare_model` is not required.
+
 ## Validation status
 
 CPU tests cover capacity selection, override precedence, engine construction,

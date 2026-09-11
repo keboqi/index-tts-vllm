@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import AsyncMock, Mock, patch
 
+from indextts_web.infrastructure.gpu_work import GpuWorkCoordinator, await_gpu_job
 from indextts_web.services.translation.moss_client import MossModelClient
 from indextts_web.services.translation.moss_runtime import MossRuntime
 from tests.test_modal_gpu_profiles import ROOT, load_definition
@@ -62,6 +63,8 @@ class ModelManagerRoutingTests(unittest.IsolatedAsyncioTestCase):
                      "JSONResponse": lambda **kwargs: kwargs["content"], "HTTPException": HttpError,
                      "moss_model_client": client, "_loaded_model_inventory": lambda: [],
                      "_cuda_memory_summary": lambda: {}, "_model_manager_lock": asyncio.Lock(),
+                     "GPU_COORDINATOR": GpuWorkCoordinator(), "await_gpu_job": await_gpu_job,
+                     "_release_cuda_cache": Mock(),
                      "_request_has_json_body": lambda request: True,
                      "tts_manager": SimpleNamespace(sleep_engine=AsyncMock(), is_ready=lambda: False),
                      "confucius_backend_manager": SimpleNamespace(_process_running=lambda: False),

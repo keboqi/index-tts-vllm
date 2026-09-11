@@ -336,7 +336,8 @@ def _normalize_duration_control(value: Any, default: str = DURATION_CONTROL_ORIG
 
 from indextts_web.config import load_settings
 from indextts_web.infrastructure.concurrency import ConcurrencyBudget
-from indextts_web.infrastructure.gpu_work import GpuWorkCoordinator, gpu_operation
+from indextts_web.infrastructure.gpu_work import GpuWorkCoordinator, await_gpu_job, gpu_operation
+from indextts_web.infrastructure.vllm_memory import GpuWakeError
 from indextts_web.services.translation.moss_client import MossModelClient
 from indextts_web.services.translation.qwen_worker import QwenOmniVadWorker
 
@@ -345,12 +346,14 @@ from indextts_web.services.translation.qwen_worker import QwenOmniVadWorker
 # compatibility code migrates to the runtime container.
 CONCURRENCY = ConcurrencyBudget.from_environ()
 GPU_COORDINATOR = GpuWorkCoordinator()
+_transcription_gpu_lock = asyncio.Lock()
 executor = CONCURRENCY.general
 io_executor = CONCURRENCY.io
 audio_executor = CONCURRENCY.audio
 # Global ClearVoice models (initialized lazily and reused)
 _enhancement_model: Optional[Any] = None
 _super_res_model: Optional[Any] = None
+_audio_separator_runtime_lock = threading.RLock()
 _current_enhancement_model_name: Optional[str] = None
 
 # Global Qwen3-TTS Voice Design manager (initialized lazily)
@@ -722,6 +725,15 @@ class ClearVoiceParallelChunkResult:
 async def _run_blocking(func: Callable, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(executor, functools.partial(func, *args, **kwargs))
+
+
+async def _run_transcription_gpu_job(backend: str, func: Callable, *args, **kwargs):
+    # These pipelines own shared cached models. Do not let a second MOSS job
+    # reclaim HY-MT between batches of the first job on the same backend lease.
+    async with _transcription_gpu_lock, GPU_COORDINATOR.use(backend):
+        if GPU_COORDINATOR.enabled:
+            await _prepare_gpu_for_qwen_asr()
+        return await await_gpu_job(_run_blocking(func, *args, **kwargs))
 
 
 async def _run_io(func: Callable, *args, **kwargs):
@@ -1156,6 +1168,16 @@ def _run_audio_separator_sync(
     cache_hash: Optional[str] = None,
     use_soundfile: Optional[bool] = None,
 ) -> AudioSeparatorResult:
+    with _audio_separator_runtime_lock:
+        return _run_audio_separator_locked(input_path, model_key, cache_hash, use_soundfile)
+
+
+def _run_audio_separator_locked(
+    input_path: str,
+    model_key: str = DEFAULT_AUDIO_SEPARATOR_MODEL,
+    cache_hash: Optional[str] = None,
+    use_soundfile: Optional[bool] = None,
+) -> AudioSeparatorResult:
     """
     Run audio-separator on input audio file to separate vocals and instrumentals.
     Uses caching based on input file MD5 hash.
@@ -1276,7 +1298,8 @@ async def _run_audio_separator(
             message=f"Separating vocals/instrumentals using {model_key} model ({model_name})...",
         )
     
-    result = await _run_blocking(_run_audio_separator_sync, input_path, model_key, cache_hash, use_soundfile)
+    result = await _run_transcription_gpu_job(
+        "audio_separator", _run_audio_separator_sync, input_path, model_key, cache_hash, use_soundfile)
     
     if emit_status:
         cache_note = " (cached)" if result.from_cache else ""
@@ -2585,23 +2608,18 @@ async def _build_translation_segments(
                 {"status": "error", "message": "MOSS Transcribe+Diarize pipeline is not installed. Start the SGLang-Omni backend with sglang_omni_moss_transcribe.sh."},
             )
         print(f"[translate] Using MOSS Transcribe+Diarize SGLang pipeline for transcription/translation")
-        loop = asyncio.get_event_loop()
         (
             gemini_chunks,
             speaker_profiles,
             raw_gemini_response_text,
             gemini_cache_info,
-        ) = await loop.run_in_executor(
-            executor,
-            functools.partial(
-                _run_moss_transcribe_pipeline_sync,
-                processed_audio_bytes,
-                input_mime_type=gemini_mime_type,
-                dest_language=dest_language,
-                enable_translation=translate_enabled,
-                translation_llm_model=resolved_translation_llm_model,
-                force_refresh=force_gemini_regenerate,
-            ),
+        ) = await _run_transcription_gpu_job(
+            "moss_transcribe", _run_moss_transcribe_pipeline_sync, processed_audio_bytes,
+            input_mime_type=gemini_mime_type,
+            dest_language=dest_language,
+            enable_translation=translate_enabled,
+            translation_llm_model=resolved_translation_llm_model,
+            force_refresh=force_gemini_regenerate,
         )
     else:
         # --- Gemini cloud pipeline (default) ---
@@ -3738,12 +3756,14 @@ def _loaded_model_inventory() -> List[Dict[str, Any]]:
                 "name": "IndexTTS vLLM",
                 "kind": "Core TTS",
                 "state": "sleeping" if vllm_state["indextts_vllm_sleeping"] else "loaded",
+                "error": vllm_state.get("wake_error", ""),
             },
             {
                 "key": "emotion_vllm",
                 "name": "Qwen Emotion vLLM",
                 "kind": "Emotion",
                 "state": "sleeping" if vllm_state["emotion_vllm_sleeping"] else "loaded",
+                "error": vllm_state.get("wake_error", ""),
             },
         ])
     if confucius_backend_manager._process_running():
@@ -3772,6 +3792,9 @@ def _loaded_model_inventory() -> List[Dict[str, Any]]:
     if _audio_separator is not None:
         label = _audio_separator_model_name or DEFAULT_AUDIO_SEPARATOR_MODEL
         models.append({"key": "audio_separator", "name": f"Audio Separator ({label})", "kind": "Separation", "state": "loaded"})
+    translator = sys.modules.get("whisperx_pipeline")
+    if translator is not None and translator.hy_mt_model_status()["loaded"]:
+        models.append({"key": "hy_mt", "name": "HY-MT Translation", "kind": "Translation", "state": "loaded"})
     return models
 
 
@@ -3781,9 +3804,20 @@ async def _managed_model_inventory() -> List[Dict[str, Any]]:
 
 async def _change_moss_model(action: str) -> None:
     try:
-        await moss_model_client.change(action)
+        if action == "wake" and GPU_COORDINATOR.enabled:
+            await _prepare_gpu_for_qwen_asr()
+        await await_gpu_job(moss_model_client.change(action))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"MOSS {action} failed: {exc}") from exc
+
+
+async def _release_translation_gpu_models() -> None:
+    """Called under a GPU lease before waking TTS on a small GPU."""
+    for model in await moss_model_client.inventory():
+        if model["state"] == "loaded":
+            await moss_model_client.change("sleep")
+    await _run_blocking(_unload_optional_model_sync, "hy_mt")
+    await _run_blocking(_unload_optional_model_sync, "audio_separator")
 
 
 def _unload_optional_model_sync(model_key: str) -> List[str]:
@@ -3816,12 +3850,19 @@ def _unload_optional_model_sync(model_key: str) -> List[str]:
         _super_res_model = None
         removed.append("clearvoice_super_resolution")
 
-    if (unload_all or requested == "audio_separator") and _audio_separator is not None:
-        _audio_separator = None
-        _audio_separator_model_name = None
-        _audio_separator_output_format = None
-        _audio_separator_use_soundfile = None
-        removed.append("audio_separator")
+    if unload_all or requested == "hy_mt":
+        translator = sys.modules.get("whisperx_pipeline")
+        if translator is not None and translator.unload_hy_mt_model():
+            removed.append("hy_mt")
+
+    if unload_all or requested == "audio_separator":
+        with _audio_separator_runtime_lock:
+            if _audio_separator is not None:
+                _audio_separator = None
+                _audio_separator_model_name = None
+                _audio_separator_output_format = None
+                _audio_separator_use_soundfile = None
+                removed.append("audio_separator")
 
     _release_cuda_cache()
     return removed
@@ -4647,6 +4688,8 @@ async def _prepare_gpu_for_qwen_asr() -> None:
     await _prepare_gpu_for_indextts25()
     if indextts25_backend_manager.process_running():
         await indextts25_backend_manager.sleep_vllm()
+    if GPU_COORDINATOR.enabled:
+        await _release_translation_gpu_models()
 
 
 qwen_omnivad_worker = QwenOmniVadWorker(
@@ -10662,6 +10705,8 @@ async def _synthesize_translated_audio(
                 )
 
             generated_audio = await _run_audio_cpu(_load_and_finalize_generated_audio)
+        except GpuWakeError:
+            raise
         except Exception as exc:
             status = "error"
             error_message = str(exc)
@@ -11298,6 +11343,7 @@ class TTSManager:
         self._indextts_vllm_sleeping = False
         self._emotion_vllm_sleeping = False
         self._vllm_state_lock = asyncio.Lock()
+        self._wake_error = ""
         
     @classmethod
     def get_instance(cls):
@@ -11387,32 +11433,54 @@ class TTSManager:
     @gpu_operation("index")
     async def ensure_awake(self) -> None:
         """Wake any manually slept vLLM engines before IndexTTS inference."""
+        await self._wake_engines(("indextts_vllm", "emotion_vllm"))
+
+    async def _wake_engines(self, engines) -> None:
+        async with self._vllm_state_lock:
+            pending = [engine for engine in engines if getattr(self, "_" + engine + "_sleeping")]
+            if not pending:
+                return
+            try:
+                await self._prepare_wake_memory()
+                tts = self.get_tts()
+                for engine in pending:
+                    if engine == "indextts_vllm":
+                        await tts.wake_indextts_vllm()
+                    else:
+                        await tts.wake_emotion_vllm()
+                    setattr(self, "_" + engine + "_sleeping", False)
+                self._wake_error = ""
+            except Exception as exc:
+                self._wake_error = str(exc)
+                raise GpuWakeError(f"IndexTTS wake failed: {exc}") from exc
+
+    async def _prepare_wake_memory(self) -> None:
         if indextts25_backend_manager.process_running():
             await indextts25_backend_manager.sleep_vllm()
         if (GPU_COORDINATOR.enabled and confucius_backend_manager._process_running()
                 and not confucius_backend_manager._vllm_sleeping):
             await confucius_backend_manager.sleep_vllm()
-        if not (self._indextts_vllm_sleeping or self._emotion_vllm_sleeping):
-            return
-        tts = self.get_tts()
-        async with self._vllm_state_lock:
-            if self._indextts_vllm_sleeping:
-                await tts.wake_indextts_vllm()
-                self._indextts_vllm_sleeping = False
-            if self._emotion_vllm_sleeping:
-                await tts.wake_emotion_vllm()
-                self._emotion_vllm_sleeping = False
+        if GPU_COORDINATOR.enabled:
+            await _release_translation_gpu_models()
+        await _run_blocking(_release_cuda_cache)
+        memory = _cuda_memory_summary()
+        if memory.get("available"):
+            # Reserve room for BOTH engines, even when the UI wakes only GPT.
+            # The next synthesis also wakes emotion, as seen in the reported OOM.
+            fraction = (GPU_PROFILE.index.gpu_memory_utilization if self._indextts_vllm_sleeping else 0)
+            fraction += (GPU_PROFILE.emotion.gpu_memory_utilization if self._emotion_vllm_sleeping else 0)
+            required_mb = fraction * memory["total_mb"] + 512
+            if memory["free_mb"] < required_mb:
+                raise GpuWakeError(
+                    f"Need {required_mb / 1024:.2f} GiB free to restore sleeping TTS engines, "
+                    f"but only {memory['free_mb'] / 1024:.2f} GiB is free. "
+                    "Unload other models in Model Manager and retry. No wake allocation was attempted."
+                )
 
+    @gpu_operation("index")
     async def wake_engine(self, engine: str) -> None:
         """Wake one vLLM engine from the Model Manager."""
-        tts = self.get_tts()
-        async with self._vllm_state_lock:
-            if engine == "indextts_vllm" and self._indextts_vllm_sleeping:
-                await tts.wake_indextts_vllm()
-                self._indextts_vllm_sleeping = False
-            elif engine == "emotion_vllm" and self._emotion_vllm_sleeping:
-                await tts.wake_emotion_vllm()
-                self._emotion_vllm_sleeping = False
+        await self._wake_engines((engine,))
 
     async def wake_from_snapshot(self):
         tts = self.get_tts()
@@ -11423,10 +11491,11 @@ class TTSManager:
         self._emotion_vllm_sleeping = False
         self.refresh_post_snapshot_state()
 
-    def vllm_status(self) -> Dict[str, bool]:
+    def vllm_status(self) -> Dict[str, Any]:
         return {
             "indextts_vllm_sleeping": self._indextts_vllm_sleeping,
             "emotion_vllm_sleeping": self._emotion_vllm_sleeping,
+            "wake_error": self._wake_error,
         }
 
     def refresh_post_snapshot_state(self):
@@ -12967,8 +13036,9 @@ async def api_models_unload(request: Request):
     if model_key != "all" and model_key not in valid_keys:
         raise HTTPException(status_code=404, detail=f"Model is not loaded: {model_key}")
 
-    async with _model_manager_lock:
+    async with _model_manager_lock, GPU_COORDINATOR.exclusive():
         removed: List[str] = []
+        memory_before = _cuda_memory_summary()
         if model_key in {"all", "indextts_vllm"}:
             await tts_manager.sleep_engine("indextts_vllm", level=1)
             removed.append("indextts_vllm")
@@ -12988,11 +13058,14 @@ async def api_models_unload(request: Request):
             "indextts_vllm", "emotion_vllm", "confucius_vllm", "indextts25_omni", "moss_transcribe"
         }:
             removed.extend(await _run_blocking(_unload_optional_model_sync, model_key))
+        await _run_blocking(_release_cuda_cache)
+        memory_after = _cuda_memory_summary()
     return JSONResponse(
         content={
             "status": "success",
             "unloaded": removed,
-            "gpu": _cuda_memory_summary(),
+            "gpu": memory_after,
+            "freed_mb": max(0, memory_after.get("free_mb", 0) - memory_before.get("free_mb", 0)),
             "models": await _managed_model_inventory(),
         }
     )
@@ -13008,9 +13081,12 @@ async def api_models_wake(request: Request):
     model_key = str(payload.get("model_key") or "").strip() if isinstance(payload, dict) else ""
     if model_key not in {"indextts_vllm", "emotion_vllm", "confucius_vllm", "indextts25_omni", "moss_transcribe"}:
         raise HTTPException(status_code=400, detail="Unknown or non-sleepable model")
-    async with _model_manager_lock:
+    async with _model_manager_lock, GPU_COORDINATOR.exclusive():
         if model_key in {"indextts_vllm", "emotion_vllm"}:
-            await tts_manager.wake_engine(model_key)
+            try:
+                await tts_manager.wake_engine(model_key)
+            except GpuWakeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
         elif model_key == "confucius_vllm":
             await confucius_backend_manager.wake_vllm()
         elif model_key == "indextts25_omni":

@@ -157,6 +157,7 @@ class EngineConstructionTests(unittest.TestCase):
                 self.assertEqual(options["max_model_len"], 2048)
                 self.assertEqual(instance.max_model_len, 2048)
                 self.assertTrue(options["enable_sleep_mode"])
+                self.assertEqual(options["worker_cls"], "indextts_web.infrastructure.vllm_worker.RecoverableSleepWorker")
                 if size == 24:
                     self.assertEqual(options["max_num_seqs"], 1)
                     self.assertTrue(options["enforce_eager"])
@@ -175,6 +176,7 @@ class EngineConstructionTests(unittest.TestCase):
                 self.assertEqual(initialize(), "engine")
                 options = factory.call_args.args[0]
                 self.assertTrue(options["enable_sleep_mode"])
+                self.assertEqual(options["worker_cls"], "indextts_web.infrastructure.vllm_worker.RecoverableSleepWorker")
                 self.assertEqual(options["gpu_memory_utilization"], profile.index.gpu_memory_utilization)
                 if size == 24:
                     self.assertTrue(options["enforce_eager"])

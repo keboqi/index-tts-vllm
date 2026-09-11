@@ -14,20 +14,24 @@ class GpuWorkCoordinator:
         self._condition = asyncio.Condition()
         self._backend: str | None = None
         self._owners: dict[asyncio.Task, str] = {}
+        self._exclusive_owner = None
+        self._exclusive_waiters = 0
 
     @asynccontextmanager
     async def use(self, backend: str):
-        if not self.enabled:
+        task = asyncio.current_task()
+        if task is self._exclusive_owner:
             yield
             return
-        task = asyncio.current_task()
         if task in self._owners:
-            if self._owners[task] != backend:
+            if self.enabled and self._owners[task] != backend:
                 raise RuntimeError("Cannot switch TTS backends during an active synthesis operation")
             yield
             return
         async with self._condition:
-            await self._condition.wait_for(lambda: self._backend in {None, backend})
+            await self._condition.wait_for(lambda: self._exclusive_owner is None
+                                           and not self._exclusive_waiters
+                                           and (not self.enabled or self._backend in {None, backend}))
             self._backend = backend
             self._owners[task] = backend
         try:
@@ -38,6 +42,50 @@ class GpuWorkCoordinator:
                 if not self._owners:
                     self._backend = None
                     self._condition.notify_all()
+
+    @asynccontextmanager
+    async def exclusive(self):
+        """Manual memory changes wait for active jobs, even on large GPUs."""
+        task = asyncio.current_task()
+        if task is self._exclusive_owner:
+            yield
+            return
+        if task in self._owners:
+            raise RuntimeError("Cannot unload models inside active GPU work")
+        async with self._condition:
+            self._exclusive_waiters += 1
+            try:
+                await self._condition.wait_for(lambda: not self._owners and self._exclusive_owner is None)
+                self._exclusive_owner = task
+            finally:
+                self._exclusive_waiters -= 1
+                self._condition.notify_all()
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._exclusive_owner = None
+                self._condition.notify_all()
+
+
+async def await_gpu_job(job):
+    """Keep a GPU lease until a worker thread exits, including cancellation."""
+    future = asyncio.ensure_future(job)
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        # Cancelling run_in_executor does not stop its GPU inference thread.
+        # Repeated cancellation must not let another backend reclaim its model.
+        while not future.done():
+            try:
+                await asyncio.shield(future)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not future.cancelled():
+            future.exception()
+        raise
 
 
 def gpu_operation(backend: str):

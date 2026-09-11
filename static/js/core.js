@@ -159,7 +159,9 @@ const CHUNK_SPLIT_MIN_SILENCE_MS = Number(document.querySelector('meta[name="chu
                 if (!response.ok) throw new Error(await parseHttpError(response, 'Failed to unload model'));
                 const data = await response.json();
                 renderModelManager(data);
-                if (statusEl) statusEl.textContent = data.unloaded.length ? `Released VRAM: ${data.unloaded.join(', ')}` : 'No loaded models matched.';
+                if (statusEl) statusEl.textContent = data.unloaded.length
+                    ? `Released ${Number(data.freed_mb || 0).toLocaleString()} MiB: ${data.unloaded.join(', ')}`
+                    : 'No loaded models matched.';
             } catch (error) {
                 if (statusEl) statusEl.textContent = `Error: ${error.message}`;
             }

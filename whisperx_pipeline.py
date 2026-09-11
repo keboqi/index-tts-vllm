@@ -231,7 +231,25 @@ print(f"📂 WhisperX model cache directory: {WHISPERX_MODEL_DIR}")
 _HY_MT_TOKENIZER: Any = None
 _HY_MT_MODEL: Any = None
 _HY_MT_MODEL_REF: Optional[str] = None
-_HY_MT_LOCK = threading.Lock()
+_HY_MT_LOCK = threading.RLock()
+
+
+def hy_mt_model_status() -> Dict[str, Any]:
+    return {"loaded": _HY_MT_MODEL is not None, "model": _HY_MT_MODEL_REF}
+
+
+def unload_hy_mt_model() -> bool:
+    """Drop cached translator weights after any active generation finishes."""
+    global _HY_MT_MODEL, _HY_MT_MODEL_REF, _HY_MT_TOKENIZER
+    with _HY_MT_LOCK:
+        loaded = _HY_MT_MODEL is not None
+        _HY_MT_MODEL = None
+        _HY_MT_MODEL_REF = None
+        _HY_MT_TOKENIZER = None
+        gc.collect()
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return loaded
 
 
 class _HyMtLocalModelMissingError(RuntimeError):
@@ -493,6 +511,16 @@ def _hy_mt_prompt_texts(
 
 
 def _translate_batch_with_hy_mt_model(
+    source_texts: List[str],
+    dest_language: str,
+) -> List[str]:
+    # Loading, generation and unload share one reentrant lock so no caller can
+    # retain a model reference after unload reports that VRAM has been released.
+    with _HY_MT_LOCK:
+        return _translate_batch_with_hy_mt_model_locked(source_texts, dest_language)
+
+
+def _translate_batch_with_hy_mt_model_locked(
     source_texts: List[str],
     dest_language: str,
 ) -> List[str]:
