@@ -2,7 +2,7 @@
 
 Status: runtime implementation and CPU/Modal command tests are in place. Actual GPU deployment and snapshot validation remain pending. See [GPU_DEPLOYMENT.md](GPU_DEPLOYMENT.md) for the implemented settings and operator workflow. The design below records the original investigation and release acceptance criteria.
 
-Implementation details that refine the original plan: the Modal image now ships this checkout's application source and uses container-local code linked to persistent data; Confucius engine options are forwarded by a repository-owned launcher adapter rather than a companion checkout patch. Small/medium profiles coordinate backend transitions and disable compilation. Numeric budgets remain candidates until the hardware acceptance matrix passes.
+Implementation details that refine the original plan: the Modal image now ships this checkout's application source and uses container-local code linked to persistent data; Confucius engine options are forwarded by a repository-owned launcher adapter rather than a companion checkout patch. Small/medium profiles coordinate backend transitions. At the operator's request, Torch compilation is now enabled by default on all GPU profiles, superseding the original proposals below to disable it on smaller GPUs. Numeric budgets remain candidates until the hardware acceptance matrix passes.
 
 Investigated application revision: `84f82f1`. The local IndexTTS 2.5 checkout matches the deployment's pinned revision, `0a7d9aaeb9a0516c124669966aeed907e29b811d`.
 

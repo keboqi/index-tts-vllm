@@ -188,16 +188,16 @@ def resolve_gpu_profile(gpu: GpuInfo, environ: Mapping[str, str] | None = None, 
     if total < 32:
         profile = GpuProfile("24gb", gpu, EngineProfile(6 / total, 4, 2560, enforce_eager=True),
                              EngineProfile(3 / total, 1, 2048, 2048, True),
-                             EngineProfile(6 / total, 4, enforce_eager=True), False,
+                             EngineProfile(6 / total, 4, enforce_eager=True), True,
                              1, 1, 1, 2, 4, 1, 4 / total, 7 / total)
     elif total < 64:
         profile = GpuProfile("48gb", gpu, EngineProfile(10 / total, 16, 4096),
                              EngineProfile(4 / total, 4, 2048, 2048),
-                             EngineProfile(10 / total, 16), False,
+                             EngineProfile(10 / total, 16), True,
                              4, 4, 4, 4, 16, 4, 8 / total, 14 / total)
     else:
         profile = GpuProfile("96gb", gpu, EngineProfile(0.15), EngineProfile(0.05, max_model_len=2048),
-                             EngineProfile(0.20 if modal else 0.15), modal,
+                             EngineProfile(0.20 if modal else 0.15), True,
                              100, 100, 100, 8, 32, 16, 0.3, 0.3)
     updates: dict[str, Any] = {}
     for engine, prefix in ENGINE_PREFIXES.items():
@@ -241,7 +241,7 @@ def write_omni_deploy_config(base_path: Path, output_dir: Path, profile: GpuProf
     """Derive stage limits without changing checkpoint/context/sampling semantics."""
     import yaml
 
-    if profile.name == "96gb":
+    if profile.name == "96gb" and profile.use_torch_compile:
         return base_path
     config = yaml.safe_load(base_path.read_text(encoding="utf-8"))
     stages = {stage["stage_id"]: stage for stage in config["stages"]}
@@ -251,7 +251,8 @@ def write_omni_deploy_config(base_path: Path, output_dir: Path, profile: GpuProf
     stages[1].update(max_num_seqs=profile.omni_s2mel_seqs, gpu_memory_utilization=profile.omni_s2mel_memory)
     stages[1].setdefault("hf_overrides", {}).update(
         s2mel_cfm_batch_size=profile.omni_s2mel_seqs,
-        s2mel_dit_torch_compile=False, s2mel_vocoder_torch_compile=False,
+        s2mel_dit_torch_compile=profile.use_torch_compile,
+        s2mel_vocoder_torch_compile=profile.use_torch_compile,
     )
     if profile.name == "24gb":
         stages[0]["enforce_eager"] = True

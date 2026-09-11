@@ -59,7 +59,7 @@ performance guarantees.
 | GPT / emotion max sequences | 4 / 1 | 16 / 4 | Existing vLLM defaults |
 | GPT batched tokens | 2560* | 4096* | Existing vLLM default |
 | vLLM eager mode | Enabled | Existing default | Existing default |
-| S2Mel / Confucius compilation | Disabled | Disabled | Enabled in Modal |
+| S2Mel / Confucius compilation | Enabled | Enabled | Enabled |
 | Active IndexTTS / translation synthesis | 1 / 1 | 4 / 4 | 100 / 100 |
 | IndexTTS conditioning cache entries | 2 | 4 | 8 |
 | Confucius T2S budget | 6 GiB | 10 GiB | 20% in Modal; 15% locally |
@@ -72,8 +72,9 @@ performance guarantees.
 the automatic profile does not shorten the GPT context. Emotion retains its
 2048-token context and subtracts prompt length from the output-token budget.
 
-The smaller profiles disable Omni S2Mel compilation and reduce its CFM batch
-size. Other stage settings, model contexts, attention backends, and sampling
+All profiles enable Torch compilation by default, including Omni S2Mel DiT and
+vocoder compilation. The smaller profiles reduce the CFM batch size.
+Other stage settings, model contexts, attention backends, and sampling
 parameters are retained. Modal's Confucius command uses this repository's
 launcher adapter to forward engine options into its isolated environment.
 Custom non-Modal Confucius commands must use the adapter if they need the

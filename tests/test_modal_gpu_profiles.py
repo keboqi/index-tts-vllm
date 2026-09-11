@@ -61,11 +61,11 @@ class ModalGpuCommandTests(unittest.TestCase):
                         self.assertEqual(index_budget, profile.index.gpu_memory_utilization)
                         self.assertEqual(emotion_budget, profile.emotion.gpu_memory_utilization)
                         self.assertEqual(command[command.index("--indextts25_max_parallel_segments") + 1], str(segments))
-                        self.assertIn("--use_torch_compile" if size == 96 else "--no-use_torch_compile", command)
+                        self.assertIn("--use_torch_compile", command)
                         conf = shlex.split(command[command.index("--confucius_start_command") + 1])
                         self.assertIn("indextts_web.services.tts.confucius_launcher", conf)
                         self.assertIn(f"PYTHONPATH={root / deploy.CONFUCIUS_APP_SUBDIR}{os.pathsep}{root}", conf)
-                        self.assertIn("--compile-s2a" if size == 96 else "--no-compile-s2a", conf)
+                        self.assertIn("--compile-s2a", conf)
                         self.assertEqual(conf[conf.index("--warmup-mode") + 1],
                                          "background" if size == 96 else "foreground")
                         self.assertEqual(float(conf[conf.index("--vllm-gpu-memory-utilization") + 1]),

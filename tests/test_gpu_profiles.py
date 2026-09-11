@@ -36,7 +36,9 @@ class GpuProfileTests(unittest.TestCase):
         for capacity, expected in ((22.49, "24gb"), (31.99, "24gb"), (32, "48gb"),
                                    (44.5, "48gb"), (63.99, "48gb"), (64, "96gb"), (95, "96gb")):
             with self.subTest(capacity=capacity):
-                self.assertEqual(resolve_gpu_profile(gpu(capacity), {}).name, expected)
+                profile = resolve_gpu_profile(gpu(capacity), {})
+                self.assertEqual(profile.name, expected)
+                self.assertTrue(profile.use_torch_compile)
         with self.assertRaisesRegex(ValueError, "24 GB-class"):
             resolve_gpu_profile(gpu(16), {})
 
@@ -46,19 +48,20 @@ class GpuProfileTests(unittest.TestCase):
         self.assertAlmostEqual(profile.emotion.gpu_memory_utilization * profile.gpu.total_gib, 3)
         self.assertTrue(profile.index.enforce_eager)
         self.assertEqual(profile.index_concurrency, 1)
-        self.assertFalse(profile.use_torch_compile)
+        self.assertTrue(profile.use_torch_compile)
 
     def test_medium_limits_and_high_modal_compatibility(self):
         medium = resolve_gpu_profile(gpu(48), {}, modal=True)
         self.assertEqual((medium.index.max_num_seqs, medium.emotion.max_num_seqs), (16, 4))
         self.assertEqual(medium.parallel_segments, 4)
+        self.assertTrue(medium.use_torch_compile)
         high = resolve_gpu_profile(gpu(96), {}, modal=True)
         self.assertEqual(high.index.kwargs(), {"gpu_memory_utilization": 0.15})
         self.assertEqual(high.emotion.kwargs(), {"gpu_memory_utilization": 0.05, "max_model_len": 2048})
         self.assertEqual(high.confucius.gpu_memory_utilization, 0.20)
         self.assertTrue(high.use_torch_compile)
         self.assertEqual(high.index_concurrency, 100)
-        self.assertFalse(resolve_gpu_profile(gpu(96), {}, modal=False).use_torch_compile)
+        self.assertTrue(resolve_gpu_profile(gpu(96), {}, modal=False).use_torch_compile)
 
     def test_explicit_overrides_and_cli_precedence(self):
         env = {"GPU_MEMORY_UTILIZATION": "0.3", "QWENEMO_VLLM_MAX_NUM_SEQS": "2",
@@ -183,7 +186,14 @@ class OmniProfileTests(unittest.TestCase):
                     self.assertEqual(ar["attention_backend"], "TRITON_ATTN")
                     self.assertEqual((ar["max_model_len"], mel["max_model_len"]), (2560, 32768))
                     self.assertEqual(mel["max_num_batched_tokens"], 8192)
-                    self.assertEqual(mel["hf_overrides"]["s2mel_dit_torch_compile"], capacity == 96)
+                    self.assertTrue(mel["hf_overrides"]["s2mel_dit_torch_compile"])
+                    self.assertTrue(mel["hf_overrides"]["s2mel_vocoder_torch_compile"])
+                    disabled = resolve_gpu_profile(gpu(capacity), {"INDEXTTS_USE_TORCH_COMPILE": "0"}, modal=True)
+                    disabled_path = write_omni_deploy_config(source, root / "generated", disabled)
+                    disabled_config = yaml.safe_load(disabled_path.read_text())
+                    overrides = disabled_config["stages"][1]["hf_overrides"]
+                    self.assertFalse(overrides["s2mel_dit_torch_compile"])
+                    self.assertFalse(overrides["s2mel_vocoder_torch_compile"])
                     self.assertEqual(target, write_omni_deploy_config(source, root / "generated", profile))
                     if capacity == 96:
                         self.assertEqual(target, source)
