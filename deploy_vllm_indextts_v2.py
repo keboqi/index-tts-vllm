@@ -25,6 +25,8 @@ CONFUCIUS_VENV_DIR = "/opt/confucius4tts-venv"
 CONFUCIUS_PYTHON = f"{CONFUCIUS_VENV_DIR}/bin/python"
 MOSS_TRANSCRIBE_VENV_DIR = "/opt/moss-transcribe-venv"
 MOSS_TRANSCRIBE_PYTHON = f"{MOSS_TRANSCRIBE_VENV_DIR}/bin/python"
+QWEN_ASR_VENV_DIR = "/opt/qwen-asr-venv"
+QWEN_ASR_PYTHON = f"{QWEN_ASR_VENV_DIR}/bin/python"
 CONFUCIUS_MODEL_REPO_ID = "netease-youdao/Confucius4-TTS"
 CONFUCIUS_W2V_REPO_ID = "facebook/w2v-bert-2.0"
 CONFUCIUS_BIGVGAN_REPO_ID = "nvidia/bigvgan_v2_22khz_80band_256x"
@@ -209,8 +211,7 @@ image = (
         "\"from indextts.utils.maskgct.models.tts.maskgct.llama_nar "
         "import DiffLlama; print('IndexTTS Transformers compatibility check passed')\"",
     )
-    # MOSS remote code currently requires Transformers 5.6+. Keep qwen-asr
-    # omitted because it pins a conflicting Transformers release.
+    # MOSS and Qwen ASR use their own Transformers versions below.
     .pip_install(
         "yt-dlp[default]",
         "yt-dlp-ejs",
@@ -223,6 +224,23 @@ image = (
         "node --version",
     )
     .pip_install("pedalboard", "PyYAML>=6.0")
+    .run_commands(
+        # Reuse the CUDA/audio/diarization stack, but install Qwen ASR's exact
+        # Transformers dependency inside its own venv, never in the TTS env.
+        f"python -m venv --system-site-packages {QWEN_ASR_VENV_DIR}",
+        f"{QWEN_ASR_PYTHON} -m pip install --upgrade pip setuptools wheel",
+        f"{QWEN_ASR_PYTHON} -m pip install 'qwen-asr==0.0.6' 'transformers==4.57.6'",
+        f"{QWEN_ASR_PYTHON} -c \"from qwen_asr import Qwen3ASRModel; "
+        "from omnivad import OmniVAD; import litai, transformers, torch; "
+        "assert transformers.__version__ == '4.57.6'; "
+        "assert torch.version.cuda, 'Qwen ASR requires CUDA Torch'; "
+        "print('Qwen3-ASR environment ready')\"",
+    )
+    .env({
+        "QWEN_OMNIVAD_PYTHON": QWEN_ASR_PYTHON,
+        "QWEN_OMNIVAD_MODEL_DIR": "/persistent_app/checkpoints/qwen_omnivad",
+        "QWEN_OMNIVAD_CACHE_DIR": "/persistent_cache/qwen_omnivad",
+    })
     # copy=True makes source changes part of the image/snapshot identity. Use
     # these exact local sources at startup, not the code in the model Volume.
     .add_local_dir(str(DEPLOY_SOURCE_ROOT), RUNTIME_SOURCE_DIR,
@@ -1805,6 +1823,7 @@ def _configure_gpu_runtime(persistent_app_path: Path) -> Path:
     profile.check_startup_memory(non_vllm_gib=float(os.environ.get("INDEXTTS_NON_VLLM_RESERVE_GIB", "8")))
     os.environ[PROFILE_ENV] = profile.to_json()
     os.environ.setdefault("CONFUCIUS_REFERENCE_CACHE_SIZE", "2" if profile.name == "24gb" else "100")
+    os.environ.setdefault("QWEN_ASR_MAX_BATCH_SIZE", {"24gb": "1", "48gb": "4", "96gb": "20"}[profile.name])
     os.environ["PYTHONPATH"] = str(runtime_path)
     cache_root = Path(PERSISTENT_CACHE_DIR) / "gpu-profiles" / profile.cache_key
     for variable, subdir in (("TORCHINDUCTOR_CACHE_DIR", "torchinductor"),
@@ -1889,9 +1908,6 @@ class IndexTTSVllmServer:
             internal=True,
         )
         _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
-
-        _call_local_json("/internal/snapshot/warmup", method="POST",
-                         timeout=SNAPSHOT_REQUEST_TIMEOUT, internal=True)
 
     @modal.web_server(port=VLLM_PORT, startup_timeout=SNAPSHOT_STARTUP_TIMEOUT)
     def serve(self):

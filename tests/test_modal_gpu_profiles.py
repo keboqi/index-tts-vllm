@@ -184,7 +184,22 @@ class EngineConstructionTests(unittest.TestCase):
 
 
 class SnapshotWarmupTests(unittest.IsolatedAsyncioTestCase):
-    def test_restore_validates_gpu_before_wake_and_synthesis(self):
+    def test_snapshot_creation_still_warms_up_before_sleep(self):
+        events = []
+        namespace = {"print": Mock(), "os": os,
+                     "subprocess": SimpleNamespace(Popen=Mock()),
+                     "_configure_persistent_runtime": lambda: ROOT,
+                     "_start_moss_transcribe_server": Mock(),
+                     "_wait_moss_ready": lambda proc: events.append("moss"),
+                     "_build_webui_command": lambda path: ["python", "webui.py"],
+                     "_wait_ready": lambda proc, **kwargs: events.append("ready"),
+                     "_call_local_json": lambda path, **kwargs: events.append(path),
+                     "SNAPSHOT_REQUEST_TIMEOUT": 900, "SNAPSHOT_STARTUP_TIMEOUT": 1800}
+        start = load_definition(ROOT / "deploy_vllm_indextts_v2.py", "IndexTTSVllmServer.start", namespace)
+        start(SimpleNamespace())
+        self.assertEqual(events, ["moss", "ready", "/internal/snapshot/warmup", "/internal/snapshot/sleep?level=1"])
+
+    def test_restore_validates_gpu_and_readiness_without_repeating_warmup(self):
         events = []
         namespace = {"print": Mock(), "_wait_moss_ready": lambda proc: events.append("moss"),
                      "_call_local_json": lambda path, **kwargs: events.append(path),
@@ -199,7 +214,7 @@ class SnapshotWarmupTests(unittest.IsolatedAsyncioTestCase):
                           return_value=resolve_gpu_profile(gpu(size), {}, modal=True)), \
                     patch("indextts_web.infrastructure.gpu.probe_gpu", return_value=gpu(size)):
                 restore(server)
-                self.assertEqual(events, ["moss", "/internal/snapshot/wake", "ready", "/internal/snapshot/warmup"])
+                self.assertEqual(events, ["moss", "/internal/snapshot/wake", "ready"])
         events.clear()
         with patch("indextts_web.gpu_profiles.runtime_gpu_profile",
                    return_value=resolve_gpu_profile(gpu(96), {}, modal=True)), \

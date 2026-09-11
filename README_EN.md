@@ -159,6 +159,13 @@ pip install -U "nemo_toolkit[asr]"
 > [!NOTE]
 > Do not install `qwen-asr` into the same environment as `qwen-tts` for now: current releases pin incompatible exact `transformers` versions (`qwen-tts` pins `4.57.3`, while `qwen-asr` pins `4.57.6`). Also do not install `qwen-asr[vllm]` into this environment; this project pins `vllm==0.10.2` for IndexTTS2.
 
+The Modal image now installs Qwen3-ASR in `/opt/qwen-asr-venv` and sets
+`QWEN_OMNIVAD_PYTHON` automatically. Selecting the Qwen3-ASR + OmniVAD pipeline
+runs the existing transcription/diarization/translation workflow in that
+interpreter. For other deployments, set `QWEN_OMNIVAD_PYTHON` to the Python
+executable of your ASR environment. The worker exits after each job, including
+cancellation and timeout, to release its models. See [GPU deployment details](GPU_DEPLOYMENT.md#qwen3-asr--omnivad).
+
 MOSS Transcribe+Diarize is the default `transcription_pipeline`. It runs through the SGLang-Omni Docker manager in `sglang_omni_moss_transcribe.sh`; run `bash sglang_omni_moss_transcribe.sh deploy` ahead of time to pre-pull the image and model, or let the WebUI start it lazily on the first MOSS transcription request.
 
 ### 4. Model Weights

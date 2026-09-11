@@ -337,6 +337,8 @@ def _normalize_duration_control(value: Any, default: str = DURATION_CONTROL_ORIG
 from indextts_web.config import load_settings
 from indextts_web.infrastructure.concurrency import ConcurrencyBudget
 from indextts_web.infrastructure.gpu_work import GpuWorkCoordinator, gpu_operation
+from indextts_web.services.translation.moss_client import MossModelClient
+from indextts_web.services.translation.qwen_worker import QwenOmniVadWorker
 
 
 # Central application concurrency budget. Existing names remain aliases while
@@ -2524,34 +2526,30 @@ async def _build_translation_segments(
         )
     elif use_qwen_omnivad:
         # --- Qwen3-ASR + OmniVAD pipeline ---
-        if _run_qwen_omnivad_pipeline_sync is None:
+        if not qwen_omnivad_worker.is_available(local_available=is_qwen_omnivad_available()):
             raise TranslateWorkflowHttpError(
                 500,
-                {"status": "error", "message": "Qwen3-ASR/OmniVAD pipeline is not installed. Install qwen-asr, omnivad, and litai."},
+                {"status": "error", "message": "Qwen3-ASR is unavailable. Rebuild the Modal image or set QWEN_OMNIVAD_PYTHON to its separate Python environment."},
             )
         print(f"[translate] Using Qwen3-ASR + OmniVAD pipeline for transcription/translation")
-        loop = asyncio.get_event_loop()
         (
             gemini_chunks,
             speaker_profiles,
             raw_gemini_response_text,
             gemini_cache_info,
-        ) = await loop.run_in_executor(
-            executor,
-            functools.partial(
-                _run_qwen_omnivad_pipeline_sync,
-                processed_audio_bytes,
-                input_mime_type=gemini_mime_type,
-                dest_language=dest_language,
-                enable_translation=translate_enabled,
-                translation_llm_model=resolved_translation_llm_model,
-                force_refresh=force_gemini_regenerate,
-                enable_diarization=qwen_omnivad_enable_diarization,
-                diarization_backend=qwen_omnivad_diarization_backend,
-                diarization_min_seconds=qwen_omnivad_diarization_min_seconds,
-                enable_forced_aligner=qwen_omnivad_enable_forced_aligner,
-                merge_gap_seconds=qwen_omnivad_merge_gap_seconds,
-            ),
+        ) = await qwen_omnivad_worker.translate(
+            processed_audio_bytes,
+            local_pipeline=_run_qwen_omnivad_pipeline_sync,
+            input_mime_type=gemini_mime_type,
+            dest_language=dest_language,
+            enable_translation=translate_enabled,
+            translation_llm_model=resolved_translation_llm_model,
+            force_refresh=force_gemini_regenerate,
+            enable_diarization=qwen_omnivad_enable_diarization,
+            diarization_backend=qwen_omnivad_diarization_backend,
+            diarization_min_seconds=qwen_omnivad_diarization_min_seconds,
+            enable_forced_aligner=qwen_omnivad_enable_forced_aligner,
+            merge_gap_seconds=qwen_omnivad_merge_gap_seconds,
         )
     elif use_parakeet:
         # --- NVIDIA Parakeet NeMo pipeline ---
@@ -3696,6 +3694,7 @@ stable_audio3_manager = StableAudio3Manager(STABLE_AUDIO3_CHECKPOINT_DIR)
 # Serializes explicit model teardown with other manager operations.  Individual
 # inference backends retain their own generation locks as well.
 _model_manager_lock = asyncio.Lock()
+moss_model_client = MossModelClient.from_env()
 
 
 def _cuda_memory_summary() -> Dict[str, Any]:
@@ -3774,6 +3773,17 @@ def _loaded_model_inventory() -> List[Dict[str, Any]]:
         label = _audio_separator_model_name or DEFAULT_AUDIO_SEPARATOR_MODEL
         models.append({"key": "audio_separator", "name": f"Audio Separator ({label})", "kind": "Separation", "state": "loaded"})
     return models
+
+
+async def _managed_model_inventory() -> List[Dict[str, Any]]:
+    return _loaded_model_inventory() + await moss_model_client.inventory()
+
+
+async def _change_moss_model(action: str) -> None:
+    try:
+        await moss_model_client.change(action)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"MOSS {action} failed: {exc}") from exc
 
 
 def _unload_optional_model_sync(model_key: str) -> List[str]:
@@ -4630,6 +4640,18 @@ indextts25_backend_manager = ManagedIndexTTS25Backend(
     app_dir=APP_DIR,
     output_root=ROOT_OUTPUT_DIR,
     prepare_gpu=_prepare_gpu_for_indextts25,
+)
+
+
+async def _prepare_gpu_for_qwen_asr() -> None:
+    await _prepare_gpu_for_indextts25()
+    if indextts25_backend_manager.process_running():
+        await indextts25_backend_manager.sleep_vllm()
+
+
+qwen_omnivad_worker = QwenOmniVadWorker(
+    app_dir=APP_DIR, coordinator=GPU_COORDINATOR,
+    prepare_gpu=_prepare_gpu_for_qwen_asr, executor=executor,
 )
 
 
@@ -12912,7 +12934,7 @@ async def api_models_status():
         content={
             "status": "success",
             "gpu": _cuda_memory_summary(),
-            "models": _loaded_model_inventory(),
+            "models": await _managed_model_inventory(),
             "core_model": {
                 "name": "IndexTTS2 vLLM",
                 "loaded": tts_manager.is_ready(),
@@ -12938,7 +12960,10 @@ async def api_models_unload(request: Request):
     if not model_key:
         raise HTTPException(status_code=400, detail="model_key is required")
 
-    valid_keys = {item["key"] for item in _loaded_model_inventory()}
+    mode = str(payload.get("mode") or "unload").strip()
+    if mode not in {"sleep", "unload"} or (mode == "sleep" and model_key != "moss_transcribe"):
+        raise HTTPException(status_code=400, detail="Explicit sleep mode is supported only for MOSS")
+    valid_keys = {item["key"] for item in await _managed_model_inventory()}
     if model_key != "all" and model_key not in valid_keys:
         raise HTTPException(status_code=404, detail=f"Model is not loaded: {model_key}")
 
@@ -12956,8 +12981,11 @@ async def api_models_unload(request: Request):
         if model_key in {"all", "indextts25_omni"} and indextts25_backend_manager.process_running():
             await indextts25_backend_manager.sleep_vllm()
             removed.append("indextts25_omni")
+        if model_key in {"all", "moss_transcribe"} and "moss_transcribe" in valid_keys:
+            await _change_moss_model(mode)
+            removed.append("moss_transcribe")
         if model_key == "all" or model_key not in {
-            "indextts_vllm", "emotion_vllm", "confucius_vllm", "indextts25_omni"
+            "indextts_vllm", "emotion_vllm", "confucius_vllm", "indextts25_omni", "moss_transcribe"
         }:
             removed.extend(await _run_blocking(_unload_optional_model_sync, model_key))
     return JSONResponse(
@@ -12965,20 +12993,20 @@ async def api_models_unload(request: Request):
             "status": "success",
             "unloaded": removed,
             "gpu": _cuda_memory_summary(),
-            "models": _loaded_model_inventory(),
+            "models": await _managed_model_inventory(),
         }
     )
 
 
 @app.post("/api/models/wake")
 async def api_models_wake(request: Request):
-    """Wake a sleeping vLLM engine without rebuilding its model process."""
+    """Wake a sleeping engine, or reload an unloaded MOSS model."""
     try:
         payload = await request.json()
     except Exception:
         payload = {}
     model_key = str(payload.get("model_key") or "").strip() if isinstance(payload, dict) else ""
-    if model_key not in {"indextts_vllm", "emotion_vllm", "confucius_vllm", "indextts25_omni"}:
+    if model_key not in {"indextts_vllm", "emotion_vllm", "confucius_vllm", "indextts25_omni", "moss_transcribe"}:
         raise HTTPException(status_code=400, detail="Unknown or non-sleepable model")
     async with _model_manager_lock:
         if model_key in {"indextts_vllm", "emotion_vllm"}:
@@ -12987,12 +13015,14 @@ async def api_models_wake(request: Request):
             await confucius_backend_manager.wake_vllm()
         elif model_key == "indextts25_omni":
             await indextts25_backend_manager.wake_vllm()
+        elif model_key == "moss_transcribe":
+            await _change_moss_model("wake")
     return JSONResponse(
         content={
             "status": "success",
             "woken": [model_key],
             "gpu": _cuda_memory_summary(),
-            "models": _loaded_model_inventory(),
+            "models": await _managed_model_inventory(),
         }
     )
 
@@ -18475,7 +18505,8 @@ async def server_info():
                 "speaker_manager": "SpeakerPresetManager",
                 "speaker_effects_available": SoundEffectApplier is not None and EffectType is not None,
                 "whisperx_available": is_whisperx_available(),
-                "qwen_omnivad_available": is_qwen_omnivad_available(),
+                "qwen_omnivad_available": qwen_omnivad_worker.is_available(
+                    local_available=is_qwen_omnivad_available()),
                 "parakeet_available": is_parakeet_available(),
                 "moss_transcribe_available": is_moss_transcribe_available(),
                 "transcription_pipeline_default": DEFAULT_TRANSCRIPTION_PIPELINE,

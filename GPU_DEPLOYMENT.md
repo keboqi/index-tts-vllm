@@ -40,8 +40,9 @@ invalidate Modal snapshots, while Volume changes do not. See
 [Modal's snapshot lifecycle](https://modal.com/docs/guide/memory-snapshots#when-are-memory-snapshots-updated).
 
 The snapshot path requires `/health` to report a loaded model and a warmup to
-produce nonempty audio. Restore verifies the GPU architecture/capacity, wakes
-the engines, and checks inference again. Compiler caches and generated Omni
+produce nonempty audio before taking the snapshot. Restore verifies the GPU
+architecture/capacity, wakes the engines, and checks readiness without repeating
+warmup inference. Compiler caches and generated Omni
 configs use separate paths for each resolved GPU profile and Modal image.
 
 ## Automatic settings
@@ -133,11 +134,61 @@ estimated 8 GiB allowance for other models, and headroom. Advanced users can
 adjust that allowance with `INDEXTTS_NON_VLLM_RESERVE_GIB`. This preflight is an
 estimate and does not certify that every workload fits.
 
+## Qwen3-ASR + OmniVAD
+
+The Modal image installs `qwen-asr==0.0.6` and its required
+`transformers==4.57.6` in `/opt/qwen-asr-venv`. That venv shares the image's
+CUDA/audio/diarization packages while keeping its conflicting Transformers
+version separate from TTS and MOSS. The image build checks the ASR imports.
+This follows the package's requirement to use a separate environment when
+dependencies conflict; see [Qwen3-ASR installation guidance](https://github.com/QwenLM/Qwen3-ASR#environment-setup).
+
+`QWEN_OMNIVAD_PYTHON` selects the worker interpreter. The WebUI dispatches the
+complete existing pipeline to that process and preserves segment timestamps,
+speaker profiles, translation controls, and cache metadata. Logs still appear
+in Modal. One ASR worker runs at a time per container. On L4/L40S profiles it
+waits for active TTS, sleeps the managed TTS engines, and exits before another
+TTS backend can wake. Cancellation and timeout also stop the worker. Models
+are loaded again for each job; downloaded files remain cached.
+
+The Modal ASR batch-size defaults are 1 / 4 / 20 for L4 / L40S / RTX PRO 6000.
+Override with `QWEN_ASR_MAX_BATCH_SIZE`. `QWEN_OMNIVAD_WORKER_TIMEOUT` defaults
+to 7200 seconds. This worker uses the Transformers ASR backend.
+
+Qwen ASR and aligner downloads use `/persistent_app/checkpoints/qwen_omnivad`;
+pipeline result caching uses `/persistent_cache/qwen_omnivad`. Existing
+on-demand model downloads continue on first use. To apply the dependency fix,
+pull the latest checkout and redeploy so Modal builds the updated image.
+Rerunning `prepare_model` alone cannot install this interpreter into a running
+deployment.
+
+## MOSS model controls
+
+The dedicated MOSS service used by Modal reports its state in Model Manager,
+including before the model has been loaded. **Sleep** moves its weights to CPU
+and clears its CUDA allocator cache; **Wake** moves them back to the configured
+device. **Unload** drops the model and processor and clears the CUDA cache.
+Unloaded MOSS remains listed with a **Load** button. Transcription also wakes
+or reloads it automatically when needed. **Unload All** includes MOSS.
+
+Inference and lifecycle changes share a lock in the MOSS process, so sleep or
+unload waits for active transcription. Status remains responsive while that
+work runs. These controls apply to `moss_transcribe_server.py`; an external
+SGLang/OpenAI-compatible server without this lifecycle API is not managed.
+Sleep/unload releases model allocations; a small CUDA context may remain in
+the running service. Redeploy to install the updated service and UI; existing
+checkpoints do not need another `prepare_model` run.
+
 ## Validation status
 
 CPU tests cover capacity selection, override precedence, engine construction,
 Modal command construction for all three GPUs, generated Omni configurations,
-source isolation, readiness, and request coordination. Install the lightweight
+source isolation, readiness, and request coordination. Qwen worker tests run
+real child processes with a fake pipeline to check dispatch, data transfer,
+errors, cancellation, and timeouts without model downloads. They do not verify
+ASR inference on a GPU. MOSS tests cover lazy loading, CPU offload, wake,
+reference release, inference/lifecycle locking, Model Manager routing and UI
+controls, using fake models without CUDA. Install the lightweight
 test dependencies with `pip install -e '.[dev]'`, then run:
 
 ```bash

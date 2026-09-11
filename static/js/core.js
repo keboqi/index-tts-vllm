@@ -118,13 +118,20 @@ const CHUNK_SPLIT_MIN_SILENCE_MS = Number(document.querySelector('meta[name="chu
                 gpuEl.textContent = 'CUDA GPU memory information is unavailable.';
             }
             const models = Array.isArray(data.models) ? data.models : [];
-            const rows = models.map(model => `
+            const rows = models.map(model => {
+                const actions = Array.isArray(model.actions) ? model.actions
+                    : (model.state === 'sleeping' ? ['wake'] : ['unload']);
+                const buttons = actions.filter(action => ['sleep', 'wake', 'unload'].includes(action)).map(action => {
+                    const label = action === 'wake' ? (model.state === 'unloaded' ? 'Load' : 'Wake')
+                        : action === 'sleep' || (action === 'unload' && (model.key.endsWith('_vllm') || model.key === 'indextts25_omni')) ? 'Sleep' : 'Unload';
+                    return `<button type="button" class="btn ${action === 'unload' ? 'btn-danger' : 'btn-secondary'}" data-action="models-${action}" data-model-key="${escapeHtml(model.key)}" ${model.busy ? 'disabled' : ''}>${label}</button>`;
+                }).join('');
+                return `
                     <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px; border:1px solid var(--border); border-radius:10px; background:var(--surface-muted);">
-                        <div><strong>${escapeHtml(model.name)}</strong><br><small style="color:var(--text-secondary)">${escapeHtml(model.kind || 'Optional model')} · ${escapeHtml(model.state || 'loaded')}</small></div>
-                        ${model.state === 'sleeping'
-                    ? `<button type="button" class="btn btn-secondary" data-action="models-wake" data-model-key="${escapeHtml(model.key)}">Wake</button>`
-                    : `<button type="button" class="btn btn-danger" data-action="models-unload" data-model-key="${escapeHtml(model.key)}">${model.key.endsWith('_vllm') ? 'Sleep' : 'Unload'}</button>`}
-                    </div>`);
+                        <div><strong>${escapeHtml(model.name)}</strong><br><small style="color:var(--text-secondary)">${escapeHtml(model.kind || 'Optional model')} · ${escapeHtml(model.state || 'loaded')}${model.busy ? ' · busy' : ''}${model.error ? ` · ${escapeHtml(model.error)}` : ''}</small></div>
+                        <div style="display:flex; gap:8px;">${buttons}</div>
+                    </div>`;
+            });
             listEl.innerHTML = rows.join('');
         }
 
@@ -140,19 +147,19 @@ const CHUNK_SPLIT_MIN_SILENCE_MS = Number(document.querySelector('meta[name="chu
             }
         }
 
-        async function unloadManagedModel(modelKey) {
+        async function unloadManagedModel(modelKey, mode = 'unload') {
             const statusEl = document.getElementById('modelManagerStatus');
-            if (statusEl) statusEl.textContent = 'Unloading model and releasing VRAM…';
+            if (statusEl) statusEl.textContent = mode === 'sleep' ? 'Moving model to CPU and releasing VRAM…' : 'Unloading model and releasing VRAM…';
             try {
                 const response = await fetch(ENDPOINTS.MODELS_UNLOAD, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model_key: modelKey }),
+                    body: JSON.stringify({ model_key: modelKey, mode }),
                 });
                 if (!response.ok) throw new Error(await parseHttpError(response, 'Failed to unload model'));
                 const data = await response.json();
                 renderModelManager(data);
-                if (statusEl) statusEl.textContent = data.unloaded.length ? `Unloaded: ${data.unloaded.join(', ')}` : 'No loaded models matched.';
+                if (statusEl) statusEl.textContent = data.unloaded.length ? `Released VRAM: ${data.unloaded.join(', ')}` : 'No loaded models matched.';
             } catch (error) {
                 if (statusEl) statusEl.textContent = `Error: ${error.message}`;
             }
@@ -301,6 +308,10 @@ const CHUNK_SPLIT_MIN_SILENCE_MS = Number(document.querySelector('meta[name="chu
                 }
                 if (action === 'models-unload') {
                     unloadManagedModel(actionEl.dataset.modelKey || '');
+                    return;
+                }
+                if (action === 'models-sleep') {
+                    unloadManagedModel(actionEl.dataset.modelKey || '', 'sleep');
                     return;
                 }
                 if (action === 'models-wake') {

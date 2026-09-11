@@ -19,6 +19,10 @@
 及快照恢复仍待验证。现代 `fastapi_webui_v2.py`、quickstart 和 Docker WebUI
 同样使用自动配置；下文旧版 IndexTTS 1.x API 的启动方式保持不变。
 
+Modal 会为 Qwen3-ASR 配置单独的 Python 环境，并通过
+`QWEN_OMNIVAD_PYTHON` 调用工作进程，避免其 Transformers 依赖影响 TTS。
+此更新需要重新部署以构建镜像；无需为安装依赖重新运行 `prepare_model`。
+
 Working on IndexTTS2 support, coming soon... 0.0
 
 ## 项目简介

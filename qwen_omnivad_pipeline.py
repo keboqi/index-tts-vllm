@@ -110,7 +110,9 @@ QWEN_OMNIVAD_OMNIVAD_MODEL_PATH = os.getenv(
     "QWEN_OMNIVAD_OMNIVAD_MODEL_PATH",
     os.path.join(QWEN_OMNIVAD_MODEL_DIR, "omnivad", "vad.omnivad"),
 ).strip()
-QWEN_OMNIVAD_CACHE_DIR = os.path.join(_SCRIPT_DIR, "qwen_omnivad_cache")
+QWEN_OMNIVAD_CACHE_DIR = os.getenv(
+    "QWEN_OMNIVAD_CACHE_DIR", os.path.join(_SCRIPT_DIR, "qwen_omnivad_cache"),
+)
 QWEN_OMNIVAD_CACHE_VERSION = 8
 
 QWEN_ASR_MODEL = os.getenv("QWEN_ASR_MODEL", "Qwen/Qwen3-ASR-1.7B")
