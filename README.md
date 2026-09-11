@@ -5,6 +5,20 @@
 # IndexTTS-vLLM
 </div>
 
+## Modal GPU 选择
+
+在 [`deploy_vllm_indextts_v2.py`](deploy_vllm_indextts_v2.py) 的
+`IndexTTSVllmServer` 装饰器中，手动将 `gpu=` 设置为 `"L4"`（24 GB）、
+`"L40S"`（48 GB）或 `"RTX-PRO-6000"`（96 GB），然后运行
+`modal deploy deploy_vllm_indextts_v2.py`。GPU 型号由部署者手动选择。
+容器启动后根据实际显存自动调整 vLLM 显存比例、批处理、编译和推理并发参数，
+无需随 GPU 手动修改这些参数。
+
+具体参数、覆盖方式和测试流程见 [GPU 部署说明](GPU_DEPLOYMENT.md)。
+小显存配置已实现并通过 CPU 和启动命令测试；实际 Modal GPU 冷启动、推理峰值
+及快照恢复仍待验证。现代 `fastapi_webui_v2.py`、quickstart 和 Docker WebUI
+同样使用自动配置；下文旧版 IndexTTS 1.x API 的启动方式保持不变。
+
 Working on IndexTTS2 support, coming soon... 0.0
 
 ## 项目简介

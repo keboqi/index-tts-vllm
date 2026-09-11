@@ -336,11 +336,13 @@ def _normalize_duration_control(value: Any, default: str = DURATION_CONTROL_ORIG
 
 from indextts_web.config import load_settings
 from indextts_web.infrastructure.concurrency import ConcurrencyBudget
+from indextts_web.infrastructure.gpu_work import GpuWorkCoordinator, gpu_operation
 
 
 # Central application concurrency budget. Existing names remain aliases while
 # compatibility code migrates to the runtime container.
 CONCURRENCY = ConcurrencyBudget.from_environ()
+GPU_COORDINATOR = GpuWorkCoordinator()
 executor = CONCURRENCY.general
 io_executor = CONCURRENCY.io
 audio_executor = CONCURRENCY.audio
@@ -3612,6 +3614,7 @@ def estimate_speech_duration(text: str, language: str = "auto") -> int:
     return duration_ms
 
 SETTINGS = load_settings(sys.argv[1:], allow_unknown=True)
+GPU_PROFILE = None
 
 # Create directories
 APP_DIR = Path(__file__).resolve().parent
@@ -4284,7 +4287,12 @@ class ManagedConfuciusBackend:
         async with self._lock:
             await self._restart_locked(reason)
 
+    @gpu_operation("confucius")
     async def ensure_ready(self) -> Dict[str, Any]:
+        main_manager = globals().get("tts_manager")
+        if GPU_COORDINATOR.enabled and main_manager is not None and main_manager.is_ready():
+            await main_manager.sleep_engine("indextts_vllm", level=1)
+            await main_manager.sleep_engine("emotion_vllm", level=1)
         omni_manager = globals().get("indextts25_backend_manager")
         if omni_manager is not None and omni_manager.process_running():
             await omni_manager.sleep_vllm()
@@ -4459,6 +4467,7 @@ class ManagedConfuciusBackend:
             raise last_exc
         raise RuntimeError("Confucius4-TTS synthesis failed without an exception.")
 
+    @gpu_operation("confucius")
     async def synthesize_to_file(
         self,
         *,
@@ -4475,6 +4484,9 @@ class ManagedConfuciusBackend:
         self._active_requests += 1
         try:
             await self.ensure_ready()
+
+            if self._vllm_sleeping:
+                await self.wake_vllm()
 
             lang = _resolve_confucius_language(language, text)
             payload: Dict[str, Any] = {
@@ -4582,6 +4594,7 @@ class ManagedConfuciusBackend:
         )
         self._vllm_sleeping = True
 
+    @gpu_operation("confucius")
     async def wake_vllm(self) -> None:
         """Wake the live Confucius vLLM engine without restarting its process."""
         await self.ensure_ready()
@@ -11299,8 +11312,11 @@ class TTSManager:
                     is_fp16=SETTINGS.is_fp16,
                     use_torch_compile=SETTINGS.use_torch_compile,
                     gpu_memory_utilization=SETTINGS.gpu_memory_utilization,
-                    qwenemo_gpu_memory_utilization=SETTINGS.qwenemo_gpu_memory_utilization
+                    qwenemo_gpu_memory_utilization=SETTINGS.qwenemo_gpu_memory_utilization,
+                    gpu_profile=GPU_PROFILE,
                 )
+                self.tts.gpu_coordinator = GPU_COORDINATOR
+                self.tts.prepare_gpu_callback = self.ensure_awake
                 
                 # Initialize speaker preset manager
                 self.speaker_manager = initialize_preset_manager(self.tts)
@@ -11346,10 +11362,14 @@ class TTSManager:
                 await tts.sleep_emotion_vllm(level=level)
                 self._emotion_vllm_sleeping = True
 
+    @gpu_operation("index")
     async def ensure_awake(self) -> None:
         """Wake any manually slept vLLM engines before IndexTTS inference."""
         if indextts25_backend_manager.process_running():
             await indextts25_backend_manager.sleep_vllm()
+        if (GPU_COORDINATOR.enabled and confucius_backend_manager._process_running()
+                and not confucius_backend_manager._vllm_sleeping):
+            await confucius_backend_manager.sleep_vllm()
         if not (self._indextts_vllm_sleeping or self._emotion_vllm_sleeping):
             return
         tts = self.get_tts()
@@ -12341,7 +12361,7 @@ class SpeakRequest(BaseModel):
     def _normalize_effects(cls, value: Any) -> List[str]:
         return _normalize_speaker_effect_names(value)
 
-async def warmup_model():
+async def warmup_model(*, strict: bool = False):
     """Run warmup inferences to fully preload the model"""
     try:
         print("🔥 Running model warmup (2 inferences for full load)...")
@@ -12354,6 +12374,8 @@ async def warmup_model():
         
         # Check if first warmup audio exists
         if not os.path.exists(warmup_audio_1):
+            if strict:
+                raise FileNotFoundError(f"Warmup audio missing: {warmup_audio_1}")
             print(f"⚠️ Warmup audio file not found: {warmup_audio_1}")
             return
         
@@ -12382,6 +12404,10 @@ async def warmup_model():
                 speech_length=0,
                 diffusion_steps=10
             )
+            if strict:
+                import soundfile as sf
+                if sf.info(warmup_output_1).frames <= 0:
+                    raise RuntimeError("Snapshot warmup produced empty audio")
             print("✅ Warmup 1/2 completed!")
         finally:
             # Clean up first temporary warmup file
@@ -12432,6 +12458,8 @@ async def warmup_model():
         print("✅ Model warmup fully completed (2/2 inferences)!")
                 
     except Exception as e:
+        if strict:
+            raise
         print(f"⚠️ Warmup failed (non-critical): {e}")
         traceback.print_exc()
 
@@ -12441,8 +12469,31 @@ async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown"""
     # Startup
     print("🚀 Starting IndexTTS vLLM v2 FastAPI WebUI...")
+    global SETTINGS, GPU_PROFILE, INDEXTTS_GPU_WORK_CONCURRENCY
+    global TRANSLATION_TTS_CONCURRENCY, INDEXTTS_GPU_WORK_SLOTS
+    from indextts_web.gpu_profiles import PROFILE_ENV, runtime_gpu_profile
+
+    GPU_PROFILE = runtime_gpu_profile().with_settings(SETTINGS)
+    GPU_PROFILE.check_startup_memory(non_vllm_gib=float(os.getenv("INDEXTTS_NON_VLLM_RESERVE_GIB", "8")))
+    SETTINGS = GPU_PROFILE.apply_settings(SETTINGS)
+    GPU_COORDINATOR.enabled = GPU_PROFILE.name != "96gb"
+    tts_manager.gpu_coordinator = GPU_COORDINATOR
+    confucius_backend_manager.gpu_coordinator = GPU_COORDINATOR
+    indextts25_backend_manager.gpu_coordinator = GPU_COORDINATOR
+    os.environ[PROFILE_ENV] = GPU_PROFILE.to_json()
+    CONCURRENCY.configure_gpu_limits(GPU_PROFILE.index_concurrency, GPU_PROFILE.translation_concurrency)
+    INDEXTTS_GPU_WORK_CONCURRENCY = CONCURRENCY.index_tts_requests
+    TRANSLATION_TTS_CONCURRENCY = CONCURRENCY.translation_tts_requests
+    INDEXTTS_GPU_WORK_SLOTS = CONCURRENCY.index_tts
+    indextts25_backend_manager.settings = SETTINGS
+    indextts25_backend_manager.gpu_profile = GPU_PROFILE
+    indextts25_backend_manager._segment_slots = asyncio.Semaphore(GPU_PROFILE.parallel_segments)
+    if hasattr(app.state, "runtime"):
+        app.state.runtime.settings = SETTINGS
+    print(f"[GPU profile] {GPU_PROFILE.to_json()}")
     _ensure_runtime_directories()
-    await tts_manager.initialize()
+    if not await tts_manager.initialize():
+        raise RuntimeError("IndexTTS initialization failed; see the model error and resolved GPU profile above")
     
     # Only run warmup inference when torch_compile is enabled
     # torch_compile benefits from warmup to compile optimized CUDA graphs
@@ -12486,7 +12537,7 @@ async def internal_snapshot_warmup(request: Request):
     _require_internal_snapshot_token(request)
     if not tts_manager.is_ready():
         raise HTTPException(status_code=503, detail="IndexTTS2 is not initialized")
-    await warmup_model()
+    await warmup_model(strict=True)
     tts_manager.refresh_post_snapshot_state()
     return JSONResponse(content={"status": "ok", "action": "warmup"})
 

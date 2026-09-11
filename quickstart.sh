@@ -253,7 +253,6 @@ fi
 
 log "Starting FastAPI WebUI on port ${SERVER_PORT}"
 exec "${VENV_DIR}/bin/python" fastapi_webui_v2.py \
-    --use_torch_compile \
     --model_dir "${MODEL_DIR}" \
     --port "${SERVER_PORT}" \
     --confucius_repo_dir "${CONFUCIUS_REPO_DIR}" \

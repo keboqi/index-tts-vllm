@@ -5,6 +5,7 @@ import time
 from subprocess import CalledProcessError
 import traceback
 from typing import List
+from indextts_web.infrastructure.gpu_work import gpu_operation
 import asyncio
 import uuid
 from collections import OrderedDict
@@ -33,6 +34,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # optional dependency chain includes ``peft``. IndexTTS registers its model
 # directly and does not need any vLLM plugin. Respect an explicit allowlist.
 os.environ.setdefault("VLLM_PLUGINS", "")
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 # Patch transformers to fix 'dict' object has no attribute 'model_type' error
 # This must be done before vLLM imports its tokenizer
@@ -151,9 +153,10 @@ class IndexTTS2:
         is_fp16=False,
         device=None,
         use_cuda_kernel=None,
-        gpu_memory_utilization=0.15,
-        qwenemo_gpu_memory_utilization=0.05,
-        use_torch_compile=False,
+        gpu_memory_utilization=None,
+        qwenemo_gpu_memory_utilization=None,
+        use_torch_compile=None,
+        gpu_profile=None,
     ):
         """
         Args:
@@ -162,8 +165,8 @@ class IndexTTS2:
             is_fp16 (bool): whether to use fp16.
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device (default: None, which enables it automatically on CUDA).
-            qwenemo_gpu_memory_utilization (float): GPU memory utilization for QwenEmotion vLLM engine (default: 0.05).
-            use_torch_compile (bool): whether to use torch.compile for s2mel acceleration (default: False). Uses fullgraph=True with torch.split to avoid dynamic slicing issues.
+            qwenemo_gpu_memory_utilization (float | None): QwenEmotion vLLM memory fraction; None selects the VRAM profile.
+            use_torch_compile (bool | None): override the profile's S2Mel compilation setting. Uses fullgraph=True with torch.split to avoid dynamic slicing issues.
 
             BF16 autocast is selected automatically on supported CUDA GPUs.
         """
@@ -197,7 +200,18 @@ class IndexTTS2:
         inference_dtype = self.dtype if self.dtype is not None else torch.float32
         print(f">> S2Mel inference dtype: {inference_dtype}")
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
-        self.use_torch_compile = bool(use_torch_compile)
+        from dataclasses import replace
+        from indextts_web.gpu_profiles import runtime_gpu_profile
+
+        self.gpu_profile = gpu_profile or runtime_gpu_profile(device=str(self.device))
+        if gpu_memory_utilization is not None:
+            self.gpu_profile = replace(self.gpu_profile, index=replace(
+                self.gpu_profile.index, gpu_memory_utilization=gpu_memory_utilization))
+        if qwenemo_gpu_memory_utilization is not None:
+            self.gpu_profile = replace(self.gpu_profile, emotion=replace(
+                self.gpu_profile.emotion, gpu_memory_utilization=qwenemo_gpu_memory_utilization))
+        self.use_torch_compile = (self.gpu_profile.use_torch_compile
+                                  if use_torch_compile is None else bool(use_torch_compile))
 
         # =============================================================
         # vLLM ENGINE INITIALIZATION
@@ -211,10 +225,8 @@ class IndexTTS2:
         qwen_emo_path = os.path.join(self.model_dir, self.cfg.qwen_emo_path)
         
         # Check GPU VRAM to decide initialization strategy
-        gpu_vram_gb = 0
-        if torch.cuda.is_available():
-            gpu_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            print(f"🔍 Detected GPU VRAM: {gpu_vram_gb:.1f} GB")
+        gpu_vram_gb = self.gpu_profile.gpu.total_gib
+        print(f"🔍 Detected GPU VRAM: {gpu_vram_gb:.1f} GiB ({self.gpu_profile.name})")
         
         use_parallel_init = gpu_vram_gb > 40  # Only parallel init for >40GB GPUs
         
@@ -225,7 +237,7 @@ class IndexTTS2:
                 "model": vllm_dir,
                 "tensor_parallel_size": 1,
                 "dtype": "auto",
-                "gpu_memory_utilization": gpu_memory_utilization,
+                **self.gpu_profile.index.kwargs(vllm_dir),
             }
             if _vllm_sleep_mode_enabled():
                 engine_kwargs["enable_sleep_mode"] = True
@@ -239,7 +251,7 @@ class IndexTTS2:
             _start = _time.time()
             qwen = QwenEmotion(
                 qwen_emo_path,
-                gpu_memory_utilization=qwenemo_gpu_memory_utilization,
+                engine_profile=self.gpu_profile.emotion,
             )
             print(f"⏱️ Qwen vLLM engine initialized in {_time.time() - _start:.2f}s")
             return qwen
@@ -391,7 +403,8 @@ class IndexTTS2:
         # Content-addressed and bounded to keep GPU-resident conditioning data
         # predictable. In-flight tasks provide per-key single-flight behavior.
         try:
-            conditioning_cache_size = int(os.environ.get("INDEXTTS_CONDITIONING_CACHE_SIZE", "8"))
+            conditioning_cache_size = int(os.environ.get(
+                "INDEXTTS_CONDITIONING_CACHE_SIZE", self.gpu_profile.conditioning_cache_size))
         except ValueError:
             conditioning_cache_size = 8
         self._conditioning_cache_max_entries = max(1, min(conditioning_cache_size, 64))
@@ -986,6 +999,7 @@ class IndexTTS2:
         return (spk_cond_emb, emo_cond_emb, sentences, style, prompt_condition, ref_mel,
                 emovec_mat, weight_vector, emo_vector, sampling_rate, text_tokens_list)
 
+    @gpu_operation("index")
     async def infer_stream(self, spk_audio_prompt, text,
               emo_audio_prompt=None, emo_alpha=0.6,
               emo_vector=None,
@@ -1044,6 +1058,7 @@ class IndexTTS2:
         end_time = time.perf_counter()
         print(f">> Total streaming inference time: {end_time - start_time:.2f} seconds")
 
+    @gpu_operation("index")
     async def infer(self, spk_audio_prompt, text, output_path,
               emo_audio_prompt=None, emo_alpha=0.6,
               emo_vector=None,
@@ -1138,7 +1153,7 @@ def find_most_similar_cosine(query_vector, matrix):
     return most_similar_index
 
 class QwenEmotion:
-    def __init__(self, model_dir, gpu_memory_utilization=0.05, cache_dir="emotion_cache"):
+    def __init__(self, model_dir, gpu_memory_utilization=None, cache_dir="emotion_cache", engine_profile=None):
         self.model_dir = model_dir
         self.cache_dir = cache_dir
         
@@ -1160,18 +1175,24 @@ class QwenEmotion:
                 local_files_only=True
             )
 
+        if engine_profile is None:
+            from indextts_web.gpu_profiles import runtime_gpu_profile
+            engine_profile = runtime_gpu_profile().emotion
+        if gpu_memory_utilization is not None:
+            from dataclasses import replace
+            engine_profile = replace(engine_profile, gpu_memory_utilization=gpu_memory_utilization)
         engine_kwargs = {
             "model": model_dir,
             "tensor_parallel_size": 1,
             "dtype": "auto",
-            "gpu_memory_utilization": gpu_memory_utilization,
-            "max_model_len": 2048,
+            **engine_profile.kwargs(),
             "trust_remote_code": True,
         }
         if _vllm_sleep_mode_enabled():
             engine_kwargs["enable_sleep_mode"] = True
         engine_args = AsyncEngineArgs(**engine_kwargs)
         self.model = AsyncLLM.from_engine_args(engine_args)
+        self.max_model_len = engine_kwargs.get("max_model_len", 2048)
 
         self.prompt = "文本情感分类"
         self.convert_dict = {
@@ -1299,8 +1320,11 @@ class QwenEmotion:
         )
         model_inputs = self.tokenizer(text)["input_ids"]
 
+        output_budget = min(2048, self.max_model_len - len(model_inputs))
+        if output_budget <= 0:
+            raise ValueError(f"Emotion prompt exceeds the {self.max_model_len}-token context window")
         sampling_params = SamplingParams(
-            max_tokens=2048,  # 32768
+            max_tokens=output_budget,
             stop_token_ids=[self.tokenizer.eos_token_id],
             include_stop_str_in_output=True,
         )

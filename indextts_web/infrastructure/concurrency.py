@@ -51,3 +51,10 @@ class ConcurrencyBudget:
     def shutdown(self) -> None:
         for executor in (self.general, self.io, self.audio):
             executor.shutdown(wait=True, cancel_futures=True)
+
+    def configure_gpu_limits(self, index_requests: int, translation_requests: int) -> None:
+        """Set GPU admission during lifespan, before any requests are admitted."""
+        self.index_tts_requests = max(1, index_requests)
+        self.translation_tts_requests = max(1, min(translation_requests, index_requests))
+        self.index_tts = asyncio.BoundedSemaphore(self.index_tts_requests)
+        self.translation_tts = asyncio.BoundedSemaphore(self.translation_tts_requests)

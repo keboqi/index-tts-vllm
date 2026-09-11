@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from indextts_web.config import AppSettings
+from indextts_web.infrastructure.gpu_work import gpu_operation
 
 INDEXTTS25_BACKEND = "index25"
 INDEXTTS25_LANGUAGES = ("zh", "en", "ja", "es", "ar")
@@ -217,7 +218,9 @@ class ManagedIndexTTS25Backend:
         self._active_requests = 0
         self._vllm_sleeping = False
         self._lock = asyncio.Lock()
-        self._segment_slots = asyncio.Semaphore(max(1, settings.indextts25_max_parallel_segments))
+        self._segment_slots = asyncio.Semaphore(max(1, settings.indextts25_max_parallel_segments or 100))
+        self.gpu_profile = None
+        self.gpu_coordinator = None
 
     @property
     def base_url(self) -> str:
@@ -303,6 +306,13 @@ class ManagedIndexTTS25Backend:
                 f"IndexTTS 2.5 integration launcher not found at {launcher}. "
                 "Set --indextts25_repo_dir to the experiment repository."
             )
+        if self.gpu_profile is not None and not env.get("INDEXTTS25_DEPLOY_CONFIG"):
+            from indextts_web.gpu_profiles import write_omni_deploy_config
+
+            env["INDEXTTS25_DEPLOY_CONFIG"] = str(write_omni_deploy_config(
+                self.repo_dir / "vllm_omni" / "deploy" / "indextts2_5.yaml",
+                self.data_dir / "deploy", self.gpu_profile,
+            ))
         return ["bash", str(launcher)], env
 
     def _open_log_handle(self, command: list[str]) -> Any | None:
@@ -449,6 +459,7 @@ class ManagedIndexTTS25Backend:
             self._last_ready_at = time.monotonic()
         return health
 
+    @gpu_operation("index25")
     async def ensure_ready(self) -> dict[str, Any]:
         async with self._lock:
             self._want_running = True
@@ -624,6 +635,7 @@ class ManagedIndexTTS25Backend:
             timeout = max(1.0, float(self.settings.indextts25_request_timeout))
             return await asyncio.to_thread(self._post_audio_sync, payload, timeout)
 
+    @gpu_operation("index25")
     async def synthesize_to_file(
         self,
         *,

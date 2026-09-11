@@ -15,9 +15,10 @@ class ConfuciusBackend(LegacyBackend):
     async def synthesize(self, request: SynthesisRequest) -> Path:
         legacy = self.legacy
         omni_manager = getattr(legacy, "indextts25_backend_manager", None)
-        if omni_manager is not None and omni_manager.process_running():
+        coordinated = getattr(getattr(legacy.confucius_backend_manager, "gpu_coordinator", None), "enabled", False)
+        if not coordinated and omni_manager is not None and omni_manager.process_running():
             await omni_manager.stop("switching to Confucius4-TTS")
-        if getattr(legacy.confucius_backend_manager, "_vllm_sleeping", False):
+        if not coordinated and getattr(legacy.confucius_backend_manager, "_vllm_sleeping", False):
             await legacy.confucius_backend_manager.wake_vllm()
         if request.emotion_text or request.emotion_audio:
             print("[Confucius4-TTS] Ignoring IndexTTS emotion controls for Confucius backend.")

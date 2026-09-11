@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from typing import List, Dict, Optional
 
-# Use CUDA 13.0 for RTX Pro 6000 Blackwell.
+# The image supports Ada (L4/L40S) and RTX PRO 6000 Blackwell.
 cuda_version = "13.0.0"
 flavor = "devel" 
 operating_sys = "ubuntu24.04"
@@ -52,6 +52,22 @@ STABLE_AUDIO3_REPOS = {
 }
 MOSS_TRANSCRIBE_REPO_ID = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
 HY_MT_TRANSLATION_REPO_ID = "tencent/Hy-MT2-1.8B"
+RUNTIME_SOURCE_DIR = "/opt/indextts-runtime-source"
+DEPLOY_SOURCE_ROOT = Path(__file__).resolve().parent
+
+
+def _ignore_runtime_source(path) -> bool:
+    """Ship application source/assets, never checkpoints, credentials or outputs."""
+    relative = Path(path).resolve().relative_to(DEPLOY_SOURCE_ROOT)
+    if not relative.parts:
+        return False
+    if any(part.startswith(".") or part == "__pycache__" for part in relative.parts):
+        return True
+    directories = {"indextts", "indextts_web", "static", "tools", "fonts", "examples", "assets"}
+    if relative.parts[0] in directories:
+        return False
+    return not (len(relative.parts) == 1 and relative.suffix in {".py", ".html", ".sh"}
+                and not relative.name.startswith("deploy_"))
 
 # Create Modal image for IndexTTS v2 with vLLM optimization
 image = (
@@ -206,14 +222,18 @@ image = (
         "n 22",
         "node --version",
     )
-    .pip_install("pedalboard")
+    .pip_install("pedalboard", "PyYAML>=6.0")
+    # copy=True makes source changes part of the image/snapshot identity. Use
+    # these exact local sources at startup, not the code in the model Volume.
+    .add_local_dir(str(DEPLOY_SOURCE_ROOT), RUNTIME_SOURCE_DIR,
+                   copy=True, ignore=_ignore_runtime_source)
 )
 
-app = modal.App("vllm-indextts-v2", image=image)
+app = modal.App("audio-studio", image=image)
 
 # Create persistent storage volumes
-app_storage = modal.Volume.from_name("indextts-v2-app", create_if_missing=True)
-cache_storage = modal.Volume.from_name("indextts-v2-cache", create_if_missing=True)
+app_storage = modal.Volume.from_name("audio-studio-app", create_if_missing=True)
+cache_storage = modal.Volume.from_name("audio-studio-cache", create_if_missing=True)
 
 # Configuration
 PERSISTENT_APP_DIR = "/persistent_app"
@@ -234,9 +254,6 @@ SNAPSHOT_STARTUP_TIMEOUT = 1800
 SNAPSHOT_REQUEST_TIMEOUT = 900
 INTERNAL_TOKEN_ENV = "INDEXTTS_INTERNAL_TOKEN"
 DEFAULT_TTS_BACKEND = "index"
-GPU_MEMORY_UTILIZATION = 0.15
-QWENEMO_GPU_MEMORY_UTILIZATION = 0.05
-CONFUCIUS_GPU_MEMORY_UTILIZATION = 0.20
 CONFUCIUS_STARTUP_TIMEOUT = 1200
 CONFUCIUS_REQUEST_TIMEOUT = 900
 INDEXTTS25_STARTUP_TIMEOUT = 1800
@@ -1261,6 +1278,7 @@ def legacy_serve_without_snapshot():
     # ========================================================================
     print("\n🚀 Starting FastAPI server...")
     
+    persistent_app_path = _configure_gpu_runtime(persistent_app_path)
     cmd = _build_webui_command(persistent_app_path)
     
     print(f"   Command: {' '.join(cmd)}")
@@ -1316,7 +1334,9 @@ def _wait_ready(proc: subprocess.Popen, *, timeout_seconds: int) -> None:
 
         try:
             socket.create_connection(("127.0.0.1", VLLM_PORT), timeout=1).close()
-            _call_local_json("/server_info", timeout=10)
+            health = _call_local_json("/health", timeout=10)
+            if health.get("ready") is not True:
+                raise urllib.error.URLError("TTS model is not ready")
             print("FastAPI server is ready.")
             return
         except (OSError, urllib.error.URLError, TimeoutError) as exc:
@@ -1373,21 +1393,22 @@ def _wait_moss_ready(proc: subprocess.Popen, *, timeout_seconds: int = 120) -> N
     raise TimeoutError(f"Timed out waiting for MOSS server. Last error: {last_error}")
 
 
-def _build_confucius_start_command(confucius_repo_path: Path) -> str:
+def _build_confucius_start_command(confucius_repo_path: Path, gpu_profile) -> str:
     confucius_config_path = confucius_repo_path / CONFUCIUS_FASTAPI_CONFIG
     confucius_vllm_dir = confucius_repo_path / "checkpoints" / "t2s-vllm"
     confucius_output_dir = confucius_repo_path / "outputs" / "api"
     confucius_compile_cache_dir = (
-        Path(PERSISTENT_CACHE_DIR) / "confucius" / "torchinductor"
+        Path(PERSISTENT_CACHE_DIR) / "confucius" / gpu_profile.cache_key / "torchinductor"
     )
     confucius_warmup_voice = confucius_repo_path / "resources" / "voice.mp3"
 
     parts = [
         "env",
-        f"PYTHONPATH={confucius_repo_path}{os.pathsep}{PERSISTENT_APP_DIR}",
+        f"PYTHONPATH={confucius_repo_path}{os.pathsep}{confucius_repo_path.parent}",
         CONFUCIUS_PYTHON,
         "-u",
-        "fastapi_app.py",
+        "-m",
+        "indextts_web.services.tts.confucius_launcher",
         "--host",
         "127.0.0.1",
         "--port",
@@ -1397,7 +1418,7 @@ def _build_confucius_start_command(confucius_repo_path: Path) -> str:
         "--vllm-model-dir",
         str(confucius_vllm_dir),
         "--vllm-gpu-memory-utilization",
-        str(CONFUCIUS_GPU_MEMORY_UTILIZATION),
+        str(gpu_profile.confucius.gpu_memory_utilization),
         "--vllm-attention-backend",
         "FLASHINFER",
         "--vllm-prefix-mode",
@@ -1410,10 +1431,10 @@ def _build_confucius_start_command(confucius_repo_path: Path) -> str:
         str(confucius_compile_cache_dir),
         "--warmup",
         "--warmup-mode",
-        "background",
+        "background" if gpu_profile.name == "96gb" else "foreground",
         "--warmup-prompt-wav",
         str(confucius_warmup_voice),
-        "--compile-s2a",
+        "--compile-s2a" if gpu_profile.use_torch_compile else "--no-compile-s2a",
         "--gpu-stage-concurrency",
         "1",
         "--postprocess-concurrency",
@@ -1424,8 +1445,17 @@ def _build_confucius_start_command(confucius_repo_path: Path) -> str:
     return " ".join(shlex.quote(str(part)) for part in parts)
 
 
-def _build_indextts25_start_command(indextts25_repo_path: Path) -> str:
-    deploy_config = indextts25_repo_path / "vllm_omni" / "deploy" / "indextts2_5.yaml"
+def _build_indextts25_start_command(indextts25_repo_path: Path, gpu_profile) -> str:
+    from indextts_web.gpu_profiles import write_omni_deploy_config
+
+    deploy_config = Path(os.environ["INDEXTTS25_DEPLOY_CONFIG"]) if os.environ.get("INDEXTTS25_DEPLOY_CONFIG") else (
+        write_omni_deploy_config(
+            indextts25_repo_path / "vllm_omni" / "deploy" / "indextts2_5.yaml",
+            Path(INDEXTTS25_PERSISTENT_DATA_DIR) / "deploy", gpu_profile,
+        )
+    )
+    if not deploy_config.is_file():
+        raise FileNotFoundError(f"IndexTTS 2.5 deployment config missing: {deploy_config}")
     data_dir = Path(INDEXTTS25_PERSISTENT_DATA_DIR)
     parts = [
         "env",
@@ -1435,9 +1465,9 @@ def _build_indextts25_start_command(indextts25_repo_path: Path) -> str:
         f"SPEAKER_SAMPLES_DIR={data_dir / 'speakers'}",
         f"SPEAKER_CACHE_DIR={data_dir / 'cache' / 'speaker-conditioning'}",
         "SPEAKER_CACHE_VERSION=indextts25-v1",
-        f"TORCHINDUCTOR_CACHE_DIR={data_dir / 'cache' / 'torchinductor'}",
-        f"TRITON_CACHE_DIR={data_dir / 'cache' / 'triton'}",
-        f"CUDA_CACHE_PATH={data_dir / 'cache' / 'cuda'}",
+        f"TORCHINDUCTOR_CACHE_DIR={data_dir / 'cache' / gpu_profile.cache_key / 'torchinductor'}",
+        f"TRITON_CACHE_DIR={data_dir / 'cache' / gpu_profile.cache_key / 'triton'}",
+        f"CUDA_CACHE_PATH={data_dir / 'cache' / gpu_profile.cache_key / 'cuda'}",
         INDEXTTS25_VLLM,
         "serve",
         INDEXTTS25_PERSISTENT_MODEL_DIR,
@@ -1457,8 +1487,11 @@ def _build_indextts25_start_command(indextts25_repo_path: Path) -> str:
     return " ".join(shlex.quote(str(part)) for part in parts)
 
 
-def _build_webui_command(persistent_app_path: Path) -> List[str]:
+def _build_webui_command(persistent_app_path: Path, gpu_profile=None) -> List[str]:
     """Build one launch command shared by snapshot and legacy entry points."""
+    if gpu_profile is None:
+        from indextts_web.gpu_profiles import runtime_gpu_profile
+        gpu_profile = runtime_gpu_profile(modal=True)
     return [
         "python",
         "-u",
@@ -1470,9 +1503,9 @@ def _build_webui_command(persistent_app_path: Path) -> List[str]:
         "--model_dir",
         "checkpoints",
         "--gpu_memory_utilization",
-        str(GPU_MEMORY_UTILIZATION),
+        str(gpu_profile.index.gpu_memory_utilization),
         "--qwenemo_gpu_memory_utilization",
-        str(QWENEMO_GPU_MEMORY_UTILIZATION),
+        str(gpu_profile.emotion.gpu_memory_utilization),
         "--tts_backend",
         DEFAULT_TTS_BACKEND,
         "--confucius_repo_dir",
@@ -1482,13 +1515,13 @@ def _build_webui_command(persistent_app_path: Path) -> List[str]:
         "--confucius_port",
         str(CONFUCIUS_PORT),
         "--confucius_start_command",
-        _build_confucius_start_command(persistent_app_path / CONFUCIUS_APP_SUBDIR),
+        _build_confucius_start_command(persistent_app_path / CONFUCIUS_APP_SUBDIR, gpu_profile),
         "--confucius_start_timeout",
         str(CONFUCIUS_STARTUP_TIMEOUT),
         "--confucius_request_timeout",
         str(CONFUCIUS_REQUEST_TIMEOUT),
         "--confucius_vllm_gpu_memory_utilization",
-        str(CONFUCIUS_GPU_MEMORY_UTILIZATION),
+        str(gpu_profile.confucius.gpu_memory_utilization),
         "--confucius_attach_stdio",
         "--confucius_keepalive_interval",
         "60",
@@ -1507,7 +1540,7 @@ def _build_webui_command(persistent_app_path: Path) -> List[str]:
         "--indextts25_served_model_name",
         INDEXTTS25_MODEL_REPO_ID,
         "--indextts25_start_command",
-        _build_indextts25_start_command(persistent_app_path / INDEXTTS25_APP_SUBDIR),
+        _build_indextts25_start_command(persistent_app_path / INDEXTTS25_APP_SUBDIR, gpu_profile),
         "--indextts25_start_timeout",
         str(INDEXTTS25_STARTUP_TIMEOUT),
         "--indextts25_request_timeout",
@@ -1518,8 +1551,8 @@ def _build_webui_command(persistent_app_path: Path) -> List[str]:
         "--indextts25_unhealthy_grace",
         "30",
         "--indextts25_max_parallel_segments",
-        "100",
-        "--use_torch_compile",
+        str(gpu_profile.parallel_segments),
+        "--use_torch_compile" if gpu_profile.use_torch_compile else "--no-use_torch_compile",
     ]
 
 
@@ -1724,15 +1757,12 @@ def _configure_persistent_runtime():
         "CONFUCIUS_WARMUP_PROMPT_WAV": str(confucius_warmup_voice),
         "CONFUCIUS_WARMUP": "1",
         "CONFUCIUS_WARMUP_MODE": "background",
-        "CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION": str(CONFUCIUS_GPU_MEMORY_UTILIZATION),
         "CONFUCIUS_VLLM_ATTENTION_BACKEND": "FLASHINFER",
         "CONFUCIUS_VLLM_PREFIX_MODE": "auto",
         "CONFUCIUS_VLLM_LATENT_MODE": "auto",
-        "CONFUCIUS_USE_TORCH_COMPILE": "1",
         "CONFUCIUS_GPU_STAGE_CONCURRENCY": "1",
         "CONFUCIUS_POSTPROCESS_CONCURRENCY": "2",
         "CONFUCIUS_API_INFERENCE_WORKERS": "1",
-        "CONFUCIUS_REFERENCE_CACHE_SIZE": "100",
     }
     print("Configuring Confucius4-TTS runtime environment:")
     for key, value in confucius_env_vars.items():
@@ -1755,16 +1785,43 @@ def _configure_persistent_runtime():
     if not os.environ.get(INTERNAL_TOKEN_ENV):
         os.environ[INTERNAL_TOKEN_ENV] = uuid.uuid4().hex
 
-    print(f"Working directory: {os.getcwd()}")
-    print(f"PYTHONPATH: {os.environ['PYTHONPATH']}")
-    return persistent_app_path
+    return _configure_gpu_runtime(persistent_app_path)
+
+
+def _configure_gpu_runtime(persistent_app_path: Path) -> Path:
+    """Resolve on the allocated GPU before any model is loaded or snapshotted."""
+    import sys
+    import tempfile
+
+    sys.path.insert(0, RUNTIME_SOURCE_DIR)
+    from indextts_web.gpu_profiles import PROFILE_ENV, runtime_gpu_profile
+    from indextts_web.infrastructure.modal_runtime import prepare_runtime_code
+
+    runtime_path = prepare_runtime_code(
+        Path(RUNTIME_SOURCE_DIR), persistent_app_path,
+        Path(tempfile.mkdtemp(prefix="indextts-runtime-")) / "app",
+    )
+    profile = runtime_gpu_profile(modal=True)
+    profile.check_startup_memory(non_vllm_gib=float(os.environ.get("INDEXTTS_NON_VLLM_RESERVE_GIB", "8")))
+    os.environ[PROFILE_ENV] = profile.to_json()
+    os.environ.setdefault("CONFUCIUS_REFERENCE_CACHE_SIZE", "2" if profile.name == "24gb" else "100")
+    os.environ["PYTHONPATH"] = str(runtime_path)
+    cache_root = Path(PERSISTENT_CACHE_DIR) / "gpu-profiles" / profile.cache_key
+    for variable, subdir in (("TORCHINDUCTOR_CACHE_DIR", "torchinductor"),
+                             ("TRITON_CACHE_DIR", "triton"), ("CUDA_CACHE_PATH", "cuda"),
+                             ("VLLM_CACHE_ROOT", "vllm")):
+        directory = cache_root / subdir
+        directory.mkdir(parents=True, exist_ok=True)
+        os.environ[variable] = str(directory)
+    os.chdir(runtime_path)
+    print(f"[GPU profile] {profile.to_json()}")
+    print(f"Using deployed source: {runtime_path}; persistent data: {persistent_app_path}")
+    return runtime_path
 
 
 @app.cls(
     image=image,
-    gpu="RTX-PRO-6000",  # 96GB Blackwell; use "L40S" if you want Ada/L40S instead.
-    cpu=8.0,
-    memory=32768,
+    gpu="L4",  # Manually choose "L4", "L40S", or "RTX-PRO-6000"; VRAM tuning is automatic.
     timeout=3600,
     scaledown_window=300,
     volumes={
@@ -1816,6 +1873,13 @@ class IndexTTSVllmServer:
 
     @modal.enter(snap=False)
     def wake_up(self):
+        from indextts_web.gpu_profiles import runtime_gpu_profile
+        from indextts_web.infrastructure.gpu import probe_gpu
+
+        profile = runtime_gpu_profile(modal=True)
+        actual = probe_gpu()
+        if actual.capability != profile.gpu.capability or actual.total_bytes < profile.gpu.total_bytes:
+            raise RuntimeError("Snapshot GPU does not match its startup profile; redeploy to rebuild the snapshot")
         _wait_moss_ready(self.moss_server_proc)
         print("Waking vLLM engines after memory snapshot restore...")
         _call_local_json(
@@ -1825,6 +1889,9 @@ class IndexTTSVllmServer:
             internal=True,
         )
         _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
+
+        _call_local_json("/internal/snapshot/warmup", method="POST",
+                         timeout=SNAPSHOT_REQUEST_TIMEOUT, internal=True)
 
     @modal.web_server(port=VLLM_PORT, startup_timeout=SNAPSHOT_STARTUP_TIMEOUT)
     def serve(self):

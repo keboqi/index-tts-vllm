@@ -5,6 +5,7 @@ python-multipart
 descript-audiotools==0.7.2
 matplotlib==3.8.2
 omegaconf
+PyYAML>=6.0
 sentencepiece
 soundfile
 librosa
@@ -19,4 +20,3 @@ qwen-tts
 
 WeTextProcessing; platform_machine != "Darwin"
 wetext; platform_system == "Darwin"
-

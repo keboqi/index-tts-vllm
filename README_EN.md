@@ -5,6 +5,18 @@
 # IndexTTS-vLLM
 </div>
 
+## Modal GPU selection
+
+Set the existing `gpu=` on `IndexTTSVllmServer` in
+[`deploy_vllm_indextts_v2.py`](deploy_vllm_indextts_v2.py) to `"L4"`, `"L40S"`, or
+`"RTX-PRO-6000"`, then run `modal deploy deploy_vllm_indextts_v2.py`. Startup
+detects the allocated VRAM and adjusts vLLM budgets, batch sizes, compilation,
+and active synthesis limits. The GPU selection remains a manual edit.
+
+See [GPU deployment settings and validation status](GPU_DEPLOYMENT.md).
+The smaller-GPU profiles are implemented and covered by CPU/command tests;
+actual Modal GPU cold starts and snapshot restores still require validation.
+
 ## Quick start
 
 ```bash
@@ -177,9 +189,9 @@ python fastapi_webui_v2.py [OPTIONS]
 - `--port` (integer): Port number to run the web API on (default: `8000`).
 - `--model_dir` (string): Path to model checkpoints directory (default: `checkpoints`).
 - `--is_fp16` (flag): Override the default CUDA BF16 inference path with FP16.
-- `--use_torch_compile` (flag): Enable `torch.compile` for faster BF16 model execution on supported CUDA GPUs.
-- `--gpu_memory_utilization` (float): IndexTTS2 vLLM GPU memory utilization limit (default: `0.15`).
-- `--qwenemo_gpu_memory_utilization` (float): QwenEmotion vLLM GPU memory utilization limit (default: `0.05`).
+- `--use_torch_compile` / `--no-use_torch_compile`: Explicitly enable/disable compilation; otherwise use the GPU profile.
+- `--gpu_memory_utilization` (float): Override the automatically selected IndexTTS2 vLLM memory fraction.
+- `--qwenemo_gpu_memory_utilization` (float): Override the automatically selected QwenEmotion vLLM memory fraction.
 - `--tts_backend` (`index`, `index25`, or `confucius`): Default synthesis backend. The server default is `index`.
 - `--confucius_repo_dir` (string): Path to a sibling `Confucius4-TTS` checkout used for lazy startup (default: `../Confucius4-TTS`).
 - `--confucius_host` / `--confucius_port`: Host and port for the managed Confucius FastAPI backend (default: `127.0.0.1:8001`).

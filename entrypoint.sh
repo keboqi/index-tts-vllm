@@ -146,11 +146,11 @@ if [ "$APP_SERVER" = "legacy-api" ]; then
     exec env VLLM_USE_V1=0 python3 api_server.py \
         --model_dir "$MODEL_DIR" \
         --port "$PORT" \
-        --gpu_memory_utilization="$GPU_MEMORY_UTILIZATION"
+        --gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.25}"
 fi
 
 echo "Starting modular IndexTTS WebUI/API server on port $PORT..."
 exec python3 fastapi_webui_v2.py \
     --model_dir "$MODEL_DIR" \
     --port "$PORT" \
-    --gpu_memory_utilization="$GPU_MEMORY_UTILIZATION"
+    "$@"

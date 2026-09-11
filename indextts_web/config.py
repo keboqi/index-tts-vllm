@@ -7,6 +7,8 @@ import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from .gpu_profiles import boolean, memory_fraction, positive_int
+
 TTS_BACKENDS = ("confucius", "index", "index25")
 
 
@@ -59,9 +61,9 @@ class AppSettings:
     model_dir: str = "checkpoints"
     verbose: bool = False
     is_fp16: bool = False
-    use_torch_compile: bool = False
-    gpu_memory_utilization: float = 0.15
-    qwenemo_gpu_memory_utilization: float = 0.05
+    use_torch_compile: bool | None = None
+    gpu_memory_utilization: float | None = None
+    qwenemo_gpu_memory_utilization: float | None = None
     tts_backend: str = "index"
     confucius_repo_dir: str = "../Confucius4-TTS"
     confucius_host: str = "127.0.0.1"
@@ -75,7 +77,7 @@ class AppSettings:
     confucius_request_timeout: float = 900.0
     confucius_keepalive_interval: float = 60.0
     confucius_unhealthy_grace: float = 30.0
-    confucius_vllm_gpu_memory_utilization: float = 0.15
+    confucius_vllm_gpu_memory_utilization: float | None = None
     indextts25_repo_dir: str = "../index-tts-2.5-vllm-omni-experiment"
     indextts25_model_dir: str = ""
     indextts25_data_dir: str = ""
@@ -91,7 +93,7 @@ class AppSettings:
     indextts25_request_timeout: float = 900.0
     indextts25_keepalive_interval: float = 60.0
     indextts25_unhealthy_grace: float = 30.0
-    indextts25_max_parallel_segments: int = 100
+    indextts25_max_parallel_segments: int | None = None
 
     @classmethod
     def from_namespace(cls, namespace: argparse.Namespace) -> AppSettings:
@@ -108,16 +110,18 @@ def build_parser(environ: Mapping[str, str] | None = None) -> argparse.ArgumentP
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model_dir", default="checkpoints")
     parser.add_argument("--is_fp16", action="store_true", default=False)
-    parser.add_argument("--use_torch_compile", action="store_true", default=False)
+    parser.add_argument("--use_torch_compile", action=argparse.BooleanOptionalAction,
+                        default=boolean(env["INDEXTTS_USE_TORCH_COMPILE"])
+                        if env.get("INDEXTTS_USE_TORCH_COMPILE", "").strip() else None)
     parser.add_argument(
         "--gpu_memory_utilization",
-        type=float,
-        default=env_float(env, "GPU_MEMORY_UTILIZATION", 0.15, minimum=0.0, maximum=1.0),
+        type=memory_fraction,
+        default=env.get("GPU_MEMORY_UTILIZATION") or None,
     )
     parser.add_argument(
         "--qwenemo_gpu_memory_utilization",
-        type=float,
-        default=env_float(env, "QWENEMO_GPU_MEMORY_UTILIZATION", 0.05, minimum=0.0, maximum=1.0),
+        type=memory_fraction,
+        default=env.get("QWENEMO_GPU_MEMORY_UTILIZATION") or None,
     )
     parser.add_argument("--tts_backend", choices=TTS_BACKENDS, default="index")
     parser.add_argument("--confucius_repo_dir", default="../Confucius4-TTS")
@@ -162,14 +166,8 @@ def build_parser(environ: Mapping[str, str] | None = None) -> argparse.ArgumentP
     )
     parser.add_argument(
         "--confucius_vllm_gpu_memory_utilization",
-        type=float,
-        default=env_float(
-            env,
-            "CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION",
-            0.15,
-            minimum=0.0,
-            maximum=1.0,
-        ),
+        type=memory_fraction,
+        default=env.get("CONFUCIUS_VLLM_GPU_MEMORY_UTILIZATION") or None,
     )
     parser.add_argument(
         "--indextts25_repo_dir",
@@ -226,8 +224,8 @@ def build_parser(environ: Mapping[str, str] | None = None) -> argparse.ArgumentP
     )
     parser.add_argument(
         "--indextts25_max_parallel_segments",
-        type=int,
-        default=env_int(env, "INDEXTTS25_MAX_PARALLEL_SEGMENTS", 100, maximum=256),
+        type=positive_int,
+        default=env.get("INDEXTTS25_MAX_PARALLEL_SEGMENTS") or None,
     )
     return parser
 
