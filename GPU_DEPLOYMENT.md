@@ -174,6 +174,16 @@ deployment.
 
 ## MOSS model controls
 
+For standalone deployments, `sglang_omni_moss_transcribe.sh` installs SGLang-Omni
+in its Docker container. Its install command enables prerelease resolution
+because SGLang can pin prerelease dependencies such as `cuda-tile==1.6.0rc5`;
+older uv defaults reject these transitive dependencies. See
+[uv prerelease handling](https://docs.astral.sh/uv/concepts/resolution/#pre-release-handling).
+After pulling this fix, retry `bash sglang_omni_moss_transcribe.sh start` (or
+retry MOSS transcription in the WebUI). A failed dependency installation is
+retried automatically when the server CLI is missing. Existing model downloads
+are reused; the native Python fallback is not required for SGLang serving.
+
 The dedicated MOSS service used by Modal reports its state in Model Manager,
 including before the model has been loaded. **Sleep** moves its weights to CPU
 and clears its CUDA allocator cache; **Wake** moves them back to the configured

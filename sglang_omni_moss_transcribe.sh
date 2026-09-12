@@ -222,7 +222,9 @@ if python -c "import sglang_omni" >/dev/null 2>&1 && [ -x .venv/bin/sgl-omni ]; 
   echo "sglang-omni import and CLI work; skipping reinstall."
 else
   echo "Installing sglang-omni editable package..."
-  uv pip install -v -e .
+  # SGLang pins transitive prereleases (e.g. cuda-tile==1.6.0rc5).
+  # Older uv defaults reject these unless prerelease resolution is enabled.
+  uv pip install --prerelease=allow -v -e .
 fi
 
 if [ ! -x .venv/bin/sgl-omni ]; then
