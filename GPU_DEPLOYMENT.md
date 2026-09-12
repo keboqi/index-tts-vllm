@@ -45,6 +45,16 @@ architecture/capacity, wakes the engines, and checks readiness without repeating
 warmup inference. Compiler caches and generated Omni
 configs use separate paths for each resolved GPU profile and Modal image.
 
+Snapshot creation explicitly commits `audio-studio-cache` and `audio-studio-app`
+after runtime/config setup and again after warmup and engine sleep. This makes
+new GPU cache directories and warmup artifacts durable before capture; a commit
+failure aborts snapshot creation. Relying on background commits could leave a
+first snapshot referencing an uncommitted directory, causing restore to fail
+with `vfs.CompleteRestore()` / `failed to walk ... gpu-profiles/...` before any
+Python restore hook runs. See [Modal Volume commit semantics](https://modal.com/docs/guide/volumes#volume-commits-and-reloads).
+Redeploy to rebuild the snapshot with this persistence step; existing model
+checkpoints do not require another `prepare_model` run.
+
 ## Automatic settings
 
 Fractions are calculated from **reported total VRAM**, not free memory or the

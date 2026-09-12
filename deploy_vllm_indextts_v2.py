@@ -1838,6 +1838,20 @@ def _configure_gpu_runtime(persistent_app_path: Path) -> Path:
     return runtime_path
 
 
+def _commit_snapshot_volumes(phase: str) -> None:
+    """Persist paths referenced by the snapshot before another container restores it."""
+    # Snapshot restore walks Volume paths before Python restore hooks can run.
+    # Background/shutdown commits are not a persistence barrier during startup.
+    # Do not reload: model workers may still hold open files on these mounts.
+    for name, volume in (("audio-studio-cache", cache_storage), ("audio-studio-app", app_storage)):
+        print(f"[Snapshot] Committing {name} ({phase})...", flush=True)
+        try:
+            volume.commit()
+        except Exception as exc:
+            raise RuntimeError(f"Snapshot Volume commit failed for {name} ({phase})") from exc
+    print(f"[Snapshot] Persistent Volumes committed ({phase}).", flush=True)
+
+
 @app.cls(
     image=image,
     gpu="L4",  # Manually choose "L4", "L40S", or "RTX-PRO-6000"; VRAM tuning is automatic.
@@ -1862,11 +1876,12 @@ class IndexTTSVllmServer:
     @modal.enter(snap=True)
     def start(self):
         persistent_app_path = _configure_persistent_runtime()
+        cmd = _build_webui_command(persistent_app_path)
+        _commit_snapshot_volumes("before model startup")
 
         self.moss_server_proc = _start_moss_transcribe_server(persistent_app_path)
         _wait_moss_ready(self.moss_server_proc)
 
-        cmd = _build_webui_command(persistent_app_path)
         print(f"Starting FastAPI server: {' '.join(cmd)}")
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
@@ -1889,6 +1904,9 @@ class IndexTTSVllmServer:
             timeout=SNAPSHOT_REQUEST_TIMEOUT,
             internal=True,
         )
+        # Warmup creates compiler caches and application data on both Volumes.
+        # Returning from snap=True permits capture, so commit synchronously here.
+        _commit_snapshot_volumes("before snapshot capture")
 
     @modal.enter(snap=False)
     def wake_up(self):

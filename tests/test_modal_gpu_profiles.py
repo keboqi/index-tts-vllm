@@ -191,6 +191,7 @@ class SnapshotWarmupTests(unittest.IsolatedAsyncioTestCase):
         namespace = {"print": Mock(), "os": os,
                      "subprocess": SimpleNamespace(Popen=Mock()),
                      "_configure_persistent_runtime": lambda: ROOT,
+                     "_commit_snapshot_volumes": lambda phase: events.append(phase),
                      "_start_moss_transcribe_server": Mock(),
                      "_wait_moss_ready": lambda proc: events.append("moss"),
                      "_build_webui_command": lambda path: ["python", "webui.py"],
@@ -199,7 +200,8 @@ class SnapshotWarmupTests(unittest.IsolatedAsyncioTestCase):
                      "SNAPSHOT_REQUEST_TIMEOUT": 900, "SNAPSHOT_STARTUP_TIMEOUT": 1800}
         start = load_definition(ROOT / "deploy_vllm_indextts_v2.py", "IndexTTSVllmServer.start", namespace)
         start(SimpleNamespace())
-        self.assertEqual(events, ["moss", "ready", "/internal/snapshot/warmup", "/internal/snapshot/sleep?level=1"])
+        self.assertEqual(events, ["before model startup", "moss", "ready", "/internal/snapshot/warmup",
+                                  "/internal/snapshot/sleep?level=1", "before snapshot capture"])
 
     def test_restore_validates_gpu_and_readiness_without_repeating_warmup(self):
         events = []
@@ -232,3 +234,81 @@ class SnapshotWarmupTests(unittest.IsolatedAsyncioTestCase):
             warmup = load_definition(ROOT / "fastapi_webui_v2_impl.py", "warmup_model", namespace)
             with self.assertRaisesRegex(FileNotFoundError, "Warmup audio missing"):
                 await warmup(strict=True)
+
+
+class SnapshotVolumeTests(unittest.TestCase):
+    def run_snapshot_start(self, fail_volume=None, fail_commit=None):
+        # Model a fresh mount: local writes only become restorable after commit.
+        pending = {"cache": set(), "app": set()}
+        durable = {"cache": set(), "app": set()}
+        commit_counts = {"cache": 0, "app": 0}
+        volumes = {}
+
+        def commit(name):
+            commit_counts[name] += 1
+            if name == fail_volume and commit_counts[name] == fail_commit:
+                raise OSError("Volume storage unavailable")
+            durable[name].update(pending[name])
+
+        for name in pending:
+            volumes[name] = Mock(commit=Mock(side_effect=lambda name=name: commit(name)))
+
+        def configure():
+            pending["cache"].add("gpu-profiles/new-profile")
+            pending["app"].add("outputs")
+            return ROOT
+
+        def build_command(path):
+            pending["cache"].add("omni-deploy-config.yaml")
+            return ["python", "webui.py"]
+
+        def start_worker(*args, **kwargs):
+            self.assertEqual(durable["cache"], {"gpu-profiles/new-profile", "omni-deploy-config.yaml"})
+            self.assertEqual(durable["app"], {"outputs"})
+            return Mock()
+
+        def snapshot_request(path, **kwargs):
+            if path == "/internal/snapshot/warmup":
+                pending["cache"].add("gpu-profiles/new-profile/compiled-kernel")
+                pending["app"].add("emotion_cache/warmup.json")
+
+        namespace = {"print": Mock(), "os": os,
+                     "cache_storage": volumes["cache"], "app_storage": volumes["app"],
+                     "_configure_persistent_runtime": configure,
+                     "_build_webui_command": build_command,
+                     "_start_moss_transcribe_server": Mock(side_effect=start_worker),
+                     "_wait_moss_ready": Mock(),
+                     "subprocess": SimpleNamespace(Popen=Mock(side_effect=start_worker)),
+                     "_wait_ready": Mock(), "_call_local_json": Mock(side_effect=snapshot_request),
+                     "SNAPSHOT_REQUEST_TIMEOUT": 900, "SNAPSHOT_STARTUP_TIMEOUT": 1800}
+        source = ROOT / "deploy_vllm_indextts_v2.py"
+        load_definition(source, "_commit_snapshot_volumes", namespace)
+        start = load_definition(source, "IndexTTSVllmServer.start", namespace)
+        if fail_volume is None:
+            start(SimpleNamespace())
+            self.assertEqual(durable, pending)
+            self.assertIn("gpu-profiles/new-profile/compiled-kernel", durable["cache"])
+            self.assertIn("emotion_cache/warmup.json", durable["app"])
+            self.assertEqual(commit_counts, {"cache": 2, "app": 2})
+        else:
+            phase = "before model startup" if fail_commit == 1 else "before snapshot capture"
+            with self.assertRaisesRegex(RuntimeError, f"audio-studio-{fail_volume}.*{phase}") as error:
+                start(SimpleNamespace())
+            self.assertIsInstance(error.exception.__cause__, OSError)
+            if fail_commit == 1:
+                namespace["_start_moss_transcribe_server"].assert_not_called()
+                namespace["subprocess"].Popen.assert_not_called()
+            else:
+                self.assertEqual(namespace["_call_local_json"].call_args.args[0],
+                                 "/internal/snapshot/sleep?level=1")
+        for volume in volumes.values():
+            volume.reload.assert_not_called()
+
+    def test_first_snapshot_persists_new_paths_and_warmup_artifacts(self):
+        self.run_snapshot_start()
+
+    def test_failed_commit_aborts_startup_or_capture_for_either_volume(self):
+        for name in ("cache", "app"):
+            for commit_number in (1, 2):
+                with self.subTest(volume=name, commit_number=commit_number):
+                    self.run_snapshot_start(name, commit_number)
