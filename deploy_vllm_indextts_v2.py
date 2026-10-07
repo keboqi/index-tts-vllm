@@ -1874,7 +1874,7 @@ def _commit_snapshot_volumes(phase: str) -> None:
 
 @app.cls(
     image=image,
-    gpu="L4",  # Manually choose "L4", "L40S", or "RTX-PRO-6000"; VRAM tuning is automatic.
+    gpu="RTX-PRO-6000",  # Manually choose "L4", "L40S", or "RTX-PRO-6000"; VRAM tuning is automatic.
     timeout=3600,
     scaledown_window=300,
     volumes={
