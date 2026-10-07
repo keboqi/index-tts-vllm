@@ -52,6 +52,32 @@ failure aborts snapshot creation. Snapshots require committed cache directories;
 an uncommitted path can prevent restore before any Python hook runs. See
 [Modal Volume commit semantics](https://modal.com/docs/guide/volumes#volume-commits-and-reloads).
 
+## Modal build dependency resolution
+
+For pip's `resolution-too-deep`, use the complete main-environment manifest
+[requirements-modal.txt](requirements-modal.txt) and its
+[constraints-main.txt](constraints-main.txt), copied from the deploying
+checkout before installation. The 356 resolved pins target Linux x86_64/Python
+3.12: vLLM 0.10.2/Torch 2.8, Qwen3-TTS/Transformers 4.57.3, WhisperX
+3.3.1/Pyannote 3.3.2, NumPy 1.26.4, and Matplotlib 3.8.2. Core audiotools uses
+the official 0.7.4 tag's exact source archive; its Protobuf requirement remains
+below 5, incompatible with Pyannote 4's requirement for 5 or later. The main
+`audio-separator==0.30.2` uses rotary embeddings 0.6.5, retaining the production
+Roformer models.
+
+ClearVoice 0.1.2 uses its own fresh `/opt/clearvoice-venv`, configured through
+`CLEARVOICE_PYTHON`. [requirements-clearvoice.txt](requirements-clearvoice.txt)
+contains its 72 resolved Linux/Python 3.12 pins, including rotary embeddings
+0.8.3. Each processing job loads its models in a child process and exits to
+release them; existing processed-audio caching still reuses matching results.
+Qwen3-ASR, MOSS, Confucius, and IndexTTS 2.5 also retain their own environments.
+Do not set a global `PIP_CONSTRAINT` that imposes the main pins on these workers.
+
+After changing a local dependency manifest, run
+`modal deploy deploy_vllm_indextts_v2.py` to rebuild the affected image layers.
+`prepare_model` prepares persistent model volumes; rerunning it does not fix
+image build dependencies.
+
 ## Automatic settings
 
 Fractions are calculated from **reported total VRAM**, not free memory or the

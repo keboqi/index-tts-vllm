@@ -11,6 +11,8 @@ import uuid
 from pathlib import Path
 from typing import List, Dict, Optional
 
+from indextts_web.infrastructure.modal_dependencies import install_main_dependencies
+
 # The image supports Ada (L4/L40S) and RTX PRO 6000 Blackwell.
 cuda_version = "13.0.0"
 flavor = "devel" 
@@ -27,6 +29,8 @@ MOSS_TRANSCRIBE_VENV_DIR = "/opt/moss-transcribe-venv"
 MOSS_TRANSCRIBE_PYTHON = f"{MOSS_TRANSCRIBE_VENV_DIR}/bin/python"
 QWEN_ASR_VENV_DIR = "/opt/qwen-asr-venv"
 QWEN_ASR_PYTHON = f"{QWEN_ASR_VENV_DIR}/bin/python"
+CLEARVOICE_VENV_DIR = "/opt/clearvoice-venv"
+CLEARVOICE_PYTHON = f"{CLEARVOICE_VENV_DIR}/bin/python"
 CONFUCIUS_MODEL_REPO_ID = "netease-youdao/Confucius4-TTS"
 CONFUCIUS_W2V_REPO_ID = "facebook/w2v-bert-2.0"
 CONFUCIUS_BIGVGAN_REPO_ID = "nvidia/bigvgan_v2_22khz_80band_256x"
@@ -84,6 +88,8 @@ image = (
         "cmake",
         "sox",
         "libsox-fmt-all",
+        "libgl1",
+        "libglib2.0-0",
         "nodejs",
         "npm",
     )
@@ -123,24 +129,28 @@ image = (
         "TORCH_CPP_LOG_LEVEL": "ERROR"
     })
     .run_commands("pip install --upgrade pip setuptools wheel")
-    .pip_install(
-        "torch",
-        "torchvision",
-        "torchaudio",
-        extra_options="--index-url https://download.pytorch.org/whl/cu130"
-    )
-    .pip_install(
-        "litai",
-        "whisperx",
-        "nemo_toolkit[asr]",
-        "omnivad",
-        "json-repair"
-    )
     .run_commands(
         f"git clone {INDEXTTS_REPO_URL} /app/index-tts-vllm"
     )
+)
+
+# The local manifests are copied into a build layer before installation. A
+# dependency edit therefore invalidates the cache even when git clone is cached.
+# Resolve TTS and main-process ASR together, including vLLM's exact Torch ABI.
+image = install_main_dependencies(image, DEPLOY_SOURCE_ROOT)
+image = (
+    image
     .run_commands(
-        "cd /app/index-tts-vllm && pip install -r requirements.txt"
+        "python -m pip check",
+        # Qwen-TTS requires the CPU distribution and audio-separator requires
+        # the GPU distribution. They share import paths; put GPU bindings last.
+        "python -m pip install --force-reinstall --no-deps "
+        "-c /app/index-tts-vllm/constraints-main.txt onnxruntime-gpu",
+        "python -c \"import torch; "
+        "assert torch.version.cuda, 'IndexTTS installed CPU-only Torch'; "
+        "print('IndexTTS CUDA Torch:', torch.__version__, torch.version.cuda); "
+        "import onnxruntime; assert 'CUDAExecutionProvider' in "
+        "onnxruntime.get_available_providers(), 'Audio separator installed CPU-only ONNX Runtime'\""
     )
     .run_commands(
         f"git clone {CONFUCIUS_REPO_URL} {CONFUCIUS_IMAGE_DIR}"
@@ -183,22 +193,33 @@ image = (
     .run_commands(
         # The PyPI stable-audio-tools wheel is too old for Stable Audio 3
         # configs and also pins older torch builds. Use current source and
-        # keep dependencies explicit so CUDA 13 torch stays installed.
+        # install its runtime dependencies in the constrained main environment.
         "pip install --force-reinstall --no-deps --ignore-requires-python "
         "git+https://github.com/Stability-AI/stable-audio-tools.git",
-        "pip install alias-free-torch dill einops-exts huggingface_hub "
-        "importlib-resources nnAudio PyWavelets safetensors scipy soxr "
-        "torchsde tqdm transformers v-diffusion-pytorch "
-        "vector-quantize-pytorch",
     )
-    .pip_install("alias_free_torch")
-    .pip_install(
-        "pydub",
-        "flashinfer-python"
+    .run_commands(
+        # These official wheels match Torch 2.8/Python 3.12. Select its actual
+        # C++ ABI and avoid an incompatible CUDA 13 source-build fallback.
+        "python -c \"import subprocess, sys, torch; "
+        "assert torch.__version__.split('+')[0] == '2.8.0'; "
+        "assert torch.version.cuda and torch.version.cuda.startswith('12.'); "
+        "abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper(); "
+        "wheel = 'https://github.com/Dao-AILab/flash-attention/releases/download/' "
+        "+ 'v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.8cxx11abi' "
+        "+ abi + '-cp312-cp312-linux_x86_64.whl'; "
+        "subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-deps', wheel], check=True)\""
     )
-    .run_commands("pip install flash-attn --no-build-isolation")
-    .run_commands("pip install 'audio-separator[gpu]'")
-    .run_commands("pip install clearvoice google-genai")
+    .add_local_file(DEPLOY_SOURCE_ROOT / "requirements-clearvoice.txt",
+                    "/opt/requirements-clearvoice.txt", copy=True)
+    .run_commands(
+        # This environment must not see the incompatible Roformer packages.
+        f"python -m venv {CLEARVOICE_VENV_DIR}",
+        f"{CLEARVOICE_PYTHON} -m pip install --upgrade pip setuptools wheel",
+        f"{CLEARVOICE_PYTHON} -m pip install -r /opt/requirements-clearvoice.txt",
+        f"{CLEARVOICE_PYTHON} -c \"from clearvoice import ClearVoice; import torch; "
+        "assert torch.version.cuda, 'ClearVoice installed CPU-only Torch'; "
+        "print('ClearVoice environment ready')\"",
+    )
     .run_commands(
         f"python -m venv --system-site-packages {MOSS_TRANSCRIBE_VENV_DIR}",
         f"{MOSS_TRANSCRIBE_PYTHON} -m pip install --upgrade pip setuptools wheel",
@@ -207,23 +228,12 @@ image = (
         "fastapi uvicorn python-multipart",
         f"{MOSS_TRANSCRIBE_PYTHON} -m pip install --no-deps "
         "git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git",
-        "cd /app/index-tts-vllm && python -c "
-        "\"from indextts.utils.maskgct.models.tts.maskgct.llama_nar "
-        "import DiffLlama; print('IndexTTS Transformers compatibility check passed')\"",
     )
-    # MOSS and Qwen ASR use their own Transformers versions below.
-    .pip_install(
-        "yt-dlp[default]",
-        "yt-dlp-ejs",
-        "bgutil-ytdlp-pot-provider",
-    )
-    .pip_install("numpy<2")
     .run_commands(
         "npm install -g n",
         "n 22",
         "node --version",
     )
-    .pip_install("pedalboard", "PyYAML>=6.0")
     .run_commands(
         # Reuse the CUDA/audio/diarization stack, but install Qwen ASR's exact
         # Transformers dependency inside its own venv, never in the TTS env.
@@ -237,6 +247,7 @@ image = (
         "print('Qwen3-ASR environment ready')\"",
     )
     .env({
+        "CLEARVOICE_PYTHON": CLEARVOICE_PYTHON,
         "QWEN_OMNIVAD_PYTHON": QWEN_ASR_PYTHON,
         "QWEN_OMNIVAD_MODEL_DIR": "/persistent_app/checkpoints/qwen_omnivad",
         "QWEN_OMNIVAD_CACHE_DIR": "/persistent_cache/qwen_omnivad",
@@ -245,6 +256,11 @@ image = (
     # these exact local sources at startup, not the code in the model Volume.
     .add_local_dir(str(DEPLOY_SOURCE_ROOT), RUNTIME_SOURCE_DIR,
                    copy=True, ignore=_ignore_runtime_source)
+    .run_commands(
+        f"cd {RUNTIME_SOURCE_DIR} && python -c "
+        "\"from indextts.utils.maskgct.models.tts.maskgct.llama_nar "
+        "import DiffLlama; print('IndexTTS Transformers compatibility check passed')\""
+    )
 )
 
 app = modal.App("audio-studio", image=image)

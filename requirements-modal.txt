@@ -1,0 +1,32 @@
+# Main Linux/Python 3.12 environment. Resolve all main-process features together.
+-c constraints-main.txt
+-r requirements-core.txt
+
+litai
+whisperx
+nemo_toolkit[asr]
+omnivad
+json-repair
+audio-separator[gpu]
+flashinfer-python
+
+# Stable Audio 3 source is installed separately with --no-deps; these are its
+# runtime dependencies used by the application's generation integration.
+alias-free-torch
+dill
+einops-exts
+importlib-resources
+nnAudio
+PyWavelets
+safetensors
+scipy
+soxr
+torchsde
+tqdm
+transformers
+v-diffusion-pytorch
+vector-quantize-pytorch
+
+yt-dlp[default]
+yt-dlp-ejs
+bgutil-ytdlp-pot-provider

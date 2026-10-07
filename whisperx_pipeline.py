@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from indextts_web.infrastructure.callables import filter_supported_keyword_arguments
 from whisperx_segment_refiner import RefinerConfig, refine_proxy_segments
 
 # Optional imports — gracefully degrade when not installed
@@ -859,6 +860,22 @@ def _load_whisperx_asr_model(
         return whisperx.load_model(WHISPERX_MODEL_SIZE, device, **kwargs)
 
 
+def _load_whisperx_diarization_pipeline(hf_token: str, device: str) -> Any:
+    """Preserve authentication across WhisperX's constructor API versions."""
+    options, dropped = filter_supported_keyword_arguments(
+        DiarizationPipeline,
+        {"token": hf_token, "device": device, "cache_dir": WHISPERX_PYANNOTE_CACHE},
+    )
+    if "token" in dropped:
+        authentication, unsupported = filter_supported_keyword_arguments(
+            DiarizationPipeline, {"use_auth_token": hf_token}
+        )
+        if unsupported:
+            raise RuntimeError("WhisperX diarization does not accept HuggingFace authentication")
+        options.update(authentication)
+    return DiarizationPipeline(**options)
+
+
 def _format_timestamp(seconds: float) -> str:
     """Convert seconds to mm:ss.xxx format."""
     if seconds is None:
@@ -1470,11 +1487,7 @@ def _run_whisperx_pipeline_sync(
     print("Diarizing...")
     diarize_model = None
     try:
-        diarize_model = DiarizationPipeline(
-            token=hf_token,
-            device=device,
-            cache_dir=WHISPERX_PYANNOTE_CACHE,
-        )
+        diarize_model = _load_whisperx_diarization_pipeline(hf_token, device)
         diarize_segments = diarize_model(audio)
         proxy_result = whisperx.assign_word_speakers(diarize_segments, proxy_result)
     except Exception as exc:

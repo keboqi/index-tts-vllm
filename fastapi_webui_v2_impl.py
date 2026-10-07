@@ -67,7 +67,7 @@ import gzip
 import threading
 import zipfile
 import unicodedata
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import copy
 import gc
 from dataclasses import dataclass, field, replace
@@ -338,6 +338,7 @@ from indextts_web.config import load_settings
 from indextts_web.infrastructure.concurrency import ConcurrencyBudget
 from indextts_web.infrastructure.gpu_work import GpuWorkCoordinator, await_gpu_job, gpu_operation
 from indextts_web.infrastructure.vllm_memory import GpuWakeError
+from indextts_web.services.audio import clearvoice_worker
 from indextts_web.services.translation.moss_client import MossModelClient
 from indextts_web.services.translation.qwen_worker import QwenOmniVadWorker
 
@@ -1412,12 +1413,12 @@ async def _run_clearvoice_pipeline(
 ) -> Tuple[AudioSegment, Optional[AudioSegment]]:
     if not (apply_enhancement or apply_super_resolution):
         return original_audio, None
-    if ClearVoice is None:
+    if not clearvoice_worker.is_available(local_available=ClearVoice is not None):
         raise TranslateWorkflowHttpError(
             500,
             {
                 "status": "error",
-                "message": "ClearVoice package is required for enhancement or super-resolution.",
+                "message": "ClearVoice is unavailable. Install clearvoice locally or configure CLEARVOICE_PYTHON with its separate Python interpreter.",
             },
         )
 
@@ -6837,6 +6838,12 @@ def _apply_clearvoice_parallel_sync(
             os.close(fd)
             _ffmpeg_extract_segment(input_path, chunk_path, start_ms, end_ms, reencode=True)
             _track(chunk_path)
+            if not clearvoice_worker.is_configured():
+                chunk_output = chunk_path
+                for enabled, suffix in ((apply_enhancement, "_se"), (apply_super_resolution, "_sr")):
+                    if enabled:
+                        chunk_output = _append_suffix_to_path(chunk_output, suffix)
+                        _track(chunk_output)
             chunk_jobs.append(
                 ClearVoiceParallelChunkJob(
                     chunk_idx=idx,
@@ -6851,16 +6858,30 @@ def _apply_clearvoice_parallel_sync(
             _safe_remove_file(path)
         raise
 
-    ctx = multiprocessing.get_context("spawn")
     worker_count = max(1, min(config.max_workers, len(chunk_jobs)))
     results: List[ClearVoiceParallelChunkResult] = []
+    futures = []
     start_time = time.perf_counter()
     try:
-        with ProcessPoolExecutor(max_workers=worker_count, mp_context=ctx) as pool:
+        # The separate interpreter owns GPU models. Threads launch those workers
+        # without also importing this application in spawned pool processes.
+        pool_options = {"max_workers": worker_count}
+        pool_class = ThreadPoolExecutor if clearvoice_worker.is_configured() else ProcessPoolExecutor
+        if pool_class is ProcessPoolExecutor:
+            pool_options["mp_context"] = multiprocessing.get_context("spawn")
+        with pool_class(**pool_options) as pool:
             futures = [pool.submit(_run_clearvoice_chunk_job, job) for job in chunk_jobs]
             for future in as_completed(futures):
                 results.append(future.result())
     except Exception:
+        # The pool has waited for every job to exit. Keep successful sibling
+        # outputs in the cleanup list when another chunk failed.
+        for future in futures:
+            try:
+                for generated in future.result().generated_paths:
+                    _track(generated)
+            except Exception:
+                pass
         for path in cleanup_paths:
             _safe_remove_file(path)
         raise
@@ -6906,8 +6927,15 @@ def _apply_clearvoice_processing_sync(
 ) -> Tuple[str, List[str], Optional[str]]:
     """Run ClearVoice enhancement/super-resolution synchronously."""
     global _enhancement_model, _super_res_model, _current_enhancement_model_name
+
+    if clearvoice_worker.is_configured():
+        model_name = enhancement_model_name if enhancement_model_name in AVAILABLE_ENHANCEMENT_MODELS else DEFAULT_ENHANCEMENT_MODEL
+        return clearvoice_worker.process(
+            input_path, apply_enhancement, apply_super_resolution,
+            enhancement_model_name=model_name,
+        )
     
-    if ClearVoice is None:
+    if not clearvoice_worker.is_available(local_available=ClearVoice is not None):
         raise RuntimeError("ClearVoice package is not available in the environment.")
     
     # Determine which enhancement model to use
@@ -11538,10 +11566,10 @@ class SpeakerAPIWrapper:
             loop = asyncio.get_event_loop()
             clearvoice_requested = apply_enhancement or apply_super_resolution
 
-            if clearvoice_requested and ClearVoice is None:
+            if clearvoice_requested and not clearvoice_worker.is_available(local_available=ClearVoice is not None):
                 return {
                     "status": "error",
-                    "message": "ClearVoice package is required for enhancement or super-resolution. Install the `clearvoice` package to enable these options."
+                    "message": "ClearVoice is unavailable. Install clearvoice locally or configure CLEARVOICE_PYTHON with its separate Python interpreter."
                 }
 
             existing_presets = await loop.run_in_executor(executor, self.preset_manager.list_presets)
@@ -17981,8 +18009,8 @@ async def add_speaker(
         apply_super_resolution_flag = bool(super_resolution_voice)
         print(f"🎚️ API: ClearVoice options -> enhancement={apply_enhancement}, super_resolution={apply_super_resolution_flag}")
         
-        if (apply_enhancement or apply_super_resolution_flag) and ClearVoice is None:
-            error_msg = "ClearVoice is required for enhancement or super-resolution. Install the `clearvoice` package to enable these options."
+        if (apply_enhancement or apply_super_resolution_flag) and not clearvoice_worker.is_available(local_available=ClearVoice is not None):
+            error_msg = "ClearVoice is unavailable. Install clearvoice locally or configure CLEARVOICE_PYTHON with its separate Python interpreter."
             print(f"❌ API: {error_msg}")
             return _success_error(error_msg)
         

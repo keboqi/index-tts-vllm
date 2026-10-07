@@ -2,7 +2,9 @@ vllm==0.10.2
 fastapi
 uvicorn
 python-multipart
-descript-audiotools==0.7.2
+# Official 0.7.4 tag: fixes the obsolete Protobuf cap in the PyPI 0.7.2 wheel.
+# Pin the archive revision; Git/LFS are not needed to install it.
+descript-audiotools @ https://github.com/descriptinc/audiotools/archive/ffe03e96b4d2dfb3ddecad289a6a95a7e96cc8c6.zip
 matplotlib==3.8.2
 omegaconf
 PyYAML>=6.0
