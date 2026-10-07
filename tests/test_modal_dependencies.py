@@ -1,9 +1,14 @@
+import importlib.util
+import os
 import shlex
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from indextts_web.infrastructure.modal_dependencies import MAIN_DEPENDENCY_FILES, install_main_dependencies
+from tests.support import ROOT
 
 
 class FakeImage:
@@ -82,6 +87,52 @@ class ModalDependencyTests(unittest.TestCase):
             shlex.split(image.calls[-1][1]),
             ["python", "-m", "pip", "install", "-r", "/opt/current app/requirements-modal.txt"],
         )
+
+
+@unittest.skipUnless(importlib.util.find_spec("modal"), "Modal SDK required for remote import test")
+class ModalContainerImportTests(unittest.TestCase):
+    def test_container_import_registers_services_without_checkout_or_build_files(self):
+        import modal
+
+        with tempfile.TemporaryDirectory(prefix="modal container import ") as directory:
+            root = Path(directory)
+            (root / "deploy_vllm_indextts_v2.py").write_bytes((ROOT / "deploy_vllm_indextts_v2.py").read_bytes())
+            # Only the mounted deployment script and SDK are importable. This
+            # reproduces /root in a Function container, without the checkout.
+            script = '''
+import importlib.abc
+import sys
+from unittest.mock import patch
+
+sys.path.insert(0, sys.argv[1])
+import modal
+
+class RejectApplicationImports(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "indextts_web" or fullname.startswith("indextts_web."):
+            raise ModuleNotFoundError("Application source is not on the container import path")
+
+sys.meta_path.insert(0, RejectApplicationImports())
+with patch.object(modal, "is_local", return_value=False), patch.object(
+    modal.Image, "from_registry", side_effect=AssertionError("Remote import must not construct an image")
+):
+    import deploy_vllm_indextts_v2 as deploy
+    assert deploy.app.name == "audio-studio"
+    assert deploy.image is None
+    assert isinstance(deploy.prepare_model, modal.Function)
+    assert isinstance(deploy.clear_cache, modal.Function)
+    assert isinstance(deploy.IndexTTSVllmServer, modal.Cls)
+print("Container import registered all services")
+'''
+            environment = os.environ.copy()
+            environment.pop("PYTHONPATH", None)
+            options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(Path(modal.__file__).resolve().parent.parent)],
+                cwd=root, env=environment, capture_output=True, text=True, timeout=30, **options,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Container import registered all services", result.stdout)
 
 
 if __name__ == "__main__":

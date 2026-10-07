@@ -11,8 +11,6 @@ import uuid
 from pathlib import Path
 from typing import List, Dict, Optional
 
-from indextts_web.infrastructure.modal_dependencies import install_main_dependencies
-
 # The image supports Ada (L4/L40S) and RTX PRO 6000 Blackwell.
 cuda_version = "13.0.0"
 flavor = "devel" 
@@ -75,193 +73,199 @@ def _ignore_runtime_source(path) -> bool:
     return not (len(relative.parts) == 1 and relative.suffix in {".py", ".html", ".sh"}
                 and not relative.name.startswith("deploy_"))
 
-# Create Modal image for IndexTTS v2 with vLLM optimization
-image = (
-    modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
-    .apt_install(
-        "ffmpeg",
-        "git",
-        "wget",
-        "build-essential",
-        "gcc",
-        "g++",
-        "cmake",
-        "sox",
-        "libsox-fmt-all",
-        "libgl1",
-        "libglib2.0-0",
-        "nodejs",
-        "npm",
-    )
-    .env({
-        "CUDA_HOME": "/usr/local/cuda",
-        "CUDA_PATH": "/usr/local/cuda", 
-        "TORCH_CUDA_ARCH_LIST": "6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0;12.0",
-        "FORCE_CUDA": "1",
-        "CXX": "g++",
-        "CC": "gcc",
-        
-        # vLLM sleep mode uses its CUDA memory pool; PyTorch expandable
-        # segments are incompatible with that allocator.
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
-        "TORCH_CUDNN_BENCHMARK": "1",  # Enable cuDNN autotuning
-        "TORCH_COMPILE_MODE": "reduce-overhead",  # Optimize for TTS workloads
+# Only the deploying process has the checkout and dependency manifests.
+# Modal containers import this module to register functions in the existing image.
+image = None
+if modal.is_local():
+    from indextts_web.infrastructure.modal_dependencies import install_main_dependencies
 
-        # Cache directories for faster subsequent runs
-        "HF_HOME": "/persistent_cache/huggingface",
-        "HUGGINGFACE_HUB_CACHE": "/persistent_cache/huggingface/hub",
-        "TORCH_HOME": "/persistent_cache/torch",
-        "TRANSFORMERS_CACHE": "/persistent_cache/transformers",
-        "CUDA_CACHE_PATH": "/persistent_cache/cuda_cache",
-        "VLLM_CACHE": "/persistent_cache/vllm_cache",
-        "TRITON_CACHE_DIR": "/persistent_cache/triton",
-        "VLLM_SERVER_DEV_MODE": "1",
-        # Modal containers do not provide a Docker daemon. Run MOSS directly
-        # through Transformers.
-        "MOSS_TRANSCRIBE_MANAGE_BACKEND": "0",
-        "MOSS_TRANSCRIBE_BACKEND": "http",
-        "MOSS_TRANSCRIBE_DEVICE": "cuda:0",
-        "MOSS_TRANSCRIBE_MODEL": "/persistent_app/checkpoints/MOSS-Transcribe-Diarize",
-        "MOSS_TRANSCRIBE_SGLANG_URL": "http://127.0.0.1:8003",
-        "HY_MT_TRANSLATION_LOCAL_DIR": "/persistent_app/checkpoints/hy-mt",
-        "TORCHINDUCTOR_COMPILE_THREADS": "1",
-        "TORCH_NCCL_ENABLE_MONITORING": "0",
-        "TORCH_CPP_LOG_LEVEL": "ERROR"
-    })
-    .run_commands("pip install --upgrade pip setuptools wheel")
-    .run_commands(
-        f"git clone {INDEXTTS_REPO_URL} /app/index-tts-vllm"
-    )
-)
+    # Create Modal image for IndexTTS v2 with vLLM optimization
+    image = (
+        modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
+        .apt_install(
+            "ffmpeg",
+            "git",
+            "wget",
+            "build-essential",
+            "gcc",
+            "g++",
+            "cmake",
+            "sox",
+            "libsox-fmt-all",
+            "libgl1",
+            "libglib2.0-0",
+            "nodejs",
+            "npm",
+        )
+        .env({
+            "CUDA_HOME": "/usr/local/cuda",
+            "CUDA_PATH": "/usr/local/cuda",
+            "TORCH_CUDA_ARCH_LIST": "6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0;12.0",
+            "FORCE_CUDA": "1",
+            "CXX": "g++",
+            "CC": "gcc",
 
-# The local manifests are copied into a build layer before installation. A
-# dependency edit therefore invalidates the cache even when git clone is cached.
-# Resolve TTS and main-process ASR together, including vLLM's exact Torch ABI.
-image = install_main_dependencies(image, DEPLOY_SOURCE_ROOT)
-image = (
-    image
-    .run_commands(
-        "python -m pip check",
-        # Qwen-TTS requires the CPU distribution and audio-separator requires
-        # the GPU distribution. They share import paths; put GPU bindings last.
-        "python -m pip install --force-reinstall --no-deps "
-        "-c /app/index-tts-vllm/constraints-main.txt onnxruntime-gpu",
-        "python -c \"import torch; "
-        "assert torch.version.cuda, 'IndexTTS installed CPU-only Torch'; "
-        "print('IndexTTS CUDA Torch:', torch.__version__, torch.version.cuda); "
-        "import onnxruntime; assert 'CUDAExecutionProvider' in "
-        "onnxruntime.get_available_providers(), 'Audio separator installed CPU-only ONNX Runtime'\""
+            # vLLM sleep mode uses its CUDA memory pool; PyTorch expandable
+            # segments are incompatible with that allocator.
+            "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
+            "TORCH_CUDNN_BENCHMARK": "1",  # Enable cuDNN autotuning
+            "TORCH_COMPILE_MODE": "reduce-overhead",  # Optimize for TTS workloads
+
+            # Cache directories for faster subsequent runs
+            "HF_HOME": "/persistent_cache/huggingface",
+            "HUGGINGFACE_HUB_CACHE": "/persistent_cache/huggingface/hub",
+            "TORCH_HOME": "/persistent_cache/torch",
+            "TRANSFORMERS_CACHE": "/persistent_cache/transformers",
+            "CUDA_CACHE_PATH": "/persistent_cache/cuda_cache",
+            "VLLM_CACHE": "/persistent_cache/vllm_cache",
+            "TRITON_CACHE_DIR": "/persistent_cache/triton",
+            "VLLM_SERVER_DEV_MODE": "1",
+            # Modal containers do not provide a Docker daemon. Run MOSS directly
+            # through Transformers.
+            "MOSS_TRANSCRIBE_MANAGE_BACKEND": "0",
+            "MOSS_TRANSCRIBE_BACKEND": "http",
+            "MOSS_TRANSCRIBE_DEVICE": "cuda:0",
+            "MOSS_TRANSCRIBE_MODEL": "/persistent_app/checkpoints/MOSS-Transcribe-Diarize",
+            "MOSS_TRANSCRIBE_SGLANG_URL": "http://127.0.0.1:8003",
+            "HY_MT_TRANSLATION_LOCAL_DIR": "/persistent_app/checkpoints/hy-mt",
+            "TORCHINDUCTOR_COMPILE_THREADS": "1",
+            "TORCH_NCCL_ENABLE_MONITORING": "0",
+            "TORCH_CPP_LOG_LEVEL": "ERROR"
+        })
+        .run_commands("pip install --upgrade pip setuptools wheel")
+        .run_commands(
+            f"git clone {INDEXTTS_REPO_URL} /app/index-tts-vllm"
+        )
     )
-    .run_commands(
-        f"git clone {CONFUCIUS_REPO_URL} {CONFUCIUS_IMAGE_DIR}"
+
+    # The local manifests are copied into a build layer before installation. A
+    # dependency edit therefore invalidates the cache even when git clone is cached.
+    # Resolve TTS and main-process ASR together, including vLLM's exact Torch ABI.
+    image = install_main_dependencies(image, DEPLOY_SOURCE_ROOT)
+    image = (
+        image
+        .run_commands(
+            "python -m pip check",
+            # Qwen-TTS requires the CPU distribution and audio-separator requires
+            # the GPU distribution. They share import paths; put GPU bindings last.
+            "python -m pip install --force-reinstall --no-deps "
+            "-c /app/index-tts-vllm/constraints-main.txt onnxruntime-gpu",
+            "python -c \"import torch; "
+            "assert torch.version.cuda, 'IndexTTS installed CPU-only Torch'; "
+            "print('IndexTTS CUDA Torch:', torch.__version__, torch.version.cuda); "
+            "import onnxruntime; assert 'CUDAExecutionProvider' in "
+            "onnxruntime.get_available_providers(), 'Audio separator installed CPU-only ONNX Runtime'\""
+        )
+        .run_commands(
+            f"git clone {CONFUCIUS_REPO_URL} {CONFUCIUS_IMAGE_DIR}"
+        )
+        .run_commands(
+            f"python -m venv {CONFUCIUS_VENV_DIR}",
+            f"{CONFUCIUS_PYTHON} -m pip install --upgrade pip setuptools wheel",
+            f"cd {CONFUCIUS_IMAGE_DIR} && {CONFUCIUS_PYTHON} -m pip install -r requirements.txt",
+            f"cd {CONFUCIUS_IMAGE_DIR} && {CONFUCIUS_PYTHON} -m pip install --force-reinstall -r requirements-cu128.txt",
+            f"cd {CONFUCIUS_IMAGE_DIR} && {CONFUCIUS_PYTHON} -m pip install -r requirements-vllm.txt",
+            f"{CONFUCIUS_PYTHON} -m pip install \"numpy<2\" \"torchcodec==0.9.*\"",
+        )
+        .run_commands(
+            "pip install uv",
+            f"git clone {INDEXTTS25_REPO_URL} {INDEXTTS25_IMAGE_DIR}",
+            f"git -C {INDEXTTS25_IMAGE_DIR} fetch origin {INDEXTTS25_REPO_REF}",
+            f"git -C {INDEXTTS25_IMAGE_DIR} checkout --detach {INDEXTTS25_REPO_REF}",
+            "uv python install 3.11",
+            f"uv venv --python 3.11 --seed {INDEXTTS25_VENV_DIR}",
+            # Image builders have no GPU, so auto detection installs CPU-only
+            # PyTorch. Select the CUDA wheel explicitly for the CUDA 13 image.
+            f"uv pip install --python {INDEXTTS25_PYTHON} 'vllm==0.27.0' "
+            f"--torch-backend={INDEXTTS25_TORCH_BACKEND}",
+            f"uv pip install --python {INDEXTTS25_PYTHON} -e '{INDEXTTS25_IMAGE_DIR}[indextts2]'",
+            f"uv pip install --python {INDEXTTS25_PYTHON} -e "
+            f"'{INDEXTTS25_IMAGE_DIR}/experiments/indextts25_backend_compat'",
+            f"uv pip install --python {INDEXTTS25_PYTHON} 'huggingface_hub[cli]'",
+            f"{INDEXTTS25_PYTHON} "
+            f"{INDEXTTS25_IMAGE_DIR}/experiments/indextts25_backend_compat/src/"
+            "indextts25_compat/patch_flashinfer.py",
+            # Importing flashinfer initializes CUDA and cannot run in Modal's
+            # GPU-less image builder. The patcher above validates its target; here
+            # verify that the installed Torch wheel has CUDA support without
+            # initializing a CUDA device.
+            f"{INDEXTTS25_PYTHON} -c \"import importlib.metadata, torch; "
+            "assert torch.version.cuda, 'IndexTTS 2.5 installed CPU-only Torch'; "
+            "print('IndexTTS 2.5 CUDA Torch:', torch.version.cuda, "
+            "'FlashInfer:', importlib.metadata.version('flashinfer-python'))\"",
+        )
+        .run_commands(
+            # The PyPI stable-audio-tools wheel is too old for Stable Audio 3
+            # configs and also pins older torch builds. Use current source and
+            # install its runtime dependencies in the constrained main environment.
+            "pip install --force-reinstall --no-deps --ignore-requires-python "
+            "git+https://github.com/Stability-AI/stable-audio-tools.git",
+        )
+        .run_commands(
+            # These official wheels match Torch 2.8/Python 3.12. Select its actual
+            # C++ ABI and avoid an incompatible CUDA 13 source-build fallback.
+            "python -c \"import subprocess, sys, torch; "
+            "assert torch.__version__.split('+')[0] == '2.8.0'; "
+            "assert torch.version.cuda and torch.version.cuda.startswith('12.'); "
+            "abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper(); "
+            "wheel = 'https://github.com/Dao-AILab/flash-attention/releases/download/' "
+            "+ 'v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.8cxx11abi' "
+            "+ abi + '-cp312-cp312-linux_x86_64.whl'; "
+            "subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-deps', wheel], check=True)\""
+        )
+        .add_local_file(DEPLOY_SOURCE_ROOT / "requirements-clearvoice.txt",
+                        "/opt/requirements-clearvoice.txt", copy=True)
+        .run_commands(
+            # This environment must not see the incompatible Roformer packages.
+            f"python -m venv {CLEARVOICE_VENV_DIR}",
+            f"{CLEARVOICE_PYTHON} -m pip install --upgrade pip setuptools wheel",
+            f"{CLEARVOICE_PYTHON} -m pip install -r /opt/requirements-clearvoice.txt",
+            f"{CLEARVOICE_PYTHON} -c \"from clearvoice import ClearVoice; import torch; "
+            "assert torch.version.cuda, 'ClearVoice installed CPU-only Torch'; "
+            "print('ClearVoice environment ready')\"",
+        )
+        .run_commands(
+            f"python -m venv --system-site-packages {MOSS_TRANSCRIBE_VENV_DIR}",
+            f"{MOSS_TRANSCRIBE_PYTHON} -m pip install --upgrade pip setuptools wheel",
+            f"{MOSS_TRANSCRIBE_PYTHON} -m pip install "
+            "'transformers>=5.6.0,<6' av librosa soundfile soxr "
+            "fastapi uvicorn python-multipart",
+            f"{MOSS_TRANSCRIBE_PYTHON} -m pip install --no-deps "
+            "git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git",
+        )
+        .run_commands(
+            "npm install -g n",
+            "n 22",
+            "node --version",
+        )
+        .run_commands(
+            # Reuse the CUDA/audio/diarization stack, but install Qwen ASR's exact
+            # Transformers dependency inside its own venv, never in the TTS env.
+            f"python -m venv --system-site-packages {QWEN_ASR_VENV_DIR}",
+            f"{QWEN_ASR_PYTHON} -m pip install --upgrade pip setuptools wheel",
+            f"{QWEN_ASR_PYTHON} -m pip install 'qwen-asr==0.0.6' 'transformers==4.57.6'",
+            f"{QWEN_ASR_PYTHON} -c \"from qwen_asr import Qwen3ASRModel; "
+            "from omnivad import OmniVAD; import litai, transformers, torch; "
+            "assert transformers.__version__ == '4.57.6'; "
+            "assert torch.version.cuda, 'Qwen ASR requires CUDA Torch'; "
+            "print('Qwen3-ASR environment ready')\"",
+        )
+        .env({
+            "CLEARVOICE_PYTHON": CLEARVOICE_PYTHON,
+            "QWEN_OMNIVAD_PYTHON": QWEN_ASR_PYTHON,
+            "QWEN_OMNIVAD_MODEL_DIR": "/persistent_app/checkpoints/qwen_omnivad",
+            "QWEN_OMNIVAD_CACHE_DIR": "/persistent_cache/qwen_omnivad",
+        })
+        # copy=True makes source changes part of the image/snapshot identity. Use
+        # these exact local sources at startup, not the code in the model Volume.
+        .add_local_dir(str(DEPLOY_SOURCE_ROOT), RUNTIME_SOURCE_DIR,
+                       copy=True, ignore=_ignore_runtime_source)
+        .run_commands(
+            f"cd {RUNTIME_SOURCE_DIR} && python -c "
+            "\"from indextts.utils.maskgct.models.tts.maskgct.llama_nar "
+            "import DiffLlama; print('IndexTTS Transformers compatibility check passed')\""
+        )
     )
-    .run_commands(
-        f"python -m venv {CONFUCIUS_VENV_DIR}",
-        f"{CONFUCIUS_PYTHON} -m pip install --upgrade pip setuptools wheel",
-        f"cd {CONFUCIUS_IMAGE_DIR} && {CONFUCIUS_PYTHON} -m pip install -r requirements.txt",
-        f"cd {CONFUCIUS_IMAGE_DIR} && {CONFUCIUS_PYTHON} -m pip install --force-reinstall -r requirements-cu128.txt",
-        f"cd {CONFUCIUS_IMAGE_DIR} && {CONFUCIUS_PYTHON} -m pip install -r requirements-vllm.txt",
-        f"{CONFUCIUS_PYTHON} -m pip install \"numpy<2\" \"torchcodec==0.9.*\"",
-    )
-    .run_commands(
-        "pip install uv",
-        f"git clone {INDEXTTS25_REPO_URL} {INDEXTTS25_IMAGE_DIR}",
-        f"git -C {INDEXTTS25_IMAGE_DIR} fetch origin {INDEXTTS25_REPO_REF}",
-        f"git -C {INDEXTTS25_IMAGE_DIR} checkout --detach {INDEXTTS25_REPO_REF}",
-        "uv python install 3.11",
-        f"uv venv --python 3.11 --seed {INDEXTTS25_VENV_DIR}",
-        # Image builders have no GPU, so auto detection installs CPU-only
-        # PyTorch. Select the CUDA wheel explicitly for the CUDA 13 image.
-        f"uv pip install --python {INDEXTTS25_PYTHON} 'vllm==0.27.0' "
-        f"--torch-backend={INDEXTTS25_TORCH_BACKEND}",
-        f"uv pip install --python {INDEXTTS25_PYTHON} -e '{INDEXTTS25_IMAGE_DIR}[indextts2]'",
-        f"uv pip install --python {INDEXTTS25_PYTHON} -e "
-        f"'{INDEXTTS25_IMAGE_DIR}/experiments/indextts25_backend_compat'",
-        f"uv pip install --python {INDEXTTS25_PYTHON} 'huggingface_hub[cli]'",
-        f"{INDEXTTS25_PYTHON} "
-        f"{INDEXTTS25_IMAGE_DIR}/experiments/indextts25_backend_compat/src/"
-        "indextts25_compat/patch_flashinfer.py",
-        # Importing flashinfer initializes CUDA and cannot run in Modal's
-        # GPU-less image builder. The patcher above validates its target; here
-        # verify that the installed Torch wheel has CUDA support without
-        # initializing a CUDA device.
-        f"{INDEXTTS25_PYTHON} -c \"import importlib.metadata, torch; "
-        "assert torch.version.cuda, 'IndexTTS 2.5 installed CPU-only Torch'; "
-        "print('IndexTTS 2.5 CUDA Torch:', torch.version.cuda, "
-        "'FlashInfer:', importlib.metadata.version('flashinfer-python'))\"",
-    )
-    .run_commands(
-        # The PyPI stable-audio-tools wheel is too old for Stable Audio 3
-        # configs and also pins older torch builds. Use current source and
-        # install its runtime dependencies in the constrained main environment.
-        "pip install --force-reinstall --no-deps --ignore-requires-python "
-        "git+https://github.com/Stability-AI/stable-audio-tools.git",
-    )
-    .run_commands(
-        # These official wheels match Torch 2.8/Python 3.12. Select its actual
-        # C++ ABI and avoid an incompatible CUDA 13 source-build fallback.
-        "python -c \"import subprocess, sys, torch; "
-        "assert torch.__version__.split('+')[0] == '2.8.0'; "
-        "assert torch.version.cuda and torch.version.cuda.startswith('12.'); "
-        "abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper(); "
-        "wheel = 'https://github.com/Dao-AILab/flash-attention/releases/download/' "
-        "+ 'v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.8cxx11abi' "
-        "+ abi + '-cp312-cp312-linux_x86_64.whl'; "
-        "subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-deps', wheel], check=True)\""
-    )
-    .add_local_file(DEPLOY_SOURCE_ROOT / "requirements-clearvoice.txt",
-                    "/opt/requirements-clearvoice.txt", copy=True)
-    .run_commands(
-        # This environment must not see the incompatible Roformer packages.
-        f"python -m venv {CLEARVOICE_VENV_DIR}",
-        f"{CLEARVOICE_PYTHON} -m pip install --upgrade pip setuptools wheel",
-        f"{CLEARVOICE_PYTHON} -m pip install -r /opt/requirements-clearvoice.txt",
-        f"{CLEARVOICE_PYTHON} -c \"from clearvoice import ClearVoice; import torch; "
-        "assert torch.version.cuda, 'ClearVoice installed CPU-only Torch'; "
-        "print('ClearVoice environment ready')\"",
-    )
-    .run_commands(
-        f"python -m venv --system-site-packages {MOSS_TRANSCRIBE_VENV_DIR}",
-        f"{MOSS_TRANSCRIBE_PYTHON} -m pip install --upgrade pip setuptools wheel",
-        f"{MOSS_TRANSCRIBE_PYTHON} -m pip install "
-        "'transformers>=5.6.0,<6' av librosa soundfile soxr "
-        "fastapi uvicorn python-multipart",
-        f"{MOSS_TRANSCRIBE_PYTHON} -m pip install --no-deps "
-        "git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git",
-    )
-    .run_commands(
-        "npm install -g n",
-        "n 22",
-        "node --version",
-    )
-    .run_commands(
-        # Reuse the CUDA/audio/diarization stack, but install Qwen ASR's exact
-        # Transformers dependency inside its own venv, never in the TTS env.
-        f"python -m venv --system-site-packages {QWEN_ASR_VENV_DIR}",
-        f"{QWEN_ASR_PYTHON} -m pip install --upgrade pip setuptools wheel",
-        f"{QWEN_ASR_PYTHON} -m pip install 'qwen-asr==0.0.6' 'transformers==4.57.6'",
-        f"{QWEN_ASR_PYTHON} -c \"from qwen_asr import Qwen3ASRModel; "
-        "from omnivad import OmniVAD; import litai, transformers, torch; "
-        "assert transformers.__version__ == '4.57.6'; "
-        "assert torch.version.cuda, 'Qwen ASR requires CUDA Torch'; "
-        "print('Qwen3-ASR environment ready')\"",
-    )
-    .env({
-        "CLEARVOICE_PYTHON": CLEARVOICE_PYTHON,
-        "QWEN_OMNIVAD_PYTHON": QWEN_ASR_PYTHON,
-        "QWEN_OMNIVAD_MODEL_DIR": "/persistent_app/checkpoints/qwen_omnivad",
-        "QWEN_OMNIVAD_CACHE_DIR": "/persistent_cache/qwen_omnivad",
-    })
-    # copy=True makes source changes part of the image/snapshot identity. Use
-    # these exact local sources at startup, not the code in the model Volume.
-    .add_local_dir(str(DEPLOY_SOURCE_ROOT), RUNTIME_SOURCE_DIR,
-                   copy=True, ignore=_ignore_runtime_source)
-    .run_commands(
-        f"cd {RUNTIME_SOURCE_DIR} && python -c "
-        "\"from indextts.utils.maskgct.models.tts.maskgct.llama_nar "
-        "import DiffLlama; print('IndexTTS Transformers compatibility check passed')\""
-    )
-)
 
 app = modal.App("audio-studio", image=image)
 
