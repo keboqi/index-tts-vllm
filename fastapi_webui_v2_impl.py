@@ -6,8 +6,8 @@ Production implementation for the modular IndexTTS vLLM v2 FastAPI application.
 The supported public launcher is ``fastapi_webui_v2.py``. Application assembly
 loads this module through ``indextts_web.app``.
 
-A single-file FastAPI application that combines webui_with_presets.py functionality
-with the API structure from deploy_vllm_indextts.py, using IndexTTS vLLM v2 as backend.
+Endpoint handlers and model workflows for the shared IndexTTS web application.
+``indextts_web.app`` owns the FastAPI instance and server lifecycle.
 
 Features:
 - IndexTTS vLLM v2 backend for ultra-fast inference
@@ -115,7 +115,7 @@ except ImportError:
 
 
 # FastAPI and web interface
-from fastapi import FastAPI, File, UploadFile, Form, Request, HTTPException, Depends, Query
+from fastapi import APIRouter, FastAPI, File, UploadFile, Form, Request, HTTPException, Depends, Query
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, validator
 from urllib.parse import quote
@@ -12605,15 +12605,8 @@ async def lifespan(app: FastAPI):
     # Shutdown the thread executor
     CONCURRENCY.shutdown()
 
-def create_app() -> FastAPI:
-    return FastAPI(
-        title="IndexTTS vLLM v2 FastAPI WebUI",
-        description="Ultra-fast TTS with vLLM backend, speaker presets, and advanced translate/edit mode with Gemini integration",
-        lifespan=lifespan,
-    )
-
-
-app = create_app()
+# Endpoint inventory only; the public app factory assembles the server.
+app = APIRouter()
 
 
 def _require_internal_snapshot_token(request: Request) -> None:
@@ -18885,37 +18878,3 @@ async def clone_voice_stream(
         error_msg = f"Failed to clone voice with streaming: {str(e)}"
         print(f"❌ API Streaming: {error_msg}")
         return _success_error(error_msg)
-
-if __name__ == "__main__":
-    import uvicorn
-    print("🚀 Starting IndexTTS vLLM v2 FastAPI WebUI...")
-    print(f"📁 Model directory: {SETTINGS.model_dir}")
-    print(f"🔧 GPU memory utilization: {SETTINGS.gpu_memory_utilization}")
-    print(f"🎯 FP16 mode: {SETTINGS.is_fp16}")
-    print(f"🌐 Server will start on {SETTINGS.host}:{SETTINGS.port}")
-    print(f"🎯 Concurrent capacity: 100 requests")
-    print(f"⚡ Single worker process for optimal GPU utilization")
-    print(f"💡 Features:")
-    print(f"   - IndexTTS vLLM v2 backend for ultra-fast inference")
-    print(f"   - Speaker preset management with persistent storage")
-    print(f"   - API compatibility for external integrations")
-    print(f"   - Modern web interface with Chinese support")
-    print(f"   - MP3 output for smaller file sizes")
-    print(f"   - High concurrency support (100 concurrent connections)")
-    print(f"   - Advanced translate/edit mode with segment editing")
-    print(f"   - Gemini model selection (Flash vs Pro) with API key override")
-    print(f"   - Per-segment generation control for efficient processing")
-    
-    uvicorn.run(
-        app,
-        host=SETTINGS.host,
-        port=SETTINGS.port,
-        log_level="info",
-        workers=1,
-        limit_concurrency=100,
-        limit_max_requests=None,  # No limit on total requests
-        backlog=2048,  # Handle request queue efficiently
-        timeout_keep_alive=300,  # Set timeout to 300 seconds
-        h11_max_incomplete_event_size=16777216,  # 16MB for large audio uploads
-        access_log=True  # Enable access logging for debugging
-    )

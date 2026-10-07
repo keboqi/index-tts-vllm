@@ -44,7 +44,7 @@ def create_app(*, legacy: ModuleType | None = None) -> FastAPI:
     if STATIC_ROOT.exists():
         application.mount("/static", StaticFiles(directory=STATIC_ROOT), name="static")
     application.include_router(health_router, tags=["health"])
-    for _tag, router in build_routers(production.app):
-        application.include_router(router)
+    for tag, router in build_routers(production.app.routes):
+        application.include_router(router, tags=[tag])
     application.state.runtime = runtime
     return application

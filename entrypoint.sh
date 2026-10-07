@@ -1,156 +1,105 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-#need to set alias within container
-alias python=python3
-# Set default values if environment variables are not set
-MODEL_DIR=${MODEL_DIR:-"checkpoints/"}
-MODEL=${MODEL:-"IndexTeam/IndexTTS-1.5"}
-VLLM_USE_MODELSCOPE=${VLLM_USE_MODELSCOPE:-1}
-DOWNLOAD_MODEL=${DOWNLOAD_MODEL:-1}
-CONVERT_MODEL=${CONVERT_MODEL:-1}
-PORT=${PORT:-8001}
-APP_SERVER=${APP_SERVER:-web}
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
-echo "Starting IndexTTS server..."
-echo "Model directory: $MODEL_DIR"
-echo "Model: $MODEL"
-echo "Use ModelScope: $VLLM_USE_MODELSCOPE"
+APP_SERVER="${APP_SERVER:-web}"
+MODEL_DIR="${MODEL_DIR:-checkpoints}"
+DOWNLOAD_MODEL="${DOWNLOAD_MODEL:-1}"
 
-# Function to check if model directory exists and has required files
+case "$APP_SERVER" in
+    web)
+        PORT="${PORT:-8000}"
+        MODEL="${MODEL:-garyswansrs/index_tts_2_vllm}"
+        VLLM_USE_MODELSCOPE="${VLLM_USE_MODELSCOPE:-0}"
+        CONVERT_MODEL="${CONVERT_MODEL:-0}"
+        if [[ "$CONVERT_MODEL" == "1" ]]; then
+            printf 'The WebUI needs the preconverted IndexTTS2 bundle; set CONVERT_MODEL=0.\n' >&2
+            exit 1
+        fi
+        ;;
+    legacy-api)
+        PORT="${PORT:-8001}"
+        MODEL="${MODEL:-IndexTeam/IndexTTS-1.5}"
+        VLLM_USE_MODELSCOPE="${VLLM_USE_MODELSCOPE:-1}"
+        CONVERT_MODEL="${CONVERT_MODEL:-1}"
+        ;;
+    *)
+        printf 'Unknown APP_SERVER: %s (expected web or legacy-api).\n' "$APP_SERVER" >&2
+        exit 1
+        ;;
+esac
+export VLLM_USE_MODELSCOPE
+
+printf 'Starting %s with %s in %s on port %s\n' "$APP_SERVER" "$MODEL" "$MODEL_DIR" "$PORT"
+
 check_model_exists() {
-    if [ ! -d "$MODEL_DIR" ]; then
-        echo "Model directory $MODEL_DIR does not exist"
-        return 1
-    fi
-    
-    # Check for download completion marker
-    if [ ! -f "$MODEL_DIR/.download_complete" ]; then
-        echo "Model download not completed (marker file missing)"
-        return 1
-    fi
-    
-    # Check for essential model files
-    if [ ! -f "$MODEL_DIR/config.yaml" ] || \
-       [ ! -f "$MODEL_DIR/gpt.pth" ] || \
-       [ ! -f "$MODEL_DIR/bpe.model" ] || \
-       [ ! -f "$MODEL_DIR/s2mel.pth" ] || \
-       [ ! -f "$MODEL_DIR/wav2vec2bert_stats.pt" ]; then
-        echo "Essential model files not found in $MODEL_DIR"
-        return 1
-    fi
-    
-    echo "Model files found in $MODEL_DIR"
-    return 0
-}
-
-# Function to check if model conversion is complete
-check_conversion_complete() {
-    if [ -f "$MODEL_DIR/.conversion_complete" ]; then
-        echo "Model conversion already completed"
-        return 0
-    fi
-    return 1
-}
-
-# Function to download model from HuggingFace
-download_from_huggingface() {
-    echo "Downloading model from HuggingFace: $MODEL"
-    
-    # Create model directory
-    mkdir -p "$MODEL_DIR"
-    
-    # Use huggingface-cli to download the model
-    if ! huggingface-cli download "$MODEL" --local-dir "$MODEL_DIR" --local-dir-use-symlinks False; then
-        echo "Error: Failed to download model from HuggingFace"
-        exit 1
-    fi
-    
-    # Create download marker file
-    touch "$MODEL_DIR/.download_complete"
-    echo "Download completed successfully!"
-}
-
-# Function to download model from ModelScope
-download_from_modelscope() {
-    echo "Downloading model from ModelScope: $MODEL"
-    
-    # Create model directory
-    mkdir -p "$MODEL_DIR"
-    
-    # Use modelscope CLI to download the model
-    if ! modelscope download --model "$MODEL" --local_dir "$MODEL_DIR"; then
-        echo "Error: Failed to download model from ModelScope"
-        exit 1
-    fi
-    
-    # Create download marker file
-    touch "$MODEL_DIR/.download_complete"
-    echo "Download completed successfully!"
-}
-
-# Check if model exists and download if necessary
-if [ "$DOWNLOAD_MODEL" = "1" ]; then
-    if ! check_model_exists; then
-        echo "Model not found, downloading..."
-        
-        # Download based on VLLM_USE_MODELSCOPE setting
-        if [ "$VLLM_USE_MODELSCOPE" = "1" ]; then
-            download_from_modelscope
-        else
-            download_from_huggingface
-        fi
-        
-        # Verify download
-        if ! check_model_exists; then
-            echo "Error: Model download failed or files are missing"
-            exit 1
-        fi
+    local required=(config.yaml gpt.pth bpe.model)
+    local file
+    if [[ "$APP_SERVER" == "web" ]]; then
+        required+=(
+            s2mel.pth wav2vec2bert_stats.pt feat1.pt feat2.pt
+            gpt/config.json
+            qwen0.6bemo4-merge/config.json qwen0.6bemo4-merge/model.safetensors
+            w2v-bert-2.0/config.json w2v-bert-2.0/model.safetensors
+            w2v-bert-2.0/preprocessor_config.json
+            semantic_codec/model.safetensors campplus/campplus_cn_common.bin
+            bigvgan/config.json bigvgan/bigvgan_generator.pt
+        )
     else
-        echo "Model already exists, skipping download"
+        required+=(bigvgan_generator.pth)
     fi
-else
-    echo "Model download disabled (DOWNLOAD_MODEL=0)"
-    if ! check_model_exists; then
-        echo "Error: Model not found and download is disabled"
+    for file in "${required[@]}"; do
+        if [[ ! -f "$MODEL_DIR/$file" ]]; then
+            printf 'Missing model asset: %s/%s\n' "$MODEL_DIR" "$file" >&2
+            return 1
+        fi
+    done
+    if [[ "$APP_SERVER" == "web" ]] && \
+       [[ ! -f "$MODEL_DIR/gpt/model.safetensors" && ! -f "$MODEL_DIR/gpt/pytorch_model.bin" ]]; then
+        printf 'Missing preconverted GPT weights in %s/gpt\n' "$MODEL_DIR" >&2
+        return 1
+    fi
+}
+
+if ! check_model_exists; then
+    if [[ "$DOWNLOAD_MODEL" != "1" ]]; then
+        printf 'Model assets are missing and DOWNLOAD_MODEL=0.\n' >&2
         exit 1
     fi
+    mkdir -p -- "$MODEL_DIR"
+    if [[ "$VLLM_USE_MODELSCOPE" == "1" ]]; then
+        modelscope download --model "$MODEL" --local_dir "$MODEL_DIR"
+    else
+        python3 - "$MODEL" "$MODEL_DIR" <<'PY'
+import sys
+from huggingface_hub import snapshot_download
+
+snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2])
+PY
+    fi
+    check_model_exists
 fi
 
-# Convert model format if requested
-if [ "$CONVERT_MODEL" = "1" ]; then
-    if ! check_conversion_complete; then
-        echo "Converting model format..."
-        # Run conversion and capture the exit code
+if [[ "$APP_SERVER" == "legacy-api" ]]; then
+    # convert_hf_format.sh writes the GPT bundle consumed by infer_vllm.py.
+    if [[ ! -f "$MODEL_DIR/gpt/config.json" || ! -f "$MODEL_DIR/gpt/tokenizer.json" ]] || \
+       [[ ! -f "$MODEL_DIR/gpt/pytorch_model.bin" && ! -f "$MODEL_DIR/gpt/model.safetensors" ]]; then
+        if [[ "$CONVERT_MODEL" != "1" ]]; then
+            printf 'Legacy GPT conversion is missing and CONVERT_MODEL=0.\n' >&2
+            exit 1
+        fi
         bash convert_hf_format.sh "$MODEL_DIR"
-        conversion_exit_code=$?
-        
-        # Check if conversion was successful by verifying the vllm directory exists
-        if [ $conversion_exit_code -eq 0 ] && [ -d "$MODEL_DIR/vllm" ] && [ -f "$MODEL_DIR/vllm/model.safetensors" ]; then
-            # Create conversion marker file on success
-            touch "$MODEL_DIR/.conversion_complete"
-            echo "Model conversion completed successfully"
-        else
-            echo "Error: Model conversion failed (exit code: $conversion_exit_code)"
+        if [[ ! -f "$MODEL_DIR/gpt/config.json" || ! -f "$MODEL_DIR/gpt/pytorch_model.bin" ]]; then
+            printf 'Legacy GPT conversion did not produce its expected files.\n' >&2
             exit 1
         fi
-    else
-        echo "Model conversion already completed, skipping"
     fi
-else
-    echo "Model conversion disabled (CONVERT_MODEL=0)"
-fi
-
-# Start the selected compatibility entry point.
-if [ "$APP_SERVER" = "legacy-api" ]; then
-    echo "Starting legacy IndexTTS API server on port $PORT..."
     exec env VLLM_USE_V1=0 python3 api_server.py \
         --model_dir "$MODEL_DIR" \
         --port "$PORT" \
-        --gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.25}"
+        --gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.25}" \
+        "$@"
 fi
 
-echo "Starting modular IndexTTS WebUI/API server on port $PORT..."
-exec python3 fastapi_webui_v2.py \
-    --model_dir "$MODEL_DIR" \
-    --port "$PORT" \
-    "$@"
+exec python3 fastapi_webui_v2.py --model_dir "$MODEL_DIR" --port "$PORT" "$@"

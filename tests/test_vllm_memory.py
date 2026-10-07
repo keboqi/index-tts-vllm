@@ -1,10 +1,9 @@
-import ast
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 from indextts_web.infrastructure.vllm_memory import wake_allocations
-from tests.test_modal_gpu_profiles import ROOT
+from tests.support import ROOT, load_definition
 
 
 class WakeAllocationTests(unittest.TestCase):
@@ -81,10 +80,8 @@ class WakeAllocationTests(unittest.TestCase):
               "cumem": SimpleNamespace(CuMemAllocator=SimpleNamespace(get_instance=lambda: allocator),
                                        create_and_map=self.create, unmap_and_release=self.release,
                                        libcudart=SimpleNamespace(cudaMemcpy=self.copy))}
-        tree = ast.parse((ROOT / "indextts_web/infrastructure/vllm_worker.py").read_text())
-        node = next(node for node in tree.body if isinstance(node, ast.ClassDef))
-        exec(compile(ast.Module(body=[node], type_ignores=[]), "<worker>", "exec"), ns)
-        worker = ns["RecoverableSleepWorker"]()
+        worker_type = load_definition(ROOT / "indextts_web/infrastructure/vllm_worker.py", "RecoverableSleepWorker", ns)
+        worker = worker_type()
         self.fail_at = 20
         with self.assertRaises(RuntimeError):
             worker.wake_up()

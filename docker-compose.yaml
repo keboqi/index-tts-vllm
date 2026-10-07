@@ -1,14 +1,20 @@
-version: '3.8'
-
 services:
   index-tts:
     build: .
     image: index-tts-server
     env_file:
       - .env.example
+    environment:
+      APP_SERVER: ${APP_SERVER:-web}
+      MODEL: ${MODEL:-}
+      VLLM_USE_MODELSCOPE: ${VLLM_USE_MODELSCOPE:-}
+      CONVERT_MODEL: ${CONVERT_MODEL:-}
+      DOWNLOAD_MODEL: ${DOWNLOAD_MODEL:-1}
+      MODEL_DIR: ${MODEL_DIR:-checkpoints}
+      PORT: ${PORT:-8000}
     container_name: index-tts-server
     ports:
-      - "${PORT:-8001}:${PORT:-8001}"
+      - "${PORT:-8000}:${PORT:-8000}"
     deploy:
       resources:
         reservations:
@@ -22,7 +28,7 @@ services:
       - ./outputs:/app/outputs
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-8001}/health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:$${PORT:-8000}/health"]
       interval: 30s
       timeout: 10s
       retries: 5

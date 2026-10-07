@@ -3,6 +3,8 @@ FROM vllm/vllm-openai:v0.10.2
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ffmpeg \
+    curl \
+    wget \
     build-essential \
     libsndfile1 \
     libsm6 \

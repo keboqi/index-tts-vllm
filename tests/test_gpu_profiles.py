@@ -15,7 +15,6 @@ from indextts_web.gpu_profiles import (
     GIB,
     PROFILE_ENV,
     EngineProfile,
-    GpuInfo,
     GpuProfile,
     resolve_gpu_profile,
     runtime_gpu_profile,
@@ -25,10 +24,7 @@ from indextts_web.infrastructure.concurrency import ConcurrencyBudget
 from indextts_web.infrastructure.gpu import probe_gpu
 from indextts_web.infrastructure.gpu_work import GpuWorkCoordinator, gpu_operation
 from indextts_web.services.tts.confucius_launcher import install_engine_options
-
-
-def gpu(gib=24, free=None):
-    return GpuInfo("test GPU", int(gib * GIB), int((gib if free is None else free) * GIB), "8.9")
+from tests.support import gpu
 
 
 class GpuProfileTests(unittest.TestCase):

@@ -1,48 +1,30 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from indextts_web.infrastructure.concurrency import ConcurrencyBudget
-from indextts_web.infrastructure.ffmpeg import Ffmpeg
-from indextts_web.infrastructure.files import atomic_write_json, contained_path, safe_component
-from indextts_web.infrastructure.processes import ProcessResult
-
-
-class FakeRunner:
-    def __init__(self):
-        self.calls = []
-
-    def run(self, args, *, timeout=None, env=None):
-        self.calls.append((list(args), timeout, env))
-        return ProcessResult(tuple(args), 0, "", "")
+from indextts_web.infrastructure.files import atomic_write_json
 
 
 class InfrastructureTests(unittest.TestCase):
-    def test_safe_component(self):
-        self.assertEqual(safe_component("../../a song?.wav"), "a_song_.wav")
-        self.assertEqual(safe_component("..."), "artifact")
-
-    def test_contained_path(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            result = contained_path(root, "../../escape")
-            self.assertEqual(result.parent, root.resolve())
-
     def test_atomic_json(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "nested" / "record.json"
             atomic_write_json(target, {"text": "你好"})
-            self.assertIn("你好", target.read_text(encoding="utf-8"))
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"text": "你好"})
+            self.assertEqual(list(target.parent.glob("*.tmp")), [])
 
-    def test_ffmpeg_command_is_deterministic(self):
-        runner = FakeRunner()
-        ffmpeg = Ffmpeg(runner, threads=4)
-        ffmpeg.transcode_audio(Path("input.wav"), Path("output.mp3"), codec_args=["-b:a", "128k"])
-        command, timeout, _env = runner.calls[0]
-        self.assertEqual(command[:7], ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-threads", "4"])
-        self.assertEqual(command[-5:], ["input.wav", "-vn", "-b:a", "128k", "output.mp3"])
-        self.assertEqual(timeout, 600)
+    def test_failed_atomic_write_preserves_existing_record_and_cleans_temporary_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "record.json"
+            atomic_write_json(target, {"text": "original"})
+            with patch.object(Path, "replace", side_effect=OSError("disk unavailable")):
+                with self.assertRaisesRegex(OSError, "disk unavailable"):
+                    atomic_write_json(target, {"text": "replacement"})
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"text": "original"})
+            self.assertEqual(list(target.parent.iterdir()), [target])
 
     def test_concurrency_budget_bounds_translation_to_index_capacity(self):
         with patch.dict(

@@ -1,140 +1,131 @@
-<a href="README.md">中文</a> ｜ <a href="README_EN.md">English</a>
-
-<div align="center">
+中文 | [English](README_EN.md)
 
 # IndexTTS-vLLM
-</div>
 
-## Modal GPU 选择
+基于 vLLM 的 IndexTTS 2.0 语音工作台，支持音色预设、情绪控制、流式合成、
+语音翻译和分段编辑。可选集成包括 IndexTTS 2.5、Confucius4-TTS、Qwen3-TTS
+声音设计、Stable Audio 3 音乐/音效、视频下载和参考音频增强。
 
-在 [`deploy_vllm_indextts_v2.py`](deploy_vllm_indextts_v2.py) 的
-`IndexTTSVllmServer` 装饰器中，手动将 `gpu=` 设置为 `"L4"`（24 GB）、
-`"L40S"`（48 GB）或 `"RTX-PRO-6000"`（96 GB），然后运行
-`modal deploy deploy_vllm_indextts_v2.py`。GPU 型号由部署者手动选择。
-容器启动后根据实际显存自动调整 vLLM 显存比例、批处理、编译和推理并发参数，
-无需随 GPU 手动修改这些参数。
+## 快速开始
 
-具体参数、覆盖方式和测试流程见 [GPU 部署说明](GPU_DEPLOYMENT.md)。
-小显存配置已实现并通过 CPU 和启动命令测试；实际 Modal GPU 冷启动、推理峰值
-及快照恢复仍待验证。现代 `fastapi_webui_v2.py`、quickstart 和 Docker WebUI
-同样使用自动配置；下文旧版 IndexTTS 1.x API 的启动方式保持不变。
+自动安装脚本面向 Linux 和 NVIDIA CUDA GPU。它会安装音频工具和 Python
+依赖，下载 IndexTTS 2.0 与 HY-MT 翻译权重，准备可选后端仓库，然后在
+`http://localhost:8000` 启动 WebUI：
 
-Modal 会为 Qwen3-ASR 配置单独的 Python 环境，并通过
-`QWEN_OMNIVAD_PYTHON` 调用工作进程，避免其 Transformers 依赖影响 TTS。
-此更新需要重新部署以构建镜像；无需为安装依赖重新运行 `prepare_model`。
-
-Working on IndexTTS2 support, coming soon... 0.0
-
-## 项目简介
-该项目在 [index-tts](https://github.com/index-tts/index-tts) 的基础上使用 vllm 库重新实现了 gpt 模型的推理，加速了 index-tts 的推理过程。
-
-推理速度在单卡 RTX 4090 上的提升为：
-- 单个请求的 RTF (Real-Time Factor)：≈0.3 -> ≈0.1
-- 单个请求的 gpt 模型 decode 速度：≈90 token / s -> ≈280 token / s
-- 并发量：gpu_memory_utilization设置为0.15时，可按实际显存容量测试并发量（测速脚本参考 `simple_test.py`）
-
-## 新特性
-- 支持多角色音频混合：可以传入多个参考音频，TTS 输出的角色声线为多个参考音频的混合版本（输入多个参考音频会导致输出的角色声线不稳定，可以抽卡抽到满意的声线再作为参考音频）
-
-## 性能
-Word Error Rate (WER) Results for IndexTTS and Baseline Models on the [**seed-test**](https://github.com/BytedanceSpeech/seed-tts-eval)
-
-| model                   | zh    | en    |
-| ----------------------- | ----- | ----- |
-| Human                   | 1.254 | 2.143 |
-| index-tts (num_beams=3) | 1.005 | 1.943 |
-| index-tts (num_beams=1) | 1.107 | 2.032 |
-| index-tts-vllm      | 1.12  | 1.987 |
-
-基本保持了原项目的性能
-
-## 更新日志
-
-- **[2025-08-07]** 支持 Docker 全自动化一键部署 API 服务：`docker compose up`
-
-- **[2025-08-06]** 支持 openai 接口格式调用：
-    1. 添加 /audio/speech api 路径，兼容 OpenAI 接口
-    2. 添加 /audio/voices api 路径， 获得 voice/character 列表
-    - 对应：[createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
-
-- **[2025-09-22]** 支持了 vllm v1 版本，IndexTTS2 正在兼容中
-
-## 使用步骤
-
-### 1. git 本项目
 ```bash
-git clone https://github.com/Ksuriuri/index-tts-vllm.git
+git clone https://github.com/keboqi/index-tts-vllm.git
 cd index-tts-vllm
+EXPORT_TUNNEL=0 bash quickstart.sh
 ```
 
+使用 `bash quickstart.sh --setup-only` 只安装、不启动服务。常用变量：
 
-### 2. 创建并激活 conda 环境
-```bash
-conda create -n index-tts-vllm python=3.12
-conda activate index-tts-vllm
-```
+| 变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `VENV_DIR` / `PYTHON_VERSION` | `.venv` / `3.12` | 主 Python 环境 |
+| `MODEL_DIR` | `checkpoints` | IndexTTS 2.0 权重目录 |
+| `INSTALL_CONFUCIUS` / `INSTALL_INDEXTTS25` | `1` / `1` | 设为 `0` 跳过相应可选后端仓库 |
+| `UPDATE_EXTERNAL_REPOS` | `1` | 设为 `0` 保留已有外部仓库版本 |
+| `DOWNLOAD_MODEL` / `DOWNLOAD_HY_MT_MODEL` | `1` / `1` | 控制权重下载 |
+| `SERVER_PORT` | `8000` | WebUI/API 端口 |
+| `EXPORT_TUNNEL` | `1` | 设为 `0` 禁用可选 Cloudflare 隧道 |
 
-
-### 3. 安装 pytorch
-
-需要 pytorch 版本 2.8.0（对应 vllm 0.10.2），具体安装指令请参考：[pytorch 官网](https://pytorch.org/get-started/locally/)
-
-
-### 4. 安装依赖
-```bash
-pip install -r requirements.txt
-```
-
-
-### 5. 下载模型权重
-
-此为官方权重文件，下载到本地任意路径即可，支持 IndexTTS-1.5 的权重
-
-| **HuggingFace**                                          | **ModelScope** |
-|----------------------------------------------------------|----------------------------------------------------------|
-| [IndexTTS](https://huggingface.co/IndexTeam/Index-TTS) | [IndexTTS](https://modelscope.cn/models/IndexTeam/Index-TTS) |
-| [😁IndexTTS-1.5](https://huggingface.co/IndexTeam/IndexTTS-1.5) | [IndexTTS-1.5](https://modelscope.cn/models/IndexTeam/IndexTTS-1.5) |
-
-### 6. 模型权重转换
+已有模型环境可直接启动：
 
 ```bash
-bash convert_hf_format.sh /path/to/your/model_dir
+python fastapi_webui_v2.py --model_dir checkpoints --host 0.0.0.0 --port 8000
 ```
 
-此操作会将官方的模型权重转换为 transformers 库兼容的版本，保存在模型权重路径下的 `vllm` 文件夹中，方便后续 vllm 库加载模型权重
+显存预算、批处理和合成并发根据检测到的 VRAM 自动配置；显式 CLI/环境变量
+可覆盖自动值。使用 `--use_torch_compile` / `--no-use_torch_compile` 控制编译。
+完整参数见 [indextts_web/config.py](indextts_web/config.py)。
 
-### 7. webui 启动！
-将 [`webui.py`](webui.py) 中的 `model_dir` 修改为模型权重下载路径，然后运行：
+## 部署
+
+Modal 部署在 [deploy_vllm_indextts_v2.py](deploy_vllm_indextts_v2.py) 中手动修改
+`IndexTTSVllmServer` 的 `gpu=`，选择 `"L4"`、`"L40S"` 或 `"RTX-PRO-6000"`。
+新建持久化卷时先准备模型，再部署：
 
 ```bash
-python webui.py
+modal run deploy_vllm_indextts_v2.py::prepare_model
+modal deploy deploy_vllm_indextts_v2.py
 ```
-第一次启动可能会久一些，因为要对 bigvgan 进行 cuda 核编译
 
+卷、Secret、自动参数、覆盖方式、模型管理和快照验证流程统一见
+[GPU_DEPLOYMENT.md](GPU_DEPLOYMENT.md)。CPU 测试覆盖配置与启动命令；
+各 GPU 的实际冷启动、推理峰值和快照恢复仍需测量验证。
 
-## API
+Docker 使用 [Dockerfile](Dockerfile)、[docker-compose.yaml](docker-compose.yaml)
+和 [entrypoint.sh](entrypoint.sh)。运行 `docker compose up --build` 前检查
+`.env.example`，默认访问 `http://localhost:8000`。现代 WebUI 使用
+`APP_SERVER=web` 和已转换的 IndexTTS 2.0
+权重；旧版 API 使用 `APP_SERVER=legacy-api` 和 IndexTTS 1.x 权重。
+可选功能需另外安装依赖和权重。
+WebUI 端口应与托管后端区分（Confucius 默认 `8001`，IndexTTS 2.5 默认
+`8092`）；若占用这些端口，需同时调整对应后端端口参数。
 
-使用 fastapi 封装了 api 接口，启动示例如下，请将 `--model_dir` 改为你的模型的实际路径：
+## 可选后端与功能
+
+默认后端是 `index`（IndexTTS 2.0）。可以在 UI、单次 API 请求或
+`--tts_backend` 参数中选择 `index25` 或 `confucius`。
+
+| 后端 | 仓库与环境 | 本地 API | 说明 |
+| --- | --- | --- | --- |
+| IndexTTS 2.0 | 本仓库主环境 | 主 WebUI | 情绪文本/音频、时长控制、分块流式合成 |
+| IndexTTS 2.5 | `../index-tts-2.5-vllm-omni-experiment`，独立 Python 3.11 环境 | `127.0.0.1:8092` | 首次请求自动准备并启动；支持中、英、日、西班牙、阿拉伯语 |
+| Confucius4-TTS | `../Confucius4-TTS`，独立后端启动器 | `127.0.0.1:8001` | 首次请求启动；多语言合成；忽略 IndexTTS 情绪文本控制 |
+
+自定义路径使用 `--indextts25_repo_dir` / `--confucius_repo_dir`，自定义服务
+启动可使用对应的 `--*_start_command` 和超时参数。外部后端冷启动期间输出
+keepalive 帧；IndexTTS 2.5 模型本身非流式，完成后输出整段音频。
+切换托管后端会休眠或停止其他 TTS 引擎，但不会卸载所有辅助模型。
+
+翻译支持 MOSS Transcribe+Diarize（默认）、Gemini、WhisperX、
+Qwen3-ASR + OmniVAD 和 NVIDIA Parakeet。本地 MOSS Docker 服务可提前准备：
 
 ```bash
-python api_server.py --model_dir /your/path/to/Index-TTS
+bash sglang_omni_moss_transcribe.sh deploy
 ```
 
-### 启动参数
-- `--model_dir`: 必填，模型权重路径
-- `--host`: 服务ip地址，默认为 `6006`
-- `--port`: 服务端口，默认为 `0.0.0.0`
-- `--gpu_memory_utilization`: IndexTTS2 vLLM 显存占用率，默认设置为 `0.15`
-- `--qwenemo_gpu_memory_utilization`: QwenEmotion vLLM 显存占用率，默认设置为 `0.05`
+首次转录请求会按需启动。Modal 使用独立的
+[moss_transcribe_server.py](moss_transcribe_server.py) 服务。
 
-### 请求示例
-参考 `api_example.py`
+手动安装时，根据使用的功能安装 `requirements-optional.txt`。
+Qwen3-ASR 与 Qwen3-TTS 的 Transformers 依赖版本冲突，需要独立环境，并通过
+`QWEN_OMNIVAD_PYTHON` 指定其 Python。不要把 `qwen-asr[vllm]` 装入固定使用
+`vllm==0.10.2` 的主环境。Modal 已配置独立 ASR 环境。
+Stable Audio 3 的安装和权重路径见
+[英文安装说明](README_EN.md#stable-audio-3)，运行时从本地权重目录加载。
 
-### OpenAI API
-- 添加 /audio/speech api 路径，兼容 OpenAI 接口
-- 添加 /audio/voices api 路径， 获得 voice/character 列表
+## API 与开发
 
-详见：[createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
+启动后的 `/docs`、`/openapi.json` 和 WebUI 的 API 页提供当前接口说明。
+主要合成入口是 `/speak`、`/clone_voice` 和对应的 `_stream` 接口。
+旧版 IndexTTS 1.x 的 [api_server.py](api_server.py) 单独提供 OpenAI 兼容的
+`/audio/speech`、`/audio/voices`。先在 UI 创建 `my_speaker_preset`，再调用：
 
-## 并发测试
-参考 [`simple_test.py`](simple_test.py)，需先启动 API 服务
+```bash
+curl --fail http://127.0.0.1:8000/speak \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"你好，欢迎使用 IndexTTS。","name":"my_speaker_preset","tts_backend":"index"}' \
+  --output output.mp3
+```
+
+合成流使用二进制帧：`CHUNK:{idx}:{size}:{MORE|LAST}\n{audio_bytes}`，
+可包含 `KEEPALIVE:{size}\n{json}`。客户端应缓存跨网络读取的部分头部/负载，
+按声明字节数读取，不能当作 SSE 解析。翻译进度接口使用 SSE。
+
+目录结构、兼容规则和旧入口说明见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
+开发和部署请从仓库目录运行。下面的可编辑安装用于提供开发工具；模型代码和
+应用资源依赖仓库目录结构，目前不支持通过独立 wheel 部署。
+
+```bash
+pip install -e '.[dev]'
+python -m unittest discover -s tests -v
+ruff check indextts_web tests fastapi_webui_v2.py
+python -m compileall -q indextts_web tests fastapi_webui_v2.py fastapi_webui_v2_impl.py
+```
+
+CPU 测试不需要 CUDA 或模型权重。前端脚本通过 `node --check` 检查语法；
+发布前还需在 GPU 环境验证真实推理、流式合成、后端切换和快照恢复。

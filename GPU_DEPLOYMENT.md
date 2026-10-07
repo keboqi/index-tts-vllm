@@ -48,12 +48,9 @@ configs use separate paths for each resolved GPU profile and Modal image.
 Snapshot creation explicitly commits `audio-studio-cache` and `audio-studio-app`
 after runtime/config setup and again after warmup and engine sleep. This makes
 new GPU cache directories and warmup artifacts durable before capture; a commit
-failure aborts snapshot creation. Relying on background commits could leave a
-first snapshot referencing an uncommitted directory, causing restore to fail
-with `vfs.CompleteRestore()` / `failed to walk ... gpu-profiles/...` before any
-Python restore hook runs. See [Modal Volume commit semantics](https://modal.com/docs/guide/volumes#volume-commits-and-reloads).
-Redeploy to rebuild the snapshot with this persistence step; existing model
-checkpoints do not require another `prepare_model` run.
+failure aborts snapshot creation. Snapshots require committed cache directories;
+an uncommitted path can prevent restore before any Python hook runs. See
+[Modal Volume commit semantics](https://modal.com/docs/guide/volumes#volume-commits-and-reloads).
 
 ## Automatic settings
 
@@ -166,23 +163,21 @@ Override with `QWEN_ASR_MAX_BATCH_SIZE`. `QWEN_OMNIVAD_WORKER_TIMEOUT` defaults
 to 7200 seconds. This worker uses the Transformers ASR backend.
 
 Qwen ASR and aligner downloads use `/persistent_app/checkpoints/qwen_omnivad`;
-pipeline result caching uses `/persistent_cache/qwen_omnivad`. Existing
-on-demand model downloads continue on first use. To apply the dependency fix,
-pull the latest checkout and redeploy so Modal builds the updated image.
-Rerunning `prepare_model` alone cannot install this interpreter into a running
-deployment.
+pipeline result caching uses `/persistent_cache/qwen_omnivad`. Models download
+on first use. Interpreter/dependency changes require a new Modal image;
+`prepare_model` manages persistent models, not the running image's packages.
+For local environment setup, see [README_EN.md](README_EN.md#optional-backends-and-features).
 
 ## MOSS model controls
 
 For standalone deployments, `sglang_omni_moss_transcribe.sh` installs SGLang-Omni
 in its Docker container. Its install command enables prerelease resolution
 because SGLang can pin prerelease dependencies such as `cuda-tile==1.6.0rc5`;
-older uv defaults reject these transitive dependencies. See
+see
 [uv prerelease handling](https://docs.astral.sh/uv/concepts/resolution/#pre-release-handling).
-After pulling this fix, retry `bash sglang_omni_moss_transcribe.sh start` (or
-retry MOSS transcription in the WebUI). A failed dependency installation is
-retried automatically when the server CLI is missing. Existing model downloads
-are reused; the native Python fallback is not required for SGLang serving.
+Start it with `bash sglang_omni_moss_transcribe.sh start` or a WebUI transcription
+request. Missing server dependencies are installed again on retry and existing
+model downloads are reused.
 
 The dedicated MOSS service used by Modal reports its state in Model Manager,
 including before the model has been loaded. **Sleep** moves its weights to CPU
@@ -196,8 +191,7 @@ unload waits for active transcription. Status remains responsive while that
 work runs. These controls apply to `moss_transcribe_server.py`; an external
 SGLang/OpenAI-compatible server without this lifecycle API is not managed.
 Sleep/unload releases model allocations; a small CUDA context may remain in
-the running service. Redeploy to install the updated service and UI; existing
-checkpoints do not need another `prepare_model` run.
+the running service.
 
 ## IndexTTS sleep/wake and shared VRAM
 
@@ -216,13 +210,11 @@ allocating. MOSS and separator jobs share the GPU coordinator; manual memory
 changes wait for active tracked work, including on the large GPU profile.
 
 Both core engines use a worker adapter for the pinned vLLM 0.10.2 allocator.
-It checks the actual sleeping allocations before wake, keeps CPU weight backups
+It checks actual sleeping allocations before wake, keeps CPU weight backups
 until the entire wake succeeds, and rolls back earlier mappings if a later
-allocation fails. This addresses the partial allocation failure in the
-[upstream allocator's wake loop](https://github.com/vllm-project/vllm/blob/v0.10.2/vllm/device_allocator/cumem.py).
-A failed wake aborts the synthesis batch instead of retrying for each segment.
-Redeploy to replace any workers already damaged by an earlier failed wake;
-`prepare_model` is not required.
+allocation fails. A failed wake aborts the synthesis batch instead of retrying
+each segment. See the
+[upstream allocator](https://github.com/vllm-project/vllm/blob/v0.10.2/vllm/device_allocator/cumem.py).
 
 ## Validation status
 
@@ -238,16 +230,24 @@ test dependencies with `pip install -e '.[dev]'`, then run:
 
 ```bash
 python -m unittest discover -s tests -v
-ruff check indextts_web tests fastapi_webui_v2.py tools/extract_*.py tools/split_translation_asset.py
+ruff check indextts_web tests fastapi_webui_v2.py
 ```
 
 Actual L4/L40S/RTX PRO 6000 Modal cold starts, inference peaks, and snapshot
-restores have **not yet been measured for this change**. Before production
-rollout, test each GPU on a separate staging app with isolated writable
-volumes: deploy, synthesize with and without emotion text, queue concurrent
-requests, scale down, confirm snapshot restore, and synthesize again. Exercise
-Confucius and IndexTTS 2.5 separately and while switching backends. Record peak
-VRAM, startup/restore time, and valid nonempty output audio.
+restores have **not yet been measured for these profiles**. Release acceptance
+requires each GPU on a separate staging app with isolated writable volumes:
+
+- Deploy, cold-load, warm up, scale down, restore the snapshot, and synthesize
+  again. Change only `gpu=` when checking automatic profile selection.
+- Exercise emotion text/reference audio, streaming and nonstreaming synthesis,
+  long/multisentence text, and duration controls. Verify complete nonempty audio.
+- Queue work above the active synthesis limit and run at least 100 mixed
+  requests; verify no OOM, deadlock, or broken keepalive frames.
+- Exercise Confucius and IndexTTS 2.5 individually and during backend switching.
+- Record application revision, library versions, resolved settings, peak VRAM,
+  safety headroom, startup/restore time, latency, and throughput. Compare the
+  large profile with the same RTX PRO 6000 baseline workload; investigate a
+  median latency/throughput regression above 10% against measured variance.
 
 MOSS/ASR, Stable Audio, enhancement, and other optional model combinations need
 separate memory measurements. A successful TTS deployment does not establish

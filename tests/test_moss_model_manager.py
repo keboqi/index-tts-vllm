@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from indextts_web.infrastructure.gpu_work import GpuWorkCoordinator, await_gpu_job
 from indextts_web.services.translation.moss_client import MossModelClient
 from indextts_web.services.translation.moss_runtime import MossRuntime
-from tests.test_modal_gpu_profiles import ROOT, load_definition
+from tests.support import ROOT, load_definition
 
 
 class MossClientTests(unittest.IsolatedAsyncioTestCase):

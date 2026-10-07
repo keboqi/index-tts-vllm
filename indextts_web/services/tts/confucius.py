@@ -6,6 +6,7 @@ from .legacy import LegacyBackend
 
 class ConfuciusBackend(LegacyBackend):
     name = "confucius"
+    manager_attribute = "confucius_backend_manager"
     capabilities = BackendCapabilities(
         native_streaming=True,
         native_duration=True,

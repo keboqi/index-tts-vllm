@@ -1,28 +1,12 @@
-"""Path validation and artifact persistence primitives."""
+"""Atomic JSON persistence for deployment profiles and worker messages."""
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import tempfile
 from pathlib import Path
 from typing import Any
-
-_SAFE_COMPONENT = re.compile(r"[^A-Za-z0-9._-]+")
-
-
-def safe_component(value: str, *, fallback: str = "artifact") -> str:
-    cleaned = _SAFE_COMPONENT.sub("_", str(value or "")).strip("._")
-    return cleaned or fallback
-
-
-def contained_path(root: Path, *parts: str) -> Path:
-    resolved_root = root.resolve()
-    candidate = resolved_root.joinpath(*(safe_component(part) for part in parts)).resolve()
-    if candidate != resolved_root and resolved_root not in candidate.parents:
-        raise ValueError("path escapes artifact root")
-    return candidate
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:

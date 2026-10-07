@@ -6,6 +6,7 @@ from .legacy import LegacyBackend
 
 class IndexBackend(LegacyBackend):
     name = "index"
+    manager_attribute = "tts_manager"
     capabilities = BackendCapabilities(
         native_streaming=True,
         native_duration=True,

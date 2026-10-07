@@ -1,87 +1,101 @@
 # Application architecture
 
-The WebUI/API uses a compatibility-preserving modular shell. Existing HTTP
-contracts remain implemented by `fastapi_webui_v2_impl.py` while the public
-entry point, settings, runtime services, routers, and frontend assets live in
-small modules that can be migrated independently.
+The supported command is `python fastapi_webui_v2.py`. HTTP behavior and model
+workflows remain in `fastapi_webui_v2_impl.py`; the application package owns
+server assembly, configuration, backend adapters, and shared infrastructure.
 
-## Entry points
+## Structure
 
-- `fastapi_webui_v2.py` is the stable command and import path. It contains no
-  feature logic.
-- `indextts_web.main` owns Uvicorn startup.
-- `indextts_web.app.create_app()` assembles the application, feature routers,
-  static assets, health endpoint, runtime container, and lifespan.
-- `fastapi_webui_v2_impl.py` is the production compatibility implementation. New code
-  should not add endpoints or infrastructure helpers to this file.
+| Path | Responsibility |
+| --- | --- |
+| `fastapi_webui_v2.py` | Stable command/import entry point |
+| `indextts_web/main.py` | Uvicorn startup |
+| `indextts_web/app.py` | Sole FastAPI factory, static assets, health route, lifespan |
+| `indextts_web/api/__init__.py` / `route_groups.py` | Group and validate the production route inventory |
+| `indextts_web/config.py` / `gpu_profiles.py` | Typed CLI settings and hardware-aware runtime configuration |
+| `indextts_web/runtime.py` | Runtime settings, backend registry, concurrency, production-module reference |
+| `indextts_web/services/tts/` | IndexTTS 2.0, IndexTTS 2.5, and Confucius request/lifecycle adapters |
+| `indextts_web/services/translation/` | Subtitle parsing, isolated Qwen ASR worker, MOSS client/runtime |
+| `indextts_web/infrastructure/` | GPU coordination/memory, Modal runtime, atomic JSON persistence, concurrency, callable compatibility |
+| `fastapi_webui_v2_impl.py` | Production endpoint inventory, inference orchestration, translation sessions/artifacts |
+| `indextts/` | Model inference implementations and upstream model components |
+| `index_new.html` / `static/` | Modern WebUI markup, CSS, JavaScript |
+| `tests/` | CPU behavior, deployment, route, streaming, and frontend contracts |
 
-Importing `indextts_web`, `indextts_web.config`, or the service contracts does
-not initialize CUDA, create output directories, or start managed services.
-Mutable directories and models initialize inside FastAPI lifespan.
+Importing configuration and service contracts does not initialize CUDA or
+start services. App assembly loads the production module; model initialization
+and mutable runtime setup occur in FastAPI lifespan.
 
-## HTTP routing
+## HTTP assembly and runtime
 
-`indextts_web/api/` groups the public route inventory into health, internal
-snapshot operations, TTS, translation, speakers, video/cookies, Stable Audio,
-model management, utilities, and the UI.
+The production module's `app` is an `APIRouter` containing endpoint
+definitions. `create_app()` constructs the single FastAPI application, adds
+`/health` and static assets, groups endpoint routes, and installs lifespan.
 
-The compatibility selectors fail application assembly if a legacy route is
-unclassified or assigned to multiple feature groups.
-`tests/test_route_contract.py` locks the original 60-route inventory.
+`route_groups.py` classifies internal snapshot operations, TTS, translation,
+speakers/voice design, video/cookies, Stable Audio, model management, utilities,
+and UI routes. Assembly rejects unclassified paths and duplicate method/path
+pairs. Route tests verify the public inventory and real application assembly.
 
-## Services
+`app.state.runtime` exposes the objects actually used by the application.
+Translation sessions, persisted manifests, and media artifacts remain owned by
+the production workflow; there is no separate unused repository/orchestrator
+layer.
 
-`RuntimeContainer` exposes services through `app.state.runtime`.
+## TTS and GPU lifecycle
 
-The TTS registry owns backend selection. IndexTTS 2.0, the isolated IndexTTS
-2.5 vLLM-Omni service, and Confucius implement one `SynthesisRequest` contract
-and publish backend capabilities. `index25_manager.py` owns the 2.5 subprocess,
-OpenAI-compatible speech payloads, sentence batching, and WAV assembly without
-importing the vLLM-Omni environment into the WebUI process.
-The production shared synthesis function delegates through this registry.
+The backend registry selects one `SynthesisRequest` interface for IndexTTS
+2.0, IndexTTS 2.5 vLLM-Omni, and Confucius. `index25_manager.py` owns the 2.5
+subprocess, OpenAI-compatible upstream requests, sentence batching, and WAV
+assembly without importing vLLM-Omni into the WebUI environment.
 
-The translation package defines a stage-oriented `TranslationOrchestrator`, a
-`SessionRepository` protocol, an isolated in-memory implementation, and a
-contained `ArtifactStore`. The current orchestrator delegates the established
-media pipeline while that large workflow remains compatibility-sensitive.
-
-Infrastructure adapters isolate concurrency limits, filesystem containment,
-atomic JSON writes, subprocess execution, and FFmpeg command construction.
+GPU profiles resolve engine budgets, batch limits, and active synthesis
+capacity from reported VRAM. Shared admission coordinates synthesis and model
+sleep/wake operations. Qwen ASR uses a separate interpreter; MOSS has an
+independent service lifecycle. Optional models can retain allocations after
+TTS engines sleep. See [GPU_DEPLOYMENT.md](GPU_DEPLOYMENT.md) for configuration
+and the hardware validation requirements.
 
 ## Frontend
 
-`index_new.html` contains markup only. Styles live in `static/css/app.css`.
-Deferred scripts under `static/js/` preserve the previous execution order while
-separating core, Stable Audio, video, speakers, synthesis, translation
-state/chunks/media/segments/speakers/requests, and bootstrap code.
+`index_new.html` contains markup; styles live in `static/css/app.css`.
+Ordered deferred scripts under `static/js/` separate core, Stable Audio,
+video, speakers, synthesis, translation, and bootstrap behavior. Classic
+scripts share their top-level declarations, so order is part of the contract.
 
-The HTML meta value for `CHUNK_SPLIT_MIN_SILENCE_MS` is populated by the server;
-application JavaScript reads that value instead of embedding a template
-expression in a static file.
+The server fills the `chunk-split-min-silence-ms` HTML meta value; static
+JavaScript reads it instead of embedding a server template expression.
+Completed one-shot extraction scripts are removed; edit the maintained assets
+directly.
 
-## Compatibility rules
+## Retained legacy interfaces
 
-Changes must preserve, or explicitly version:
+| File | Purpose |
+| --- | --- |
+| `api_server.py` | IndexTTS 1.x API, including `/audio/speech` and `/audio/voices`; Docker `APP_SERVER=legacy-api` |
+| `api_example.py` | Manual client example for the legacy API |
+| `simple_test.py` | Manual HTTP concurrency benchmark |
+| `convert_hf_format.sh` / model conversion scripts | Checkpoint conversion for supported model formats |
 
-- route methods and paths;
-- status codes and JSON field names;
-- `CHUNK` and `KEEPALIVE` binary framing;
-- translation session manifests and artifact names;
-- CLI flags consumed by `fastapi_webui_v2.py`;
-- Docker and Modal launch commands.
+The retired Gradio launchers and older unserved HTML template are removed.
+Use the modern WebUI for speaker presets, synthesis, and translation. Git
+history retains the removed prototypes and completed migration scripts.
 
-Do not combine mechanical extraction with changes to model sampling, duration
-matching, concurrency defaults, or audio encoding.
+## Compatibility and verification
 
-## Verification
-
-CPU-only checks do not need FastAPI, CUDA, or model checkpoints:
+Preserve or explicitly version route methods/paths, status codes/JSON fields,
+`CHUNK`/`KEEPALIVE` binary frames, translation manifests/artifact names,
+supported CLI flags, and Docker/Modal launch commands. Changes to sampling,
+duration matching, concurrency, or encoding need behavior-specific validation.
 
 ```bash
+pip install -e '.[dev]'
 python -m unittest discover -s tests -v
-ruff check indextts_web tests fastapi_webui_v2.py tools/extract_*.py tools/split_translation_asset.py
+ruff check indextts_web tests fastapi_webui_v2.py
 python -m compileall -q indextts_web tests fastapi_webui_v2.py fastapi_webui_v2_impl.py
+for script in static/js/*.js; do node --check "$script"; done
 ```
 
-Run `node --check` over `static/js/*.js`, then run the GPU smoke suite in the
-production model environment before deployment.
+CPU checks use fake models/services; they do not establish GPU inference or
+snapshot correctness. Run real synthesis, streaming, backend switching, and
+the deployment acceptance matrix in the model environment before release.

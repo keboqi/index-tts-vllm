@@ -1,574 +1,206 @@
-<a href="README.md">中文</a> ｜ <a href="README_EN.md">English</a>
-
-<div align="center">
+[中文](README.md) | English
 
 # IndexTTS-vLLM
-</div>
 
-## Modal GPU selection
-
-Set the existing `gpu=` on `IndexTTSVllmServer` in
-[`deploy_vllm_indextts_v2.py`](deploy_vllm_indextts_v2.py) to `"L4"`, `"L40S"`, or
-`"RTX-PRO-6000"`, then run `modal deploy deploy_vllm_indextts_v2.py`. Startup
-detects the allocated VRAM and adjusts vLLM budgets, batch sizes, compilation,
-and active synthesis limits. The GPU selection remains a manual edit.
-
-See [GPU deployment settings and validation status](GPU_DEPLOYMENT.md).
-The smaller-GPU profiles are implemented and covered by CPU/command tests;
-actual Modal GPU cold starts and snapshot restores still require validation.
+An IndexTTS 2.0 speech studio powered by vLLM, with speaker presets, emotion
+controls, streaming audio, speech translation, and an editable segment workflow.
+Optional integrations provide IndexTTS 2.5, Confucius4-TTS, Qwen3-TTS voice
+design, Stable Audio 3 music/SFX, video downloads, and reference enhancement.
 
 ## Quick start
 
+The setup script targets Linux with an NVIDIA CUDA GPU. It installs audio
+utilities and Python dependencies, downloads IndexTTS 2.0 weights and HY-MT
+translation weights, provisions optional sibling backend repositories, and
+starts the WebUI at `http://localhost:8000`:
+
 ```bash
-git clone https://github.com/keboqi/index-tts-vllm
+git clone https://github.com/keboqi/index-tts-vllm.git
 cd index-tts-vllm
-bash quickstart.sh
+EXPORT_TUNNEL=0 bash quickstart.sh
 ```
 
-The executable [quickstart.sh](quickstart.sh) installs the system and Python
-dependencies, clones or fast-forward updates the optional Confucius4-TTS and
-IndexTTS 2.5 vLLM-Omni sibling repositories, creates an isolated environment,
-downloads the model weights, and starts the WebUI. Run
-`bash quickstart.sh --setup-only` to install everything without starting the
-server. Set `UPDATE_EXTERNAL_REPOS=0` to keep existing external checkouts
-unchanged, or `INSTALL_CONFUCIUS=0` / `INSTALL_INDEXTTS25=0` to disable
-provisioning an optional backend.
+Use `bash quickstart.sh --setup-only` to provision without starting the server.
+Useful setup variables:
 
-`fastapi_webui_v2.py` remains the stable launcher, while the application shell
-is organized under `indextts_web/`. See [ARCHITECTURE.md](ARCHITECTURE.md) for
-the router, service, backend, translation, and frontend boundaries. Older
-launchers are cataloged in [LEGACY_ENTRYPOINTS.md](LEGACY_ENTRYPOINTS.md).
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `VENV_DIR` / `PYTHON_VERSION` | `.venv` / `3.12` | Main Python environment |
+| `MODEL_DIR` | `checkpoints` | IndexTTS 2.0 weights |
+| `INSTALL_CONFUCIUS` / `INSTALL_INDEXTTS25` | `1` / `1` | Set to `0` to skip optional backend checkout provisioning |
+| `UPDATE_EXTERNAL_REPOS` | `1` | Set to `0` to keep existing sibling checkouts unchanged |
+| `DOWNLOAD_MODEL` / `DOWNLOAD_HY_MT_MODEL` | `1` / `1` | Control checkpoint downloads |
+| `SERVER_PORT` | `8000` | WebUI/API port |
+| `EXPORT_TUNNEL` | `1` | Set to `0` to disable the optional Cloudflare tunnel |
 
-`IndexTTS 2.5 vLLM-Omni` and `Confucius4-TTS` are optional, lazy-loaded backends. The default remains IndexTTS 2.0. Selecting `tts_backend=index25` starts the tested vLLM-Omni pipeline in its own Python 3.11 environment on port `8092`; selecting `confucius` starts Confucius on port `8001`. External backends use keepalive streaming frames during cold starts. On a shared GPU, the application sleeps the 2.0/Confucius vLLM engines before starting 2.5 and stops the 2.5 server before another backend is woken.
+For an existing model environment:
 
 ```bash
-npx localtunnel --port 8000
-ssh -p 443 -R0:localhost:8000 a.pinggy.io
-ssh -R 80:localhost:8000 serveo.net
+python fastapi_webui_v2.py --model_dir checkpoints --host 0.0.0.0 --port 8000
 ```
 
----
+GPU memory budgets, scheduler limits, and synthesis concurrency are selected
+from detected VRAM. Explicit CLI or environment settings override the profile.
+Use `--use_torch_compile` / `--no-use_torch_compile` to control compilation.
+The complete CLI definition lives in [indextts_web/config.py](indextts_web/config.py).
 
-## Project Introduction
-This project provides a high-performance implementation of **IndexTTS2** using the **vLLM v2** backend. It focuses on extreme inference speed, high concurrency, and a feature-rich user interface for both text-to-speech and advanced audio translation workflows.
+## Deployment
 
-By leveraging vLLM's PagedAttention and continuous batching, this implementation achieves significant speedups:
-- **RTF (Real-Time Factor)**: Achieved **0.02** on RTX Pro 6000 Blackwell.
-- **High Concurrency**: Handles **100** concurrent requests efficiently.
-- **IndexTTS2 Support**: Full support for the latest IndexTTS2 model with enhanced emotional expression and duration control.
+For Modal, edit `IndexTTSVllmServer`'s `gpu=` in
+[deploy_vllm_indextts_v2.py](deploy_vllm_indextts_v2.py) to `"L4"`, `"L40S"`, or
+`"RTX-PRO-6000"`. Prepare fresh persistent volumes before deploying:
 
----
-
-## Web UI Modules
-The modern Web UI [index_new.html](index_new.html) is built around 7 key functional modules:
-
-1. **🎵 Speech Synthesis (Voice Studio)**
-   - Generate speech using registered speaker presets.
-   - Adjust emotion text prompts (e.g., "excited", "whispering") and intensity weights (0.0 to 1.0).
-   - Control diffusion quality steps and text splitting thresholds (`max_text_tokens_per_sentence`).
-   - Listen to real-time audio playback or stream chunks instantly for low-latency feedback.
-2. **Stable Audio 3 Music / SFX**
-   - Generate instrumental music, ambience, and sound effects from text prompts.
-   - Uses `stable-audio-3-medium` as the default model on high-VRAM RTX Pro 6000 Blackwell servers.
-   - Supports optional negative prompts, sampler controls, seed control, init audio, and inpainting inputs.
-   - Loads from `checkpoints/stable-audio-3/*` at runtime, so an HF token is not needed once checkpoints are downloaded.
-3. **🌐 Translate & Edit**
-   - Translate speech audio or video into another language while preserving timing and speaker diarization.
-   - **Interactive Segment Editor**: Inspect, tweak timings/transcriptions, assign different speaker presets to specific segments, and regenerate modified segments selectively.
-   - Export generated subtitles as standard SRT files.
-4. **DL Video Download & replacement**
-   - Download source videos from YouTube or other sites using `yt-dlp`.
-   - Extract audio for translation and burn the translated audio/subtitles back into the original video with a single click.
-5. **🎭 Speaker Presets Library**
-   - Register new reference voices by uploading reference audio files.
-   - **Smart Silence Trimming**: Automatically splits and trims long references at silence points to a 3-15 second sweet spot for optimal voice cloning.
-   - **ClearVoice Enhancement**: Clean reference audio via speech enhancement (MossFormerGAN_SE_16K, FRCRN_SE_16K, MossFormer2_SE_48K) and 48kHz super-resolution.
-6. **🎨 Qwen3-TTS Voice Design**
-   - Describe a voice in natural language (e.g., "A warm, deep male voice speaking calmly with a British accent").
-   - Test-synthesize text and save the designed voice directly to the Preset Library.
-7. **📚 API Integration Docs**
-   - Interactive, styled REST API documentation integrated right into the interface.
-
----
-
-## Advanced Pipelines & Technical Workflows
-
-### 1. ASR (Speech-to-Text) & Diarization
-The translation workflow supports multiple transcription and alignment backends:
-- **MOSS Transcribe+Diarize via SGLang-Omni**: Default local diarized ASR pipeline, served through an OpenAI-compatible transcription endpoint. The WebUI can manage it with `sglang_omni_moss_transcribe.sh`.
-- **Cloud Gemini**: Fast and highly accurate cloud-based ASR and translation.
-- **Local WhisperX**: Precise phoneme-level word alignment and segment timing.
-- **Qwen3-ASR + OmniVAD**: Extremely robust local diarized ASR. Supports Sortformer and Pyannote diarization backends.
-- **NVIDIA Parakeet**: Fast local ASR optimized for English and European languages.
-
-### 2. Vocal & Backing Track Separation
-If **audio separation** is enabled, the system uses `audio-separator` (Mel-Band Roformer, BS-Roformer, or UVR-MDX-NET) to split incoming audio into vocals and instrumental backing tracks. After translating the vocals, it automatically blends the new voice with the original instrumental track to produce a high-quality localized output.
-
-### 3. Cookies Management
-To download videos that require authentication (e.g., age-restricted YouTube videos), the Web UI supports domain-level cookie management:
-- Import cookies directly from browser request cURL commands.
-- Upload standard Netscape `cookies.txt` files.
-
----
-
-## Installation
-
-### 1. System Dependencies
-Requires `ffmpeg` for audio processing and `sox` for some backend utilities.
 ```bash
-sudo apt update && sudo apt install ffmpeg sox libstdc++6 -y
+modal run deploy_vllm_indextts_v2.py::prepare_model
+modal deploy deploy_vllm_indextts_v2.py
 ```
 
-### 2. Environment Setup
-We recommend using Conda to manage your environment:
+See [GPU_DEPLOYMENT.md](GPU_DEPLOYMENT.md) for volumes/secrets, automatic
+settings, overrides, model lifecycle controls, and snapshot validation. CPU
+tests cover profile and deployment command behavior; actual GPU cold starts,
+inference peaks, and snapshot restore still need validation for each profile.
+
+Docker uses [Dockerfile](Dockerfile), [docker-compose.yaml](docker-compose.yaml),
+and [entrypoint.sh](entrypoint.sh). Review `.env.example` before running
+`docker compose up --build`; the default URL is `http://localhost:8000`.
+Modern WebUI deployments use `APP_SERVER=web`
+and converted IndexTTS 2.0 weights in `checkpoints`; the legacy API uses
+`APP_SERVER=legacy-api` and IndexTTS 1.x weights. Optional features need their
+own dependencies/checkpoints.
+Keep the WebUI port distinct from the managed backend ports (`8001` for
+Confucius, `8092` for IndexTTS 2.5); override the corresponding backend port if
+you deliberately assign its default port to the WebUI.
+
+## Optional backends and features
+
+The default TTS backend is `index` (IndexTTS 2.0). Select `index25` or
+`confucius` in the UI, per API request, or with `--tts_backend`.
+
+| Backend | Checkout / environment | Local API | Behavior |
+| --- | --- | --- | --- |
+| IndexTTS 2.0 | This repository's model environment | Main WebUI | Emotion text/audio, duration controls, chunk streaming |
+| IndexTTS 2.5 | `../index-tts-2.5-vllm-omni-experiment`; isolated Python 3.11 environment | `127.0.0.1:8092` | Lazy provisioning/startup; Chinese, English, Japanese, Spanish, Arabic |
+| Confucius4-TTS | `../Confucius4-TTS`; managed sibling launcher | `127.0.0.1:8001` | Lazy startup; multilingual synthesis; IndexTTS emotion text controls ignored |
+
+Set `--indextts25_repo_dir` / `--confucius_repo_dir` for custom checkout
+locations. Each backend also supports `--*_start_command`, `--*_start_timeout`,
+and `--*_request_timeout` for custom service setup. External synthesis streams
+emit keepalives during startup; IndexTTS 2.5 returns completed audio because
+its model is non-streaming. Managed backend switching sleeps/stops competing
+TTS engines; it does not release every auxiliary model's GPU allocations.
+
+The translation workflow supports MOSS Transcribe+Diarize (default), Gemini,
+WhisperX, Qwen3-ASR + OmniVAD, and NVIDIA Parakeet. The local MOSS Docker manager
+can be prepared with:
+
 ```bash
-conda create -n indextts python=3.12 -y
-conda activate indextts
+bash sglang_omni_moss_transcribe.sh deploy
 ```
 
-### 3. Python Dependencies
-Install the core requirements and specialized libraries for advanced features:
+It starts lazily on the first MOSS transcription request. Modal instead uses
+the dedicated [moss_transcribe_server.py](moss_transcribe_server.py) service.
+
+Install only the optional integrations needed for a manual deployment:
+
 ```bash
-# CUDA 13.0 / RTX Pro 6000 Blackwell torch stack
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
-
-pip install -r requirements.txt
-
-# Optional video download, separation, and enhancement integrations
 pip install -r requirements-optional.txt
+# Optional alignment and additional ASR backends:
+pip install whisperx 'nemo_toolkit[asr]'
+```
 
-# For optimized GPU inference
-pip install flashinfer-python flash-attn --no-build-isolation
+Keep Qwen3-ASR in a separate environment: the pinned `qwen-asr` and `qwen-tts`
+dependencies require different Transformers versions. Set
+`QWEN_OMNIVAD_PYTHON` to that environment's Python executable. Do not install
+`qwen-asr[vllm]` into the main environment, which pins `vllm==0.10.2`.
+Modal configures `/opt/qwen-asr-venv` automatically; see
+[ASR worker configuration](GPU_DEPLOYMENT.md#qwen3-asr--omnivad).
 
-# For Stable Audio 3. Keep --no-deps so it does not downgrade torch/torchaudio.
-# The current GitHub source is required for SA3 configs that use local_add_cond_dim.
-pip install -U --force-reinstall --no-deps --ignore-requires-python "git+https://github.com/Stability-AI/stable-audio-tools.git"
+For local setup, provision an independent ASR environment:
+
+```bash
+uv venv --python 3.12 --seed .venv-qwen-asr
+.venv-qwen-asr/bin/python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+.venv-qwen-asr/bin/python -m pip install 'qwen-asr==0.0.6' 'transformers==4.57.6' omnivad litai pydub librosa soundfile scipy google-genai json-repair
+# Optional: install only the selected diarization backend's dependencies.
+.venv-qwen-asr/bin/python -m pip install 'transformers==4.57.6' whisperx # Pyannote
+.venv-qwen-asr/bin/python -m pip install 'transformers==4.57.6' 'nemo_toolkit[asr]' # Sortformer
+QWEN_OMNIVAD_PYTHON="$PWD/.venv-qwen-asr/bin/python" .venv/bin/python fastapi_webui_v2.py
+```
+
+Diarization also requires access to the selected backend's checkpoints.
+
+### Stable Audio 3
+
+For manual setup, install the source package without replacing the existing
+Torch/audio stack, then download the gated models after accepting their terms
+and authenticating on Hugging Face:
+
+```bash
+pip install -U --no-deps --ignore-requires-python 'git+https://github.com/Stability-AI/stable-audio-tools.git'
 pip install alias-free-torch dill einops-exts huggingface_hub importlib-resources nnAudio PyWavelets safetensors scipy soxr torchsde tqdm transformers v-diffusion-pytorch vector-quantize-pytorch
 
-# For advanced audio features
-pip install audio-separator[gpu] clearvoice google-genai whisperx pydub
-
-# Optional higher-quality ASR/alignment pipeline
-# Install this in a separate environment from qwen-tts for now.
-pip install qwen-asr omnivad litai
-
-# Optional fast English / European-language ASR pipeline
-pip install -U "nemo_toolkit[asr]"
+hf auth login
+hf download stabilityai/stable-audio-3-medium --local-dir checkpoints/stable-audio-3/medium
+hf download stabilityai/stable-audio-3-small-music --local-dir checkpoints/stable-audio-3/small-music
+hf download stabilityai/stable-audio-3-small-sfx --local-dir checkpoints/stable-audio-3/small-sfx
 ```
 
-> [!NOTE]
-> Do not install `qwen-asr` into the same environment as `qwen-tts` for now: current releases pin incompatible exact `transformers` versions (`qwen-tts` pins `4.57.3`, while `qwen-asr` pins `4.57.6`). Also do not install `qwen-asr[vllm]` into this environment; this project pins `vllm==0.10.2` for IndexTTS2.
+Inference loads these local folders and does not need `HF_TOKEN` once weights
+are downloaded. Model Manager provides load/sleep/wake/unload controls where
+supported. Optional model combinations need separate GPU memory validation.
 
-The Modal image now installs Qwen3-ASR in `/opt/qwen-asr-venv` and sets
-`QWEN_OMNIVAD_PYTHON` automatically. Selecting the Qwen3-ASR + OmniVAD pipeline
-runs the existing transcription/diarization/translation workflow in that
-interpreter. For other deployments, set `QWEN_OMNIVAD_PYTHON` to the Python
-executable of your ASR environment. The worker exits after each job, including
-cancellation and timeout, to release its models. See [GPU deployment details](GPU_DEPLOYMENT.md#qwen3-asr--omnivad).
+## API
 
-MOSS Transcribe+Diarize is the default `transcription_pipeline`. It runs through the SGLang-Omni Docker manager in `sglang_omni_moss_transcribe.sh`; run `bash sglang_omni_moss_transcribe.sh deploy` ahead of time to pre-pull the image and model, or let the WebUI start it lazily on the first MOSS transcription request.
+The running application's `/docs` and `/openapi.json` expose the current API
+schema; the WebUI's API tab describes interactive workflows. Main endpoints:
 
-### 4. Model Weights
-Download the pre-converted IndexTTS2 vLLM weights and Stable Audio 3 checkpoints:
-```bash
-huggingface-cli download garyswansrs/index_tts_2_vllm --local-dir checkpoints
+| Workflow | Endpoints |
+| --- | --- |
+| Synthesis | `/speak`, `/clone_voice`, `/speak_stream`, `/clone_voice_stream` |
+| Speaker presets | `/add_speaker`, `/delete_speaker`, `/audio_roles`, `/api/speaker_preview/{speaker_name}` |
+| Translation/editor | `/api/translate_audio`, `/api/translate_segments`, `/api/translate_generate_segments`, `/api/translate_segment_preview` |
+| Long audio | `/api/translate_split_audio`, `/api/translate_generate_chunks`, `/api/translate_merge_chunks` |
+| Music/SFX | `/api/stable-audio/models`, `/api/stable-audio/generate`, `/api/stable-audio/unload` |
+| Voice design | `/api/design-voice`, `/api/design-voice/save-preset`, `/api/design-voice/languages`, `/api/design-voice/status` |
+| Video/cookies | `/api/video_info`, `/api/video_download`, `/api/video_replace_audio`, `/api/cookies` |
+| Readiness | `/health`, `/server_info` |
 
-# Stable Audio 3 repos are gated. Accept the model terms on Hugging Face first,
-# then run `hf auth login` or `huggingface-cli login` before downloading.
-huggingface-cli download stabilityai/stable-audio-3-medium --local-dir checkpoints/stable-audio-3/medium
-huggingface-cli download stabilityai/stable-audio-3-small-music --local-dir checkpoints/stable-audio-3/small-music
-huggingface-cli download stabilityai/stable-audio-3-small-sfx --local-dir checkpoints/stable-audio-3/small-sfx
-```
+The retained IndexTTS 1.x [api_server.py](api_server.py) separately provides
+the OpenAI-compatible `/audio/speech` and `/audio/voices` endpoints.
 
-The server loads Stable Audio 3 from these local folders first. Once the model files are present, runtime inference does not need `HF_TOKEN`.
-
----
-
-## Startup Reference & CLI Parameters
-
-Launch the FastAPI WebUI and API server:
-```bash
-python fastapi_webui_v2.py [OPTIONS]
-```
-
-### Options:
-- `--host` (string): Host IP to bind the server to (default: `0.0.0.0`).
-- `--port` (integer): Port number to run the web API on (default: `8000`).
-- `--model_dir` (string): Path to model checkpoints directory (default: `checkpoints`).
-- `--is_fp16` (flag): Override the default CUDA BF16 inference path with FP16.
-- `--use_torch_compile` / `--no-use_torch_compile`: Explicitly enable/disable compilation; otherwise use the GPU profile.
-- `--gpu_memory_utilization` (float): Override the automatically selected IndexTTS2 vLLM memory fraction.
-- `--qwenemo_gpu_memory_utilization` (float): Override the automatically selected QwenEmotion vLLM memory fraction.
-- `--tts_backend` (`index`, `index25`, or `confucius`): Default synthesis backend. The server default is `index`.
-- `--confucius_repo_dir` (string): Path to a sibling `Confucius4-TTS` checkout used for lazy startup (default: `../Confucius4-TTS`).
-- `--confucius_host` / `--confucius_port`: Host and port for the managed Confucius FastAPI backend (default: `127.0.0.1:8001`).
-- `--confucius_start_command` (string): Optional custom command for starting Confucius instead of the built-in launcher.
-- `--confucius_start_timeout` / `--confucius_request_timeout`: Startup and synthesis request timeouts in seconds (defaults: `1800` / `900`).
-- `--indextts25_repo_dir`: Path to the sibling `index-tts-2.5-vllm-omni-experiment` checkout.
-- `--indextts25_model_dir` / `--indextts25_data_dir`: Optional model and persistent runtime/cache paths. The launcher defaults to the experiment repository's `models/IndexTTS-2.5` and `runtime/indextts25` directories.
-- `--indextts25_host` / `--indextts25_port`: Managed vLLM-Omni API address (default: `127.0.0.1:8092`).
-- `--indextts25_start_command`: Optional pre-provisioned/remote launch command. Without it, the manager calls the experiment's API-only launcher, which creates `.venv-indextts25` with Python 3.11.
-- `--indextts25_start_timeout` / `--indextts25_request_timeout`: Cold-start and synthesis timeouts (defaults: `3600` / `900`). The cold-start window includes first-time environment and model setup.
-- `EXTERNAL_TTS_STREAM_KEEPALIVE_SECONDS` (env): Heartbeat interval for external-backend stream responses (default: `15`).
-- `--verbose` (flag): Enable verbose logging output in the console.
-
-### Confucius4-TTS Backend
-
-Clone `Confucius4-TTS` next to this repository:
-```bash
-cd ..
-git clone https://github.com/keboqi/Confucius4-TTS
-cd index-tts-vllm
-python fastapi_webui_v2.py --use_torch_compile --confucius_repo_dir ../Confucius4-TTS
-```
-
-No separate Confucius server command is required for the normal workflow. On the first Confucius request, `fastapi_webui_v2.py` starts the backend lazily and calls `Confucius4-TTS/fastapi_app.py` through `scripts/run_fastapi_uv.sh` on Linux. Use `--confucius_start_command` if your deployment needs a custom environment, for example:
-```bash
-python fastapi_webui_v2.py \
-  --tts_backend index \
-  --confucius_repo_dir ../Confucius4-TTS \
-  --confucius_start_command "bash scripts/run_fastapi_uv.sh"
-```
-
-The Confucius backend supports more target languages for speech generation and translate/edit workflows (`en`, `zh`, `ja`, `ko`, `de`, `fr`, `es`, `id`, `it`, `th`, `pt`, `ru`, `ms`, `vi`). When `tts_backend=confucius`, IndexTTS text-based emotion controls are ignored. Speaker presets are saved after enhancement/trimming so the processed reference audio can be reused as Confucius `prompt_wav`.
-
-### IndexTTS 2.5 vLLM-Omni Backend
-
-The quickstart script provisions the tested integration repository next to
-this application automatically. Then select `IndexTTS 2.5 (vLLM-Omni)` in the
-UI. For a custom checkout location, set `INDEXTTS25_REPO_DIR`:
+Register `my_speaker_preset` in the UI, then synthesize:
 
 ```bash
-INDEXTTS25_REPO_DIR=/path/to/index-tts-2.5-vllm-omni-experiment \
-  bash quickstart.sh
+curl --fail http://127.0.0.1:8000/speak \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Hello from IndexTTS.","name":"my_speaker_preset","tts_backend":"index"}' \
+  --output output.mp3
 ```
 
-The first `index25` request incrementally creates the isolated Python 3.11 environment, downloads the 2.5 checkpoint and its Wav2Vec2-BERT, CAMPPlus, and BigVGAN dependencies, then starts the OpenAI-compatible vLLM-Omni API. Supported synthesis/translation languages are Chinese, English, Japanese, Spanish, and Arabic. Speaker presets and uploaded references are encoded as cached data URLs; emotion text/audio, sampling overrides, seeded sentence batching, native duration control, exact WAV duration fitting, and streaming keepalives are supported. The model itself is non-streaming, so streaming endpoints emit progress keepalives followed by the completed audio.
+Synthesis streaming uses binary frames, not SSE:
+`CHUNK:{idx}:{size}:{MORE|LAST}\n{audio_bytes}` and optional
+`KEEPALIVE:{size}\n{json}`. Clients must buffer partial headers and payloads
+across transport reads and consume the declared byte count. Translation
+progress endpoints use `text/event-stream`.
 
----
+## Development
 
-## API Reference
+[ARCHITECTURE.md](ARCHITECTURE.md) maps the supported entry point, routers,
+services, frontend, legacy interfaces, and compatibility rules.
 
-The FastAPI server [fastapi_webui_v2.py](fastapi_webui_v2.py) exposes a rich, asynchronous REST API.
-
-### Development checks
-
-Install the development tools and run the CPU-only contract suite:
+Run development and deployment from the repository checkout. The editable
+install below provides development tooling; standalone wheel deployment is
+not supported because model code and application assets use the checkout layout.
 
 ```bash
-pip install -r requirements-dev.txt
-python -m pytest
-ruff check indextts_web tests fastapi_webui_v2.py tools/extract_*.py tools/split_translation_asset.py
+pip install -e '.[dev]'
+python -m unittest discover -s tests -v
+ruff check indextts_web tests fastapi_webui_v2.py
+python -m compileall -q indextts_web tests fastapi_webui_v2.py fastapi_webui_v2_impl.py
 ```
 
-The route inventory, streaming frame protocol, settings coercion, session
-repository, file containment, FFmpeg command construction, backend adapters,
-and externalized frontend assets are covered without requiring CUDA or
-checkpoints. GPU smoke tests should still run in the deployment environment.
-
-### 🎙️ Speech Generation
-
-#### 1. POST `/speak`
-Synthesize speech from text using an existing speaker preset.
-- **Request Body (JSON)**:
-  - `text` (string, required): The text to synthesize.
-  - `name` (string, required): The speaker preset name.
-  - `emotion_text` (string, optional): Emotional description.
-  - `emotion_weight` (float, optional): Intensity 0.0-1.0 (default: `0.6`).
-  - `diffusion_steps` (int, optional): Quality steps (default: `10`).
-  - `max_text_tokens_per_sentence` (int, optional): Text split threshold (default: `120`).
-  - `tts_backend` (`index`, `index25`, or `confucius`, optional): Override the server default backend.
-  - `duration_control` (`original` or `ffmpeg`, optional): Force FFmpeg post-process duration matching when set to `ffmpeg`.
-  - `language` (string, optional): External backend language code/label; auto-detected when omitted where supported.
-- **Response**: `audio/mpeg` binary audio data (MP3).
-
-#### 2. POST `/clone_voice`
-Clone a voice using an uploaded reference audio file (zero-shot synthesis).
-- **Request Body (`multipart/form-data`)**:
-  - `text` (string, required): Text to synthesize.
-  - `reference_audio_file` (file, required): Audio file containing the target voice.
-  - `emotion_text`, `emotion_weight`, `diffusion_steps`, `max_text_tokens_per_sentence`: Optional settings.
-  - `tts_backend` (`index`, `index25`, or `confucius`, optional): Override the server default backend.
-  - `language` (string, optional): External backend language code/label; auto-detected when omitted where supported.
-- **Response**: `audio/mpeg` binary audio data (MP3).
-
-#### 3. POST `/speak_stream`
-Generate speech with streaming chunks for low latency and external-backend cold-start keepalives.
-- **Request Body (JSON)**: Same parameters as `/speak`.
-- **Response**: `application/octet-stream` binary frames.
-  - Stream Format: `CHUNK:{idx}:{size}:{status}\n{audio_bytes}`
-  - Status: `MORE` (more chunks follow) or `LAST` (final chunk).
-  - External backends may also send `KEEPALIVE:{size}\n{json}` frames before the final audio chunk.
-
-#### 4. POST `/clone_voice_stream`
-Clone a voice with streaming chunk outputs.
-- **Request Body (`multipart/form-data`)**: Same parameters as `/clone_voice`.
-- **Response**: Same format as `/speak_stream`.
-
-#### 5. POST `/audio/speech`
-OpenAI-compatible text-to-speech API.
-- **Request Body (JSON)**:
-  - `model` (string, required): e.g., `index-tts-2`.
-  - `input` (string, required): Text to synthesize.
-  - `voice` (string, required): Speaker preset name.
-  - `response_format` (string, optional): Output format (default: `mp3`).
-  - `speed` (float, optional): Speed factor (default: `1.0`).
-- **Response**: Binary audio stream.
-
----
-
-### Stable Audio 3 Music / SFX
-
-#### 1. GET `/api/stable-audio/models`
-List Stable Audio 3 variants, checkpoint readiness, and loaded model state.
-
-#### 2. POST `/api/stable-audio/generate`
-Generate music, ambience, or sound effects from a prompt. Defaults to `stable-audio-3-medium`.
-- **Request Body (`multipart/form-data` or JSON)**:
-  - `prompt` (string, required): Audio description.
-  - `variant_key` (string, optional): `medium`, `small-music`, or `small-sfx`.
-  - `negative_prompt` (string, optional): Concepts to avoid.
-  - `duration` (int, optional): Target length in seconds.
-  - `steps`, `cfg_scale`, `sampler_type`, `seed` (optional): Sampling controls.
-  - `init_audio_file`, `inpaint_audio_file` (files, optional): Audio-to-audio and inpainting inputs.
-  - `response_format` (string, optional): `mp3`, `wav`, `flac`, `ogg`, `opus`, `aac`, or `webm`.
-- **Response**: Binary audio data in the requested format.
-
-#### 3. POST `/api/stable-audio/unload`
-Unload Stable Audio 3 models from GPU memory. Pass `variant_key` to unload one model, or omit it to unload all.
-
----
-
-### 👥 Speaker Management
-
-#### 1. POST `/add_speaker`
-Register a new reference speaker.
-- **Request Body (`multipart/form-data`)**:
-  - `name` (string, required): Target speaker preset name.
-  - `audio_files` (files, required): One or more reference audio files.
-  - `enhance_voice` (bool, optional): Run speech enhancement on the reference.
-  - `enhancement_model` (string, optional): Model key (default: `MossFormerGAN_SE_16K`).
-  - `super_resolution_voice` (bool, optional): Enable 48kHz super resolution.
-- **Response**: JSON confirmation with status and details.
-
-#### 2. POST `/delete_speaker`
-Remove a registered speaker preset.
-- **Request Body (`multipart/form-data` or JSON)**:
-  - `name` (string, required): Speaker name to delete.
-- **Response**: JSON status.
-
-#### 3. GET `/audio_roles`
-List all available speakers and presets.
-- **Response**: JSON list of speaker names and metadata.
-
-#### 4. GET `/api/speaker_preview/{speaker_name}`
-Retrieve the reference MP3 preview for a speaker.
-- **Response**: `audio/mpeg` binary data.
-
----
-
-### 🌐 Speech Translation & Editing
-
-#### 1. POST `/api/translate_audio`
-Translate a full speech audio file into another language.
-- **Request Body (`multipart/form-data`)**:
-  - `audio_file` (file, required): Input audio file.
-  - `dest_language` (string, required): Target language (e.g., "English", "Chinese").
-  - `audio_separator_enabled` (bool, optional): Enable instrumental separation.
-  - `audio_separator_model` (string, optional): 'fast', 'balance', or 'quality'.
-  - `enhance_voice` (bool, optional): Enable voice enhancement.
-  - `enhancement_model` (string, optional): MossFormer/FRCRN model choice.
-  - `super_resolution_voice` (bool, optional): Enable 48kHz upsampling.
-  - `merge_backing_track` (bool, optional): Merge backend instrumental track (default: `true`).
-  - `tts_backend` (`index`, `index25`, or `confucius`, optional): Select the synthesis backend.
-  - `transcription_pipeline` (string, optional): 'moss_transcribe' (default), 'gemini', 'whisperx', 'qwen_omnivad', or 'parakeet'.
-  - `translation_llm_model` (string, optional): Translation LLM.
-- **Response**: `audio/mpeg` binary translated audio with `X-Translation-Segments` headers containing detailed segment metadata.
-
-#### 2. POST `/api/translate_segments`
-Transcribe/translate a voice file and return editable segment metadata (first step of advanced workflow).
-- **Request Body (`multipart/form-data`)**: Similar parameters to `/api/translate_audio`.
-- **Response**: `text/event-stream` SSE progress updates, ending with a final `complete` event containing the `session_id` and list of diarized segments.
-
-#### 3. POST `/api/translate_generate_segments`
-Synthesize final translated audio using modified segment metadata and speaker assignments.
-- **Request Body (JSON)**:
-  - `session_id` (string, required): Session ID.
-  - `segments` (array of objects, required): Edited segments with translation text, timings, and speaker assignments.
-  - `speaker_overrides` (object, optional): Map of speaker IDs to presets.
-  - `tts_backend` (`index`, `index25`, or `confucius`, optional): Override the session/server backend for this generation.
-- **Response**: `text/event-stream` SSE progress events, culminating in `complete` with audio output URLs.
-
-#### 4. POST `/api/translate_segment_preview`
-Quickly test-generate a single edited segment.
-- **Request Body (JSON)**:
-  - `session_id` (string, required): Session ID.
-  - `segment` (object, required): A single segment definition.
-  - `tts_backend` (`index`, `index25`, or `confucius`, optional): Override the session/server backend for the preview.
-- **Response**: JSON containing the temporary preview URL.
-
-#### 5. GET `/api/segment_preview/{session_id}/{segment_index}`
-Download preview audio for a specific segment.
-- **Response**: `audio/mpeg` file.
-
----
-
-### 📦 Parallel Chunk Processing
-
-#### 1. POST `/api/translate_split_audio`
-Split a long audio file into manageable chunks at silence points.
-- **Request Body (`multipart/form-data`)**:
-  - `audio_file` (file, required): Source audio.
-  - `chunk_min_minutes` (float, optional): Default `3.0`.
-  - `chunk_max_minutes` (float, optional): Default `6.0`.
-  - `min_silence_ms` (int, optional): Silence split window (default: `2000`).
-- **Response**: SSE stream containing chunk session details and a batch ID.
-
-#### 2. POST `/api/translate_generate_chunks`
-Translate split chunks concurrently.
-- **Request Body (JSON)**:
-  - `chunk_session_ids` (array, required): List of session IDs to process.
-  - `dest_language` (string, required): Target language.
-- **Response**: SSE stream tracking parallel chunk synthesis progress.
-
-#### 3. POST `/api/translate_merge_chunks`
-Merge translated chunks back into a unified file and export subtitle files.
-- **Request Body (JSON)**:
-  - `chunk_batch_id` (string, required): The batch ID.
-  - `merge_backing_track` (bool, optional): Merge back original instrumental backing tracks.
-- **Response**: JSON containing merged `audio_url` and `subtitle_url`.
-
----
-
-### 🎨 Voice Design (Qwen3-TTS)
-
-#### 1. POST `/api/design-voice`
-Synthesize text with a custom voice designed from natural language descriptions.
-- **Request Body (JSON)**:
-  - `text` (string, required): Text to speak.
-  - `voice_description` (string, required): Description (e.g. "soft whispers, calm female voice").
-  - `language` (string, optional): Target language.
-- **Response**: Binary audio file.
-
-#### 2. POST `/api/design-voice/save-preset`
-Save the last designed voice as a reusable speaker preset.
-- **Request Body (JSON)**:
-  - `preset_name` (string, required): Target preset name.
-  - `description` (string, optional): Override description.
-- **Response**: JSON status.
-
-#### 3. GET `/api/design-voice/languages`
-Get a list of supported voice design languages.
-
-#### 4. GET `/api/design-voice/status`
-Check if the Qwen3-TTS voice design backend model is loaded and ready.
-
----
-
-### 📹 Video Downloader & Cookies
-
-#### 1. POST `/api/video_info`
-Extract video info and formats from a URL via `yt-dlp`.
-- **Request Body (JSON)**: `url` (string, required).
-- **Response**: JSON metadata including formats, title, and durations.
-
-#### 2. POST `/api/video_download`
-Download video files.
-- **Request Body (JSON)**: `url` (required), `quality` (optional).
-- **Response**: SSE progress stream.
-
-#### 3. POST `/api/video_replace_audio`
-Mux a translated audio file and subtitles back into a downloaded video.
-- **Request Body (JSON)**:
-  - `downloaded_video_id` (string, required): Video filename.
-  - `audio_file_name` (string, required): Translated audio filename.
-  - `subtitle_file_name` (string, optional): SRT filename.
-  - `output_filename` (string, optional): Custom name.
-- **Response**: JSON containing the download link of the output video.
-
-#### 4. GET `/api/cookies`
-Get all saved cookies by domain.
-
-#### 5. POST `/api/cookies/import_curl`
-Import site cookies from cURL command headers.
-- **Request Body (JSON)**: `curl_command` (string, required), `domain` (string, optional).
-
-#### 6. POST `/api/cookies/upload`
-Upload a Netscape `cookies.txt` file.
-- **Request Body (`multipart/form-data`)**: `file` (file), `domain` (string).
-
-#### 7. DELETE `/api/cookies/{domain}`
-Delete cookies associated with a domain.
-
----
-
-### 🛠️ Utilities
-
-#### 1. GET `/server_info`
-Get server capabilities, version, and hardware backend state.
-
-#### 2. GET `/api/prompt_templates`
-Get default Gemini transcription and translation system prompts.
-
-#### 3. POST `/api/estimate_duration`
-Estimate speech duration in milliseconds before rendering.
-- **Request Body (JSON)**: `text` (string), `language` (string).
-- **Response**: JSON containing `duration_ms`.
-
-#### 4. POST `/api/clear_outputs`
-Clean temporary files and free space in the `outputs/` folder.
-
----
-
-## Code Examples
-
-### Basic Speech Synthesis (Python)
-```python
-import requests
-
-url = "http://127.0.0.1:8000/speak"
-payload = {
-    "text": "Hello! Welcome to the high performance Voice Studio.",
-    "name": "my_speaker_preset",
-    "emotion_text": "friendly and professional",
-    "emotion_weight": 0.7
-}
-
-response = requests.post(url, json=payload)
-if response.status_code == 200:
-    with open("output.mp3", "wb") as f:
-        f.write(response.content)
-    print("Audio saved successfully!")
-else:
-    print(f"Error: {response.json()}")
-```
-
-### Streaming Audio Chunking (JavaScript / Node.js)
-```javascript
-const fetch = require('node-fetch');
-const fs = require('fs');
-
-async function streamSpeech() {
-    const response = await fetch("http://127.0.0.1:8000/speak_stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-            text: "This is a demonstration of streaming audio chunks.",
-            name: "my_speaker_preset"
-        })
-    });
-
-    const fileStream = fs.createWriteStream("streaming_output.mp3");
-
-    // Custom SSE chunk parsing loop
-    response.body.on('data', (buffer) => {
-        let offset = 0;
-        while (offset < buffer.length) {
-            // Find boundaries or write incoming bytes
-            // Note: In browser environments, EventSource or readable streams can read the custom CHUNK syntax:
-            // CHUNK:{idx}:{size}:{status}\n{audio_bytes}
-            // For simple clients, parsing the chunk headers extracts raw MP3 bytes.
-        }
-    });
-}
-```
+The CPU suite uses fake model/service adapters and needs no CUDA or
+checkpoints. Check frontend JavaScript syntax with `node --check` and run
+real inference/streaming/backend-switching smoke checks in the GPU environment
+before release. Runtime GPU acceptance criteria are in
+[GPU_DEPLOYMENT.md](GPU_DEPLOYMENT.md#validation-status).

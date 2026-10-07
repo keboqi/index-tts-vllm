@@ -1,6 +1,8 @@
 import unittest
+from dataclasses import replace
 
 from indextts_web.config import AppSettings, env_flag, env_float, env_int, load_settings
+from tests.support import ROOT, load_definition
 
 
 class ConfigTests(unittest.TestCase):
@@ -35,6 +37,22 @@ class ConfigTests(unittest.TestCase):
     def test_unknown_args_can_be_ignored_by_embedding_hosts(self):
         settings = load_settings(["--port", "8123", "--host-owned-flag"], allow_unknown=True)
         self.assertEqual(settings.port, 8123)
+
+    def test_local_service_ports_are_distinct_and_collisions_fail_before_startup(self):
+        settings = load_settings([], environ={})
+        namespace = {"SETTINGS": settings}
+        for name in ("_is_local_service_host", "_validate_local_service_ports"):
+            load_definition(ROOT / "fastapi_webui_v2_impl.py", name, namespace)
+        validate = namespace["_validate_local_service_ports"]
+        validate()
+        for name, port in (("Confucius4-TTS", settings.confucius_port),
+                           ("IndexTTS 2.5", settings.indextts25_port)):
+            with self.subTest(backend=name):
+                namespace["SETTINGS"] = replace(settings, port=port)
+                with self.assertRaisesRegex(RuntimeError, f"Local service port conflict:.*{name}"):
+                    validate()
+        namespace["SETTINGS"] = replace(settings, confucius_host="external.example", confucius_port=settings.port)
+        validate()
 
 
 if __name__ == "__main__":

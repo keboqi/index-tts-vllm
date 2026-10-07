@@ -1,10 +1,8 @@
 import ast
 import unittest
-from pathlib import Path
 
 from indextts_web.route_groups import route_group
-
-ROOT = Path(__file__).resolve().parent.parent
+from tests.support import ROOT, source_tree
 
 EXPECTED_ROUTES = {
     ("POST", "/internal/snapshot/warmup"),
@@ -70,8 +68,7 @@ EXPECTED_ROUTES = {
 
 
 def source_routes():
-    source = (ROOT / "fastapi_webui_v2_impl.py").read_text(encoding="utf-8-sig")
-    tree = ast.parse(source)
+    tree = source_tree(ROOT / "fastapi_webui_v2_impl.py")
     routes = set()
     for node in tree.body:
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
@@ -88,7 +85,6 @@ def source_routes():
 class RouteContractTests(unittest.TestCase):
     def test_legacy_route_inventory_is_stable(self):
         self.assertEqual(source_routes(), EXPECTED_ROUTES)
-        self.assertEqual(len(EXPECTED_ROUTES), 59)
 
     def test_every_compatibility_route_has_one_feature_group(self):
         grouped = {path: route_group(path) for _method, path in EXPECTED_ROUTES}

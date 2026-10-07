@@ -195,10 +195,9 @@ install_python_dependencies() {
     fi
 
     log "MOSS Transcribe+Diarize is the default translation ASR pipeline; the Docker manager starts it on first use."
-    # Qwen3-ASR + OmniVAD remains available as an alternate local pipeline.
-    # Keep these here so quickstart.sh remains the single source of truth.
-    log "Installing Qwen3-ASR and OmniVAD for alternate translation pipeline"
-    "${UV_BIN}" pip install --python "${python}" qwen-asr omnivad sentencepiece
+    # Qwen3-ASR and qwen-tts pin incompatible Transformers versions.
+    # Configure QWEN_OMNIVAD_PYTHON to use the optional isolated ASR environment.
+    log "For alternate Qwen3-ASR + OmniVAD, configure QWEN_OMNIVAD_PYTHON (see README_EN.md)."
 }
 
 download_model() {

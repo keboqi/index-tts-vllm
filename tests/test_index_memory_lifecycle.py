@@ -10,16 +10,10 @@ from unittest.mock import AsyncMock, Mock
 
 from indextts_web.infrastructure.gpu_work import GpuWorkCoordinator, await_gpu_job, gpu_operation
 from indextts_web.infrastructure.vllm_memory import GpuWakeError
-from tests.test_modal_gpu_profiles import ROOT, load_definition
+from tests.support import ROOT, load_definition, source_tree
 
 
 class IndexWakeTests(unittest.IsolatedAsyncioTestCase):
-    @classmethod
-    def setUpClass(cls):
-        tree = ast.parse((ROOT / "fastapi_webui_v2_impl.py").read_text(encoding="utf-8-sig"))
-        node = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "TTSManager")
-        cls.code = compile(ast.Module(body=[node], type_ignores=[]), "<TTSManager>", "exec")
-
     def setUp(self):
         self.memory = {"available": True, "total_mb": 24 * 1024, "free_mb": 10 * 1024}
         self.ns = {
@@ -32,8 +26,8 @@ class IndexWakeTests(unittest.IsolatedAsyncioTestCase):
             "_release_translation_gpu_models": AsyncMock(), "_release_cuda_cache": Mock(),
             "_run_blocking": AsyncMock(), "_cuda_memory_summary": lambda: self.memory,
         }
-        exec(self.code, self.ns)
-        self.manager = self.ns["TTSManager"]()
+        manager_type = load_definition(ROOT / "fastapi_webui_v2_impl.py", "TTSManager", self.ns)
+        self.manager = manager_type()
         self.manager._initialized = True
         self.manager.gpu_coordinator = self.ns["GPU_COORDINATOR"]
         self.manager.tts = SimpleNamespace(wake_indextts_vllm=AsyncMock(), wake_emotion_vllm=AsyncMock())
@@ -74,7 +68,7 @@ class IndexWakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.manager._emotion_vllm_sleeping)
 
     def test_batch_propagates_wake_failure_instead_of_generating_silence_per_segment(self):
-        tree = ast.parse((ROOT / "fastapi_webui_v2_impl.py").read_text(encoding="utf-8-sig"))
+        tree = source_tree(ROOT / "fastapi_webui_v2_impl.py")
         block = next(node for node in ast.walk(tree) if isinstance(node, ast.Try)
                      and any(isinstance(handler.type, ast.Name) and handler.type.id == "GpuWakeError"
                              for handler in node.handlers)

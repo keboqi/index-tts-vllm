@@ -1,4 +1,3 @@
-import ast
 import importlib.util
 import json
 import os
@@ -11,21 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from indextts_web.gpu_profiles import resolve_gpu_profile
 from indextts_web.infrastructure.modal_runtime import PERSISTENT_DIRECTORIES, prepare_runtime_code
-from tests.test_gpu_profiles import gpu
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def load_definition(path, name, namespace):
-    tree = ast.parse(path.read_text(encoding="utf-8-sig"))
-    if "." in name:
-        class_name, name = name.split(".", 1)
-        tree = next(node for node in ast.walk(tree) if isinstance(node, ast.ClassDef) and node.name == class_name)
-    definition = next(node for node in ast.walk(tree)
-                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name)
-    definition.decorator_list = []
-    exec(compile(ast.Module(body=[definition], type_ignores=[]), str(path), "exec"), namespace)
-    return namespace[name]
+from tests.support import ROOT, gpu, load_definition
 
 
 @unittest.skipUnless(importlib.util.find_spec("modal") and importlib.util.find_spec("yaml"),
@@ -172,7 +157,7 @@ class EngineConstructionTests(unittest.TestCase):
                              "_time": SimpleNamespace(time=lambda: 0), "_vllm_sleep_mode_enabled": lambda: True,
                              "AsyncEngineArgs": lambda **kwargs: kwargs,
                              "AsyncLLM": SimpleNamespace(from_engine_args=factory)}
-                initialize = load_definition(ROOT / "indextts/infer_vllm_v2.py", "init_gpt_vllm", namespace)
+                initialize = load_definition(ROOT / "indextts/infer_vllm_v2.py", "IndexTTS2.__init__.init_gpt_vllm", namespace)
                 self.assertEqual(initialize(), "engine")
                 options = factory.call_args.args[0]
                 self.assertTrue(options["enable_sleep_mode"])
@@ -209,7 +194,7 @@ class SnapshotWarmupTests(unittest.IsolatedAsyncioTestCase):
                      "_call_local_json": lambda path, **kwargs: events.append(path),
                      "_wait_ready": lambda proc, **kwargs: events.append("ready"),
                      "SNAPSHOT_REQUEST_TIMEOUT": 900, "SNAPSHOT_STARTUP_TIMEOUT": 1800}
-        restore = load_definition(ROOT / "deploy_vllm_indextts_v2.py", "wake_up", namespace)
+        restore = load_definition(ROOT / "deploy_vllm_indextts_v2.py", "IndexTTSVllmServer.wake_up", namespace)
         server = SimpleNamespace(moss_server_proc=Mock(), server_proc=Mock())
         for size in (24, 48, 96):
             events.clear()
@@ -260,7 +245,7 @@ class SnapshotVolumeTests(unittest.TestCase):
 
         def build_command(path):
             pending["cache"].add("omni-deploy-config.yaml")
-            return ["python", "webui.py"]
+            return ["python", "fastapi_webui_v2.py"]
 
         def start_worker(*args, **kwargs):
             self.assertEqual(durable["cache"], {"gpu-profiles/new-profile", "omni-deploy-config.yaml"})
