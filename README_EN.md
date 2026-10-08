@@ -48,12 +48,29 @@ The complete CLI definition lives in [indextts_web/config.py](indextts_web/confi
 
 For Modal, edit `IndexTTSVllmServer`'s `gpu=` in
 [deploy_vllm_indextts_v2.py](deploy_vllm_indextts_v2.py) to `"L4"`, `"L40S"`, or
-`"RTX-PRO-6000"`. Prepare fresh persistent volumes before deploying:
+`"RTX-PRO-6000"`. Deploy to expose the CPU setup manager and GPU studio:
 
 ```bash
-modal run deploy_vllm_indextts_v2.py::prepare_model
 modal deploy deploy_vllm_indextts_v2.py
 ```
+
+Open the `prepare_model` web URL printed by Modal and click **Initialize**
+to prepare missing model files, skipping complete bundles already in the app volume.
+You can also use **Update to latest** or
+**Download / resume** for an individual repository or model bundle.
+Existing prepared models do not need preparation again. Prepare fresh volumes
+before opening the GPU studio. Component dependencies are installed during the
+Modal image build, as before; dependency changes require rebuilding the image.
+Gated models require `HF_TOKEN` with repository access in the same secret.
+
+Preparation and updates run inside the same CPU web function and report progress
+and errors. Progress is held in memory while that container is running;
+interrupted downloads can be resumed. Models and source updates use `audio-studio-app` and
+`audio-studio-cache` volumes. Download status reports files on disk; optional
+models still load on demand. See the GPU studio for live model state.
+Redeploy after provisioning to create a fresh GPU snapshot with those changes.
+To use the manager temporarily, run `modal serve deploy_vllm_indextts_v2.py`
+and open its `prepare_model` URL. There is no cache-clearing action.
 
 See [GPU_DEPLOYMENT.md](GPU_DEPLOYMENT.md) for volumes/secrets, automatic
 settings, overrides, model lifecycle controls, and snapshot validation. CPU

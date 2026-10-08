@@ -21,11 +21,32 @@ The Modal app is named `audio-studio`, with persistent volumes
 `audio-studio-app` and `audio-studio-cache`. Provision these volumes and
 `custom-secret` using the deployment's normal setup process. Changing the
 volume names does not migrate data from previously named volumes.
-Model preparation is manual. For fresh volumes, run this before deployment:
+The `prepare_model` function is a CPU web manager. Deploy first (or use
+`modal serve deploy_vllm_indextts_v2.py` temporarily), then open its URL.
+The manager page and its actions are accessible directly, with no login token.
+For fresh volumes, click **Initialize** to prepare missing model files
+before requesting the GPU studio. Existing prepared volumes remain usable.
+Initialization skips complete model bundles already present in `audio-studio-app`.
+Individual model downloads and repository updates are also available.
+Gated Stable Audio models use `HF_TOKEN` from the same secret. Each download
+can be resumed; Confucius download also generates its local configuration and
+converts T2S weights for vLLM. No cache-clearing function is exposed.
 
-```bash
-modal run deploy_vllm_indextts_v2.py::prepare_model
-```
+The manager updates individual repositories to their remote default branch,
+including the initially detached Omni checkout. It preserves untracked model
+and user data and reapplies Confucius's integration patch. A managed main
+checkout is stored separately under `/persistent_app/repositories/index`.
+Component dependencies remain installed in the Modal image using the existing
+build recipes and isolated environments. No additional environment volume is
+needed. Rebuild the image to change dependencies. Downloaded checkpoints and
+installed environments do not imply GPU residency; the GPU studio reports
+live model state. IndexTTS 2.0 is the default backend; other models load on demand.
+
+Preparation and updates execute in the single `prepare_model` CPU web function.
+An in-process background task keeps the page responsive and serializes updates;
+progress is held in memory for that container's lifetime. Interrupted downloads
+can be resumed from their files in the existing app/cache volumes.
+The page works before initialization and does not start the GPU server.
 
 Changing GPU does not require changing
 vLLM fractions, compilation flags, or concurrency arguments. Detection runs
@@ -34,23 +55,33 @@ shows the detected device, usable capacity, and resolved settings.
 
 Application code is copied from the local repository into the Modal image.
 At startup, a container-local copy links to the existing persistent checkpoints,
-outputs, presets, and optional backend checkouts. Redeploy application changes;
-updating only the app Volume is insufficient. GPU/configuration/image changes
-invalidate Modal snapshots, while Volume changes do not. See
+outputs, presets, and optional backend checkouts. By default it uses the shipped
+source; after an explicit main repository update it uses the managed checkout,
+excluding Git metadata and model placeholders. Redeploy after manager changes: existing processes and
+snapshots keep their old code/models. Ordinary code and image changes invalidate
+snapshots automatically; unchanged redeployments reuse them. For changes made
+only through the web manager, increment `SNAPSHOT_REVISION` in the deployment
+script before redeploying. Volume changes alone do not invalidate snapshots. See
 [Modal's snapshot lifecycle](https://modal.com/docs/guide/memory-snapshots#when-are-memory-snapshots-updated).
 
 The snapshot path requires `/health` to report a loaded model and a warmup to
 produce nonempty audio before taking the snapshot. Restore verifies the GPU
 architecture/capacity, wakes the engines, and checks readiness without repeating
-warmup inference. Compiler caches and generated Omni
-configs use separate paths for each resolved GPU profile and Modal image.
+warmup inference. Compiler caches stay directly on `audio-studio-cache`,
+separated by GPU profile and backend. The compiler-cache directory key excludes
+`MODAL_IMAGE_ID`, so runtime/source-only redeployments do not select an empty
+cache directory. PyTorch/compiler artifact keys still validate compatibility.
+The first deployment with this key change selects a new directory; existing
+cache directories are preserved. Startup and shutdown perform no compiler-cache
+copying. The GPU function requests 2 CPUs and 8192 MiB RAM.
 
-Snapshot creation explicitly commits `audio-studio-cache` and `audio-studio-app`
-after runtime/config setup and again after warmup and engine sleep. This makes
-new GPU cache directories and warmup artifacts durable before capture; a commit
-failure aborts snapshot creation. Snapshots require committed cache directories;
-an uncommitted path can prevent restore before any Python hook runs. See
-[Modal Volume commit semantics](https://modal.com/docs/guide/volumes#volume-commits-and-reloads).
+Snapshot creation commits `audio-studio-cache` and `audio-studio-app` after
+runtime/config setup and again after warmup and engine sleep. A commit failure
+aborts snapshot creation. A missing Volume path can prevent restore before any
+Python hook runs, even when model warmup succeeded. Successful commits alone do
+not establish why the reported `gpu-profiles/...` directory was missing; that
+restore failure remains unverified. Preserve directories referenced by snapshots.
+See [Modal Volume commit semantics](https://modal.com/docs/guide/volumes#volume-commits-and-reloads).
 
 The image and startup environment set `ORT_DISABLE_TELEMETRY=1` before ONNX
 Runtime imports, including in subprocesses. This avoids its
@@ -88,10 +119,19 @@ release them; existing processed-audio caching still reuses matching results.
 Qwen3-ASR, MOSS, Confucius, and IndexTTS 2.5 also retain their own environments.
 Do not set a global `PIP_CONSTRAINT` that imposes the main pins on these workers.
 
+Only CUDA/compiler settings precede dependency installation in the image.
+Runtime environment settings come after all package installs and source checks,
+so changing them preserves earlier build layers. Application source is copied
+near the end. Main dependency installs use only `requirements-modal.txt`,
+`requirements-core.txt`, and `constraints-main.txt`; the local-only
+`requirements.txt` does not affect those layers. Changing this layer order can
+require one rebuild before the new cache layout is established. See
+[Modal image caching](https://modal.com/docs/guide/images#image-caching-and-rebuilds).
+
 After changing a local dependency manifest, run
 `modal deploy deploy_vllm_indextts_v2.py` to rebuild the affected image layers.
-`prepare_model` prepares persistent model volumes; rerunning it does not fix
-image build dependencies.
+The web manager prepares model files and updates repositories. Image dependency
+failures require fixing the local manifests and rebuilding.
 
 ## Automatic settings
 
@@ -205,8 +245,7 @@ to 7200 seconds. This worker uses the Transformers ASR backend.
 
 Qwen ASR and aligner downloads use `/persistent_app/checkpoints/qwen_omnivad`;
 pipeline result caching uses `/persistent_cache/qwen_omnivad`. Models download
-on first use. Interpreter/dependency changes require a new Modal image;
-`prepare_model` manages persistent models, not the running image's packages.
+on first use. Its isolated interpreter is installed during the Modal image build.
 For local environment setup, see [README_EN.md](README_EN.md#optional-backends-and-features).
 
 ## MOSS model controls

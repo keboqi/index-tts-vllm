@@ -7,7 +7,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 MAIN_DEPENDENCY_FILES = (
-    "requirements.txt",
     "requirements-core.txt",
     "requirements-modal.txt",
     "constraints-main.txt",

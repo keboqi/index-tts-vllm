@@ -11,7 +11,7 @@ PERSISTENT_DIRECTORIES = (
 )
 
 
-def prepare_runtime_code(source: Path, persistent: Path, destination: Path) -> Path:
+def prepare_runtime_code(source: Path, persistent: Path, destination: Path, *, managed_source: bool = False) -> Path:
     """Use the source shipped with the deployment, never stale volume code.
 
     Only destination (a fresh container-local directory) is modified. The
@@ -19,13 +19,19 @@ def prepare_runtime_code(source: Path, persistent: Path, destination: Path) -> P
     """
     if destination.exists():
         raise FileExistsError(f"Runtime code directory already exists: {destination}")
-    shutil.copytree(source, destination)
+    def ignore_checkout_data(directory, names):
+        ignored = {name for name in names if name.startswith(".") or name == "__pycache__"}
+        if Path(directory) == source:
+            ignored.update(set(names).intersection((*PERSISTENT_DIRECTORIES, "repositories")))
+        return ignored
+
+    shutil.copytree(source, destination, ignore=ignore_checkout_data if managed_source else None)
     for name in PERSISTENT_DIRECTORIES:
         target = persistent / name
         if name in {"outputs", "speaker_presets", "emotion_cache"}:
             target.mkdir(parents=True, exist_ok=True)
         if not target.is_dir():
-            raise FileNotFoundError(f"Persistent runtime data missing: {target}; run prepare_model first")
+            raise FileNotFoundError(f"Persistent runtime data missing: {target}; open the prepare_model web manager first")
         link = destination / name
         if link.exists():
             raise ValueError(f"Deployment source must not contain runtime data: {link}")

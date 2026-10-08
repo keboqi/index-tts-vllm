@@ -137,6 +137,9 @@ class GpuProfile:
         # Free memory varies across cold starts/restores. It is not part of
         # engine configuration or compilation compatibility.
         values["gpu"].pop("free_bytes")
+        # Image IDs also change for runtime env/source edits. Keep the shared
+        # directory stable; compilers key artifacts by code/library compatibility.
+        values.pop("runtime_identity")
         return f"{self.name}-sm{self.gpu.capability.replace('.', '')}-" + hashlib.sha256(
             json.dumps(values, sort_keys=True).encode()
         ).hexdigest()[:12]

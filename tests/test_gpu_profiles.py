@@ -113,6 +113,15 @@ class GpuProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             resolve_gpu_profile(gpu(), {}).check_startup_memory(non_vllm_gib=float("nan"))
 
+    def test_redeploy_does_not_discard_compatible_compiler_cache(self):
+        old = resolve_gpu_profile(gpu(), {"MODAL_IMAGE_ID": "im-before"}, modal=True)
+        new = resolve_gpu_profile(gpu(), {"MODAL_IMAGE_ID": "im-after"}, modal=True)
+        self.assertNotEqual(old.runtime_identity, new.runtime_identity)
+        self.assertEqual(old.cache_key, new.cache_key)
+        # Changed GPU architecture and engine settings still select distinct paths.
+        self.assertNotEqual(replace(new, gpu=replace(new.gpu, capability="12.0")).cache_key, new.cache_key)
+        self.assertNotEqual(replace(new, use_torch_compile=False).cache_key, new.cache_key)
+
     def test_checkpoint_context_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             model = Path(directory)

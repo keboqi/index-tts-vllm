@@ -47,9 +47,19 @@ Modal 部署在 [deploy_vllm_indextts_v2.py](deploy_vllm_indextts_v2.py) 中手�
 新建持久化卷时先准备模型，再部署：
 
 ```bash
-modal run deploy_vllm_indextts_v2.py::prepare_model
 modal deploy deploy_vllm_indextts_v2.py
 ```
+
+直接打开 Modal 输出的 `prepare_model` Web 地址，点击 **Initialize** 准备缺失的模型文件。
+页面也支持独立的仓库更新（Update to latest）和模型下载/续传（Download / resume）。
+已有模型无需重新准备；空 Volume 准备完成后再打开 GPU Studio。
+组件依赖仍在 Modal 镜像构建时安装，修改依赖后重新部署即可，无需额外的环境卷。
+页面显示文件是否已下载；其他模型仍按需加载到 GPU，实际加载状态见 Studio 的模型管理器。
+受限模型需要同一 Secret 中具有仓库访问权限的 `HF_TOKEN`。
+
+初始化和更新在同一个 CPU Web 函数内执行，页面显示进度和错误。
+配置完成后再次部署，以重新生成 GPU 快照并应用更新。也可以通过
+`modal serve deploy_vllm_indextts_v2.py` 临时打开管理页面。已移除清缓存功能。
 
 卷、Secret、自动参数、覆盖方式、模型管理和快照验证流程统一见
 [GPU_DEPLOYMENT.md](GPU_DEPLOYMENT.md)。CPU 测试覆盖配置与启动命令；

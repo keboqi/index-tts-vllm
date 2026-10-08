@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Audio Studio · Models & Setup</title>
+  <style>
+    :root { color-scheme: dark; --bg:#10131a; --panel:#191e29; --line:#30394a; --muted:#a9b4c8; --accent:#a8bfff; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:#eef2ff; font:15px/1.55 system-ui,sans-serif; }
+    main { max-width:1160px; margin:auto; padding:40px 24px; }
+    header { display:flex; justify-content:space-between; align-items:center; gap:20px; }
+    h1 { font-size:30px; margin:4px 0; letter-spacing:-.8px; } h2 { font-size:20px; margin:0 0 6px; }
+    p { color:var(--muted); margin:0 0 20px; } .eyebrow { color:var(--accent); text-transform:uppercase; font-size:12px; letter-spacing:2px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:22px; margin-top:20px; }
+    button { background:#263658; border:1px solid #46608f; color:#e3ebff; border-radius:8px; padding:9px 14px; cursor:pointer; font:inherit; }
+    button:hover:not(:disabled) { background:#344a76; } button:disabled { opacity:.45; cursor:wait; }
+    button:focus-visible, summary:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+    .grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-top:16px; }
+    .item { border:1px solid var(--line); background:#141923; border-radius:10px; padding:16px; display:flex; flex-direction:column; align-items:flex-start; gap:12px; }
+    .name { font-weight:650; } .detail { color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+    .item button { margin-top:auto; } .badge { font-size:12px; padding:3px 9px; border-radius:20px; background:#35303b; color:#dfc3bc; }
+    .badge.ready { background:#1c3930; color:#a4e4c2; } .warning { background:#292b3e; border-left:3px solid var(--accent); padding:14px; margin-top:20px; border-radius:6px; }
+    #notice { color:#ffd6b7; margin-top:12px; white-space:pre-wrap; } #notice:empty { display:none; }
+    pre { margin:12px 0 0; padding:16px; background:#0c1017; border-radius:8px; max-height:360px; overflow:auto; font:12px/1.6 monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .job-row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; } small { color:var(--muted); }
+    [hidden] { display:none !important; } summary { cursor:pointer; }
+    @media(max-width:850px) { .grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+    @media(max-width:540px) { main { padding:24px 14px; } .grid { grid-template-columns:1fr; } header { align-items:flex-start; } h1 { font-size:25px; } .panel { padding:16px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header><div><div class="eyebrow">Audio Studio</div><h1>Models & Setup</h1><p>Prepare models, update repositories, and resume downloads.</p></div><button id="refresh">Refresh</button></header>
+  <button id="prepare" class="operation">Initialize</button>
+  <p>Prepare missing models using the existing app volume and image environments. Existing complete models are skipped.</p>
+  <small>Gated model downloads use HF_TOKEN from your Modal custom-secret.</small>
+  <div id="notice" role="alert"></div>
+  <div id="content" hidden>
+    <div class="warning">Models and repository updates use the existing app and cache volumes. Redeploy after changes to refresh the GPU service's memory snapshot.</div>
+    <section class="panel"><h2>Repositories</h2><p>Update each repository to its remote default branch. Integration patches are reapplied; model and user files are preserved.</p><div id="repositories" class="grid"></div></section>
+    <section class="panel"><h2>Model downloads</h2><p>These checks report checkpoint files on disk. IndexTTS 2.0 is the default backend; other models load into GPU memory on demand. A downloaded model can still be unloaded or sleeping. Use the GPU studio's Model Manager to check live model state. Confucius downloads include conversion for vLLM.</p><div id="models" class="grid"></div></section>
+    <details class="panel"><summary>Component environments · included in image</summary><p>Dependencies are installed when the Modal image is built, as before. Rebuild and redeploy the image to change them.</p><div id="environments" class="grid"></div></details>
+    <section class="panel" id="jobs"><h2>Progress</h2><p>Preparation runs inside this web function. Progress remains available while the container is running; interrupted downloads can be resumed.</p><div id="job-list" aria-live="polite"></div></section>
+  </div>
+</main>
+<script>
+  let jobs = JSON.parse(localStorage.getItem('model-manager-jobs') || '[]');
+  let polling = false;
+  const $ = id => document.getElementById(id);
+  function notice(message='') { $('notice').textContent = message; }
+  async function api(path, options={}) {
+    const response = await fetch(path, {...options, headers:{'Content-Type':'application/json'}});
+    const body = await response.json();
+    if (!response.ok) throw new Error(typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail));
+    return body;
+  }
+  function node(tag, text, className='') { const el=document.createElement(tag); el.textContent=text; el.className=className; return el; }
+  function saveJobs() { localStorage.setItem('model-manager-jobs', JSON.stringify(jobs.slice(-30))); }
+  function renderJobs() {
+    const opened=new Map([...$('job-list').querySelectorAll('details')].map(el=>[el.dataset.jobId,el.open]));
+    $('job-list').replaceChildren();
+    if (!jobs.length) $('job-list').append(node('small','No operations yet.'));
+    for (const job of [...jobs].reverse()) {
+      const details=node('details',''); details.dataset.jobId=job.id;
+      details.open=opened.has(job.id) ? opened.get(job.id) : ['queued','running','failed'].includes(job.status);
+      const summary=node('summary',`${job.action} · ${job.target} — ${job.status}`);
+      const log=(job.logs || []).join('\n');
+      details.append(summary, node('pre',(log + (job.error ? '\nError: ' + job.error : '')).trim() || 'Waiting for worker…'));
+      $('job-list').append(details);
+    }
+  }
+  function cards(container, items, action, label) {
+    $(container).replaceChildren();
+    for (const item of items) {
+      const card=node('div','', 'item');
+      card.append(node('div',item.name,'name'), node('span',item.status_label || (item.ready ? 'Available' : 'Unavailable'),`badge ${item.ready?'ready':''}`));
+      card.append(node('div',item.revision || item.python || item.path || (item.repos || []).join(' · ') || 'No checkout yet','detail'));
+      if (item.gated) card.append(node('small','Gated · HF_TOKEN needs repository access'));
+      if (item.missing?.length) { const d=node('details',''); d.append(node('summary',`${item.missing.length} required files missing`),node('div',item.missing.join('\n'),'detail')); card.append(d); }
+      if (action) {
+        const button=node('button',label); button.className='operation';
+        button.disabled=jobs.some(j=>['queued','running'].includes(j.status));
+        button.onclick=()=>start(action,item.id); card.append(button);
+      }
+      $(container).append(card);
+    }
+  }
+  async function refresh() {
+    const state=await api('/api/state');
+    cards('repositories',state.repositories,'update-repo','Update to latest');
+    cards('models',state.models,'download-model','Download / resume');
+    cards('environments',state.environments);
+    $('prepare').disabled=jobs.some(j=>['queued','running'].includes(j.status));
+    $('content').hidden=false;
+    notice();
+  }
+  async function start(action,target) {
+    notice();
+    try { const job=await api('/api/jobs',{method:'POST',body:JSON.stringify({action,target})}); jobs.push(job); saveJobs(); renderJobs(); await refresh(); }
+    catch(error) { notice(error.message); }
+  }
+  async function poll() {
+    if (polling || !jobs.some(job=>['queued','running'].includes(job.status))) return; polling=true;
+    try {
+      let changed=false;
+      for (let i=0;i<jobs.length;i++) if (['queued','running'].includes(jobs[i].status)) {
+        const old=jobs[i];
+        try { jobs[i]=await api(`/api/jobs/${encodeURIComponent(old.id)}`); }
+        catch(error) { if (error.message.includes('expired')) jobs[i]={...old,status:'failed',error:error.message}; else throw error; }
+        changed ||= old.status!==jobs[i].status;
+      }
+      saveJobs(); renderJobs(); if (changed) await refresh();
+    } catch(error) { notice(error.message); } finally { polling=false; }
+  }
+  $('refresh').onclick=()=>refresh().catch(error=>notice(error.message));
+  $('prepare').onclick=()=>start('prepare-models','all');
+  renderJobs(); refresh().then(poll).catch(error=>notice(error.message));
+  setInterval(poll,2000);
+</script>
+</body>
+</html>

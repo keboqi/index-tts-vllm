@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 import os
 import shlex
@@ -6,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from indextts_web.infrastructure.modal_dependencies import MAIN_DEPENDENCY_FILES, install_main_dependencies
 from tests.support import ROOT
@@ -67,6 +69,15 @@ class ModalDependencyTests(unittest.TestCase):
         self.assertNotEqual(before.files[path], after.files[path])
         self.assertEqual(after.files[path], "numpy==1.26.4\n")
 
+    def test_local_only_requirements_do_not_change_the_modal_dependency_layer(self):
+        before = install_main_dependencies(FakeImage(), self.source)
+        (self.source / "requirements.txt").write_text("unrelated-local-package\n", encoding="utf-8")
+        after = install_main_dependencies(FakeImage(), self.source)
+        self.assertEqual(before.calls, after.calls)
+        self.assertEqual(before.files, after.files)
+        (self.source / "requirements.txt").unlink()
+        self.assertEqual(install_main_dependencies(FakeImage(), self.source).files, before.files)
+
     def test_missing_manifests_fail_before_any_image_changes(self):
         for name in MAIN_DEPENDENCY_FILES:
             with self.subTest(manifest=name):
@@ -87,6 +98,59 @@ class ModalDependencyTests(unittest.TestCase):
             shlex.split(image.calls[-1][1]),
             ["python", "-m", "pip", "install", "-r", "/opt/current app/requirements-modal.txt"],
         )
+
+
+class ModalImageCacheTests(unittest.TestCase):
+    def build_layers(self, runtime_changes=None):
+        class RecordingImage:
+            def __init__(self, layers=()):
+                self.layers = layers
+
+            def __getattr__(self, method):
+                def record(*args, **kwargs):
+                    # Local manifests contribute their contents to the build cache.
+                    if method == "add_local_file":
+                        args = (*args, Path(args[0]).read_bytes())
+                    kwargs = {key: value.__name__ if callable(value) else value
+                              for key, value in kwargs.items()}
+                    return RecordingImage((*self.layers, (method, args, kwargs)))
+                return record
+
+        source = ROOT / "deploy_vllm_indextts_v2.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        nodes = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "app"
+                                                   for target in node.targets):
+                break
+            if isinstance(node, (ast.Assign, ast.If, ast.FunctionDef)):
+                nodes.append(node)
+
+        class ChangeRuntimeValues(ast.NodeTransformer):
+            def visit_Dict(self, node):
+                for index, key in enumerate(node.keys):
+                    if isinstance(key, ast.Constant) and key.value in (runtime_changes or {}):
+                        node.values[index] = ast.Constant(runtime_changes[key.value])
+                return self.generic_visit(node)
+
+        tree = ast.fix_missing_locations(ChangeRuntimeValues().visit(ast.Module(body=nodes, type_ignores=[])))
+        namespace = {"Path": Path, "__file__": str(source),
+                     "modal": SimpleNamespace(is_local=lambda: True, Image=RecordingImage())}
+        exec(compile(tree, str(source), "exec"), namespace)
+        return namespace["image"].layers
+
+    def test_runtime_changes_reuse_every_build_layer(self):
+        before = self.build_layers()
+        after = self.build_layers({"HF_HOME": "/persistent_cache/other-hf",
+                                   "TORCHINDUCTOR_COMPILE_THREADS": "2",
+                                   "CLEARVOICE_PYTHON": "/opt/another-worker/bin/python"})
+        self.assertEqual(before[:-1], after[:-1])
+        self.assertEqual(before[-1][0], "env")
+        self.assertNotEqual(before[-1], after[-1])
+        # All runtime variables must be in the last layer, including ones not
+        # exercised above; only compiler/build variables may precede installs.
+        early_env = {key for method, args, _ in before[:-1] if method == "env" for key in args[0]}
+        self.assertEqual(early_env, {"CUDA_HOME", "CUDA_PATH", "TORCH_CUDA_ARCH_LIST", "FORCE_CUDA", "CC", "CXX"})
 
 
 @unittest.skipUnless(importlib.util.find_spec("modal"), "Modal SDK required for remote import test")
@@ -120,7 +184,9 @@ with patch.object(modal, "is_local", return_value=False), patch.object(
     assert deploy.app.name == "audio-studio"
     assert deploy.image is None
     assert isinstance(deploy.prepare_model, modal.Function)
-    assert isinstance(deploy.clear_cache, modal.Function)
+    assert not hasattr(deploy, "run_setup_job")
+    assert not hasattr(deploy, "environment_storage")
+    assert not hasattr(deploy, "clear_cache")
     assert isinstance(deploy.IndexTTSVllmServer, modal.Cls)
 print("Container import registered all services")
 '''

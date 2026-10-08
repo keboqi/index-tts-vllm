@@ -58,6 +58,9 @@ MOSS_TRANSCRIBE_REPO_ID = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
 HY_MT_TRANSLATION_REPO_ID = "tencent/Hy-MT2-1.8B"
 RUNTIME_SOURCE_DIR = "/opt/indextts-runtime-source"
 DEPLOY_SOURCE_ROOT = Path(__file__).resolve().parent
+# Increment only when applying repository/model changes made in the web UI.
+# Ordinary code/image changes already invalidate Modal's snapshots.
+SNAPSHOT_REVISION = "1"
 
 
 def _ignore_runtime_source(path) -> bool:
@@ -104,33 +107,6 @@ if modal.is_local():
             "FORCE_CUDA": "1",
             "CXX": "g++",
             "CC": "gcc",
-
-            # vLLM sleep mode uses its CUDA memory pool; PyTorch expandable
-            # segments are incompatible with that allocator.
-            "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
-            "TORCH_CUDNN_BENCHMARK": "1",  # Enable cuDNN autotuning
-            "TORCH_COMPILE_MODE": "reduce-overhead",  # Optimize for TTS workloads
-
-            # Cache directories for faster subsequent runs
-            "HF_HOME": "/persistent_cache/huggingface",
-            "HUGGINGFACE_HUB_CACHE": "/persistent_cache/huggingface/hub",
-            "TORCH_HOME": "/persistent_cache/torch",
-            "TRANSFORMERS_CACHE": "/persistent_cache/transformers",
-            "CUDA_CACHE_PATH": "/persistent_cache/cuda_cache",
-            "VLLM_CACHE": "/persistent_cache/vllm_cache",
-            "TRITON_CACHE_DIR": "/persistent_cache/triton",
-            "VLLM_SERVER_DEV_MODE": "1",
-            # Modal containers do not provide a Docker daemon. Run MOSS directly
-            # through Transformers.
-            "MOSS_TRANSCRIBE_MANAGE_BACKEND": "0",
-            "MOSS_TRANSCRIBE_BACKEND": "http",
-            "MOSS_TRANSCRIBE_DEVICE": "cuda:0",
-            "MOSS_TRANSCRIBE_MODEL": "/persistent_app/checkpoints/MOSS-Transcribe-Diarize",
-            "MOSS_TRANSCRIBE_SGLANG_URL": "http://127.0.0.1:8003",
-            "HY_MT_TRANSLATION_LOCAL_DIR": "/persistent_app/checkpoints/hy-mt",
-            "TORCHINDUCTOR_COMPILE_THREADS": "1",
-            "TORCH_NCCL_ENABLE_MONITORING": "0",
-            "TORCH_CPP_LOG_LEVEL": "ERROR"
         })
         .run_commands("pip install --upgrade pip setuptools wheel")
         .run_commands(
@@ -250,15 +226,6 @@ if modal.is_local():
             "assert torch.version.cuda, 'Qwen ASR requires CUDA Torch'; "
             "print('Qwen3-ASR environment ready')\"",
         )
-        .env({
-            # Disable before runtime imports: ORT's Microsoft cache tree on the
-            # shared Volume was implicated in a 9p snapshot restore failure.
-            "ORT_DISABLE_TELEMETRY": "1",
-            "CLEARVOICE_PYTHON": CLEARVOICE_PYTHON,
-            "QWEN_OMNIVAD_PYTHON": QWEN_ASR_PYTHON,
-            "QWEN_OMNIVAD_MODEL_DIR": "/persistent_app/checkpoints/qwen_omnivad",
-            "QWEN_OMNIVAD_CACHE_DIR": "/persistent_cache/qwen_omnivad",
-        })
         # copy=True makes source changes part of the image/snapshot identity. Use
         # these exact local sources at startup, not the code in the model Volume.
         .add_local_dir(str(DEPLOY_SOURCE_ROOT), RUNTIME_SOURCE_DIR,
@@ -269,6 +236,41 @@ if modal.is_local():
             "import DiffLlama; print('IndexTTS Transformers compatibility check passed')\""
         )
     )
+
+    # Runtime settings come after every build step so changes reuse dependency layers.
+    image = image.env({
+        # vLLM sleep mode uses its CUDA memory pool; PyTorch expandable
+        # segments are incompatible with that allocator.
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
+
+        # Cache directories for faster subsequent runs
+        "HF_HOME": "/persistent_cache/huggingface",
+        "HUGGINGFACE_HUB_CACHE": "/persistent_cache/huggingface/hub",
+        "TORCH_HOME": "/persistent_cache/torch",
+        "TRANSFORMERS_CACHE": "/persistent_cache/transformers",
+        "CUDA_CACHE_PATH": "/persistent_cache/cuda_cache",
+        "VLLM_CACHE": "/persistent_cache/vllm_cache",
+        "TRITON_CACHE_DIR": "/persistent_cache/triton",
+        "VLLM_SERVER_DEV_MODE": "1",
+        # Modal containers do not provide a Docker daemon. Run MOSS directly
+        # through Transformers.
+        "MOSS_TRANSCRIBE_MANAGE_BACKEND": "0",
+        "MOSS_TRANSCRIBE_BACKEND": "http",
+        "MOSS_TRANSCRIBE_DEVICE": "cuda:0",
+        "MOSS_TRANSCRIBE_MODEL": "/persistent_app/checkpoints/MOSS-Transcribe-Diarize",
+        "MOSS_TRANSCRIBE_SGLANG_URL": "http://127.0.0.1:8003",
+        "HY_MT_TRANSLATION_LOCAL_DIR": "/persistent_app/checkpoints/hy-mt",
+        "TORCHINDUCTOR_COMPILE_THREADS": "1",
+        "TORCH_NCCL_ENABLE_MONITORING": "0",
+        "TORCH_CPP_LOG_LEVEL": "ERROR",
+        # Disable ONNX Runtime telemetry before application imports.
+        "ORT_DISABLE_TELEMETRY": "1",
+        "CLEARVOICE_PYTHON": CLEARVOICE_PYTHON,
+        "QWEN_OMNIVAD_PYTHON": QWEN_ASR_PYTHON,
+        "QWEN_OMNIVAD_MODEL_DIR": "/persistent_app/checkpoints/qwen_omnivad",
+        "QWEN_OMNIVAD_CACHE_DIR": "/persistent_cache/qwen_omnivad",
+        "INDEXTTS_SETUP_SNAPSHOT_REVISION": SNAPSHOT_REVISION,
+    })
 
 app = modal.App("audio-studio", image=image)
 
@@ -392,797 +394,38 @@ def _ensure_confucius_vllm_patch_compatibility(confucius_repo_path: Path) -> Dic
     return status
 
 @app.function(
-    image=image,
-    timeout=3600,
-    volumes={
-        PERSISTENT_APP_DIR: app_storage,
-        PERSISTENT_CACHE_DIR: cache_storage
-    },
-    cpu=4.0,
-    memory=32768,
+    image=image, timeout=86400, cpu=4.0, memory=32768, max_containers=1,
+    volumes={PERSISTENT_APP_DIR: app_storage, PERSISTENT_CACHE_DIR: cache_storage},
     secrets=[modal.Secret.from_name("custom-secret")],
 )
+@modal.concurrent(max_inputs=20)
+@modal.asgi_app()
 def prepare_model():
-    """
-    CPU function to:
-    1. Copy IndexTTS, Confucius4-TTS, and IndexTTS 2.5 Omni code into persistent storage
-    2. Update the primary applications from their integration remotes
-    3. Download IndexTTS 2.0/2.5, Qwen3 Voice Design, Stable Audio 3, and
-       Confucius4-TTS assets into persistent storage/cache
-    4. Convert the Confucius T2S checkpoint into a vLLM-loadable directory
-    
-    This is a one-time setup that creates a fully self-contained persistent app.
-    """
-    import subprocess
-    import shutil
-    from pathlib import Path
-    
-    print("🚀 Preparing IndexTTS v2 application and model...")
-    
-    # Step 1: Copy the entire application to persistent storage
-    persistent_app_path = Path(PERSISTENT_APP_DIR)
-    source_app_path = Path("/app/index-tts-vllm")
-    confucius_source_path = Path(CONFUCIUS_IMAGE_DIR)
-    confucius_persistent_path = persistent_app_path / CONFUCIUS_APP_SUBDIR
-    indextts25_source_path = Path(INDEXTTS25_IMAGE_DIR)
-    indextts25_persistent_path = persistent_app_path / INDEXTTS25_APP_SUBDIR
-    
-    if not persistent_app_path.exists() or len(list(persistent_app_path.iterdir())) == 0:
-        print("📂 Copying application to persistent storage...")
-        persistent_app_path.mkdir(exist_ok=True)
-        
-        # Copy all files from source to persistent storage
-        for item in source_app_path.iterdir():
-            dest_item = persistent_app_path / item.name
-            if item.is_dir():
-                if dest_item.exists():
-                    shutil.rmtree(dest_item)
-                shutil.copytree(item, dest_item)
-                print(f"   📁 Copied directory: {item.name}")
-            else:
-                shutil.copy2(item, dest_item)
-                print(f"   📄 Copied file: {item.name}")
-        
-        print("✅ Application copied to persistent storage successfully!")
-    else:
-        print("✅ Application already exists in persistent storage")
-    
-    if not confucius_persistent_path.exists() or len(list(confucius_persistent_path.iterdir())) == 0:
-        print(f"Copying Confucius4-TTS app to persistent storage: {confucius_persistent_path}")
-        confucius_persistent_path.mkdir(parents=True, exist_ok=True)
-        for item in confucius_source_path.iterdir():
-            dest_item = confucius_persistent_path / item.name
-            if item.is_dir():
-                if dest_item.exists():
-                    shutil.rmtree(dest_item)
-                shutil.copytree(item, dest_item)
-                print(f"   Copied Confucius directory: {item.name}")
-            else:
-                shutil.copy2(item, dest_item)
-                print(f"   Copied Confucius file: {item.name}")
-    else:
-        print(f"Confucius4-TTS already exists in persistent storage: {confucius_persistent_path}")
+    """Web UI around the existing CPU model preparation flow."""
+    import sys
+    sys.path.insert(0, RUNTIME_SOURCE_DIR)
+    from indextts_web.infrastructure.model_manager import create_manager_app
+    from indextts_web.infrastructure.model_setup import ModelSetup
 
-    print(f"Synchronizing IndexTTS 2.5 vLLM-Omni code: {indextts25_persistent_path}")
+    def get_state():
+        app_storage.reload()
+        cache_storage.reload()
+        return ModelSetup(Path(PERSISTENT_APP_DIR), Path(RUNTIME_SOURCE_DIR)).status()
 
-    def ignore_indextts25_runtime_artifacts(directory: str, names: List[str]) -> set[str]:
-        """Exclude generated data without dropping nested source packages named models."""
-        ignored = {"__pycache__"}.intersection(names)
-        if Path(directory).resolve() == indextts25_source_path.resolve():
-            ignored.update(
-                name
-                for name in (".venv-indextts25", "models", "runtime")
-                if name in names
-            )
-        return ignored
-
-    shutil.copytree(
-        indextts25_source_path,
-        indextts25_persistent_path,
-        dirs_exist_ok=True,
-        ignore=ignore_indextts25_runtime_artifacts,
-    )
-
-    # Step 2: Update the application with latest code from git (force override local changes)
-    print("\n📥 Step 2: Updating application from git repository (force override)...")
-    repo_update_status = {
-        "success": False,
-        "message": "",
-        "output": ""
-    }
-    try:
-        # Change to persistent app directory
-        os.chdir(str(persistent_app_path))
-        subprocess.run(
-            ["git", "remote", "set-url", "origin", INDEXTTS_REPO_URL],
-            capture_output=True,
-            text=True,
-            cwd=str(persistent_app_path),
-        )
-        print(f"   📁 Changed to directory: {persistent_app_path}")
-        
-        # Step 2a: Fetch latest from all remotes
-        print("   📥 Fetching latest from all remotes...")
-        fetch_result = subprocess.run(
-            ["git", "fetch", "--all"],
-            capture_output=True,
-            text=True,
-            cwd=str(persistent_app_path)
-        )
-        
-        if fetch_result.returncode != 0:
-            print(f"⚠️ Git fetch failed: {fetch_result.stderr.strip()}")
-            repo_update_status["message"] = f"Git fetch failed: {fetch_result.stderr.strip()}"
-            repo_update_status["output"] = fetch_result.stderr.strip()
-        else:
-            print("   ✅ Fetch completed")
-            
-            # Step 2b: Get the default branch name
-            branch_result = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                capture_output=True,
-                text=True,
-                cwd=str(persistent_app_path)
-            )
-            current_branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "main"
-            print(f"   📌 Current branch: {current_branch}")
-            
-            # Step 2c: Hard reset to origin/branch (force override local changes)
-            print(f"   🔄 Resetting to origin/{current_branch} (force override local changes)...")
-            reset_result = subprocess.run(
-                ["git", "reset", "--hard", f"origin/{current_branch}"],
-                capture_output=True,
-                text=True,
-                cwd=str(persistent_app_path)
-            )
-            
-            if reset_result.returncode == 0:
-                print("✅ Git reset successful!")
-                repo_update_status["success"] = True
-                repo_update_status["message"] = f"Repository updated to origin/{current_branch}"
-                repo_update_status["output"] = reset_result.stdout.strip()
-                if reset_result.stdout.strip():
-                    print(f"   📋 Output: {reset_result.stdout.strip()}")
-            else:
-                print(f"⚠️ Git reset failed with exit code: {reset_result.returncode}")
-                repo_update_status["message"] = f"Git reset failed with exit code {reset_result.returncode}"
-                repo_update_status["output"] = reset_result.stderr.strip() or reset_result.stdout.strip()
-                if reset_result.stderr.strip():
-                    print(f"   ⚠️ Stderr: {reset_result.stderr.strip()}")
-    except Exception as e:
-        print(f"⚠️ Git update failed (non-fatal): {str(e)}")
-        print("   Continuing with existing code...")
-        repo_update_status["message"] = f"Git update exception: {str(e)}"
-    
-    confucius_repo_update_status = {
-        "success": False,
-        "message": "",
-        "output": "",
-        "repo": str(confucius_persistent_path),
-        "remote": CONFUCIUS_REPO_URL,
-    }
-    try:
-        if not (confucius_persistent_path / ".git").exists():
-            confucius_repo_update_status["message"] = (
-                f"Skipped git update because {confucius_persistent_path} has no .git directory"
-            )
-        else:
-            subprocess.run(
-                ["git", "remote", "set-url", "origin", CONFUCIUS_REPO_URL],
-                capture_output=True,
-                text=True,
-                cwd=str(confucius_persistent_path),
-            )
-            fetch_result = subprocess.run(
-                ["git", "fetch", "origin"],
-                capture_output=True,
-                text=True,
-                cwd=str(confucius_persistent_path),
-            )
-            if fetch_result.returncode != 0:
-                confucius_repo_update_status["message"] = (
-                    f"Confucius git fetch failed: {fetch_result.stderr.strip()}"
-                )
-                confucius_repo_update_status["output"] = fetch_result.stderr.strip()
-            else:
-                branch_result = subprocess.run(
-                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                    capture_output=True,
-                    text=True,
-                    cwd=str(confucius_persistent_path),
-                )
-                current_branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "main"
-                if not current_branch or current_branch == "HEAD":
-                    current_branch = "main"
-                origin_ref = f"origin/{current_branch}"
-                reset_result = subprocess.run(
-                    ["git", "reset", "--hard", origin_ref],
-                    capture_output=True,
-                    text=True,
-                    cwd=str(confucius_persistent_path),
-                )
-                if reset_result.returncode == 0:
-                    confucius_repo_update_status["success"] = True
-                    confucius_repo_update_status["message"] = f"Confucius repository updated to {origin_ref}"
-                    confucius_repo_update_status["output"] = reset_result.stdout.strip()
-                else:
-                    confucius_repo_update_status["message"] = (
-                        f"Confucius git reset failed: {reset_result.stderr.strip()}"
-                    )
-                    confucius_repo_update_status["output"] = (
-                        reset_result.stderr.strip() or reset_result.stdout.strip()
-                    )
-    except Exception as exc:
-        confucius_repo_update_status["message"] = f"Confucius git update exception: {exc}"
-    print(confucius_repo_update_status["message"])
-
-    try:
-        confucius_vllm_patch_status = _ensure_confucius_vllm_patch_compatibility(
-            confucius_persistent_path
-        )
-    except Exception as exc:
-        confucius_vllm_patch_status = {
-            "success": False,
-            "changed": False,
-            "path": str(
-                confucius_persistent_path
-                / "confuciustts"
-                / "llm"
-                / "vllm_patch.py"
-            ),
-            "message": f"Confucius vLLM patch compatibility update failed: {exc}",
-        }
-    print(confucius_vllm_patch_status["message"])
-
-    # Step 3: Download model repo directly into persistent checkpoints folder
-    checkpoints_dir = persistent_app_path / "checkpoints"
-    checkpoints_dir.mkdir(exist_ok=True)
-    
-    print(f"📦 Downloading IndexTTS v2 model to: {checkpoints_dir}")
-    
-    try:
-        # Use huggingface-hub to download the model directly into checkpoints
-        result = subprocess.run([
-            "python", "-c", 
-            f"""
-from huggingface_hub import hf_hub_download, snapshot_download
-import os
-
-print("Downloading main IndexTTS v2 model repo...")
-snapshot_download(
-    repo_id="garyswansrs/index_tts_2_vllm",
-    local_dir="{checkpoints_dir}",
-    local_dir_use_symlinks=False
-)
-print("Main model download completed!")
-
-indextts25_target = {INDEXTTS25_PERSISTENT_MODEL_DIR!r}
-print("Downloading IndexTTS 2.5 vLLM-Omni model bundle...")
-snapshot_download(
-    repo_id={INDEXTTS25_MODEL_REPO_ID!r},
-    local_dir=indextts25_target,
-    local_dir_use_symlinks=False,
-)
-snapshot_download(
-    repo_id={INDEXTTS25_W2V_REPO_ID!r},
-    local_dir=os.path.join(indextts25_target, "w2v-bert-2.0"),
-    allow_patterns=["config.json", "model.safetensors", "preprocessor_config.json"],
-    local_dir_use_symlinks=False,
-)
-hf_hub_download(
-    repo_id={INDEXTTS25_CAMPPLUS_REPO_ID!r},
-    filename="campplus_cn_common.bin",
-    local_dir=indextts25_target,
-    local_dir_use_symlinks=False,
-)
-snapshot_download(
-    repo_id={INDEXTTS25_BIGVGAN_REPO_ID!r},
-    local_dir=os.path.join(indextts25_target, "bigvgan"),
-    allow_patterns=["config.json", "bigvgan_generator.pt"],
-    local_dir_use_symlinks=False,
-)
-print("IndexTTS 2.5 model and external runtime assets are ready.")
-
-stable_audio_repos = {STABLE_AUDIO3_REPOS!r}
-stable_audio_root = os.path.join({str(checkpoints_dir)!r}, "stable-audio-3")
-for variant, repo_id in stable_audio_repos.items():
-    target_dir = os.path.join(stable_audio_root, variant)
-    try:
-        print(f"Downloading Stable Audio 3 {{variant}} from {{repo_id}}...")
-        snapshot_download(
-            repo_id=repo_id,
-            local_dir=target_dir,
-            local_dir_use_symlinks=False,
-        )
-    except Exception as exc:
-        # Stable Audio repositories are gated. Keep the core TTS deployment
-        # usable and report the missing optional variant in readiness output.
-        print(f"Warning: Stable Audio 3 {{variant}} was not downloaded: {{exc}}")
-
-moss_target = {MOSS_TRANSCRIBE_PERSISTENT_DIR!r}
-print("Downloading MOSS-Transcribe-Diarize to persistent storage...")
-snapshot_download(
-    repo_id={MOSS_TRANSCRIBE_REPO_ID!r},
-    local_dir=moss_target,
-    local_dir_use_symlinks=False,
-)
-print("MOSS-Transcribe-Diarize download completed: " + moss_target)
-
-hy_mt_target = {HY_MT_TRANSLATION_PERSISTENT_DIR!r}
-print("Downloading HY-MT translation model to persistent storage...")
-snapshot_download(
-    repo_id={HY_MT_TRANSLATION_REPO_ID!r},
-    local_dir=hy_mt_target,
-    local_dir_use_symlinks=False,
-)
-print("HY-MT translation model download completed: " + hy_mt_target)
-"""
-        ], check=True, capture_output=True, text=True, cwd=str(persistent_app_path))
-        
-        print("✅ Main model repo download completed successfully!")
-        
-        # Step 3b: Voice Design comes from the main repo; gated Stable Audio
-        # variants are downloaded into their current codebase-defined paths.
-        voice_design_dir = checkpoints_dir / "Qwen3-TTS-12Hz-1.7B-VoiceDesign"
-        stable_audio_root = checkpoints_dir / "stable-audio-3"
-        stable_audio_dirs = {
-            key: stable_audio_root / key
-            for key in STABLE_AUDIO3_VARIANTS
-        }
-        moss_transcribe_dir = Path(MOSS_TRANSCRIBE_PERSISTENT_DIR)
-        moss_transcribe_ready = (
-            (moss_transcribe_dir / "config.json").exists()
-            and any(moss_transcribe_dir.rglob("*.safetensors"))
-        )
-        hy_mt_dir = Path(HY_MT_TRANSLATION_PERSISTENT_DIR)
-        hy_mt_ready = (
-            (hy_mt_dir / "config.json").exists()
-            and any(hy_mt_dir.rglob("*.safetensors"))
-        )
-        indextts25_model_dir = Path(INDEXTTS25_PERSISTENT_MODEL_DIR)
-        indextts25_required_files = (
-            "config.yaml",
-            "gpt.pth",
-            "codec.pth",
-            "s2mel.pth",
-            "wav2vec2bert_stats.pt",
-            "multilingual_zh_ja_yue_char_del.tiktoken",
-            "qwen0.6bemo4-merge/config.json",
-            "qwen0.6bemo4-merge/model.safetensors",
-            "w2v-bert-2.0/config.json",
-            "w2v-bert-2.0/model.safetensors",
-            "w2v-bert-2.0/preprocessor_config.json",
-            "campplus_cn_common.bin",
-            "bigvgan/config.json",
-            "bigvgan/bigvgan_generator.pt",
-        )
-        indextts25_ready = all(
-            (indextts25_model_dir / relative_path).is_file()
-            for relative_path in indextts25_required_files
-        )
-        
-        # Step 4: List downloaded files for verification
-        print("🔍 Listing downloaded model files...")
-        for file_path in checkpoints_dir.rglob("*"):
-            if file_path.is_file():
-                file_size = file_path.stat().st_size / (1024 * 1024)  # Size in MB
-                relative_path = file_path.relative_to(checkpoints_dir)
-                print(f"   📄 {relative_path} ({file_size:.1f} MB)")
-        
-        # Check for vLLM directory (should exist in pre-converted model)
-        vllm_dir = checkpoints_dir / "gpt"
-        if vllm_dir.exists():
-            print(f"   ✅ vLLM model directory: {vllm_dir}")
-            vllm_files = list(vllm_dir.iterdir())
-            print(f"   📁 vLLM files: {[f.name for f in vllm_files]}")
-        else:
-            print(f"   ⚠️ vLLM directory not found: {vllm_dir}")
-        
-        print("   Stable Audio 3 checkpoint directories:")
-        for key, path in stable_audio_dirs.items():
-            config_path = path / "model_config.json"
-            ckpt_ready = (path / "model.safetensors").exists() or (path / "model.ckpt").exists()
-            status = "ready" if config_path.exists() and ckpt_ready else "missing"
-            print(f"      {key}: {path} ({status})")
-        print(
-            f"   MOSS-Transcribe-Diarize: {moss_transcribe_dir} "
-            f"({'ready' if moss_transcribe_ready else 'missing'})"
-        )
-        print(
-            f"   HY-MT translation model: {hy_mt_dir} "
-            f"({'ready' if hy_mt_ready else 'missing'})"
-        )
-
-        confucius_checkpoints_dir = confucius_persistent_path / "checkpoints"
-        confucius_pretrained_dir = confucius_persistent_path / "pretrained"
-        confucius_outputs_dir = confucius_persistent_path / "outputs" / "api"
-        confucius_checkpoints_dir.mkdir(parents=True, exist_ok=True)
-        confucius_pretrained_dir.mkdir(parents=True, exist_ok=True)
-        confucius_outputs_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"Downloading Confucius4-TTS assets to: {confucius_persistent_path}")
-        confucius_download_code = f"""
-from pathlib import Path
-from huggingface_hub import hf_hub_download, snapshot_download
-
-checkpoints = Path({str(confucius_checkpoints_dir)!r})
-pretrained = Path({str(confucius_pretrained_dir)!r})
-checkpoints.mkdir(parents=True, exist_ok=True)
-pretrained.mkdir(parents=True, exist_ok=True)
-
-model_files = [
-    "t2s_model.safetensors",
-    "s2a_model.pt",
-    "wav2vec2bert_stats.pt",
-    "special_tokens_map.json",
-    "tokenizer.json",
-    "tokenizer.model",
-    "tokenizer_config.json",
-]
-for filename in model_files:
-    print("Downloading Confucius model file: " + filename)
-    hf_hub_download(
-        repo_id={CONFUCIUS_MODEL_REPO_ID!r},
-        filename=filename,
-        local_dir=str(checkpoints),
-        local_dir_use_symlinks=False,
-    )
-
-print("Downloading Wav2Vec2-BERT speaker/semantic model...")
-snapshot_download(
-    repo_id={CONFUCIUS_W2V_REPO_ID!r},
-    local_dir=str(pretrained / "w2v-bert-2.0"),
-    local_dir_use_symlinks=False,
-)
-
-print("Downloading BigVGAN vocoder...")
-snapshot_download(
-    repo_id={CONFUCIUS_BIGVGAN_REPO_ID!r},
-    local_dir=str(pretrained / "bigvgan_v2_22khz_80band_256x"),
-    local_dir_use_symlinks=False,
-)
-
-print("Downloading CAMPPlus speaker encoder...")
-hf_hub_download(
-    repo_id={CONFUCIUS_CAMPPLUS_REPO_ID!r},
-    filename={CONFUCIUS_CAMPPLUS_FILENAME!r},
-    local_dir=str(pretrained / "campplus"),
-    local_dir_use_symlinks=False,
-)
-print("Confucius asset download completed.")
-"""
-        confucius_download_result = subprocess.run(
-            ["python", "-c", confucius_download_code],
-            check=True,
-            capture_output=True,
-            text=True,
-            cwd=str(confucius_persistent_path),
-        )
-        if confucius_download_result.stdout.strip():
-            print(confucius_download_result.stdout.strip())
-        if confucius_download_result.stderr.strip():
-            print(confucius_download_result.stderr.strip())
-
-        confucius_base_config = confucius_persistent_path / "config" / "inference_config.yaml"
-        confucius_modal_config = confucius_persistent_path / CONFUCIUS_FASTAPI_CONFIG
-        config_text = confucius_base_config.read_text(encoding="utf-8")
-        config_text = config_text.replace(
-            "  w2v_bert_path: facebook/w2v-bert-2.0",
-            "  w2v_bert_path: ./pretrained/w2v-bert-2.0",
-        )
-        config_text = config_text.replace(
-            "  vocoder_path: nvidia/bigvgan_v2_22khz_80band_256x",
-            "  vocoder_path: ./pretrained/bigvgan_v2_22khz_80band_256x",
-        )
-        confucius_modal_config.write_text(config_text, encoding="utf-8")
-        print(f"Wrote Confucius Modal config: {confucius_modal_config}")
-
-        confucius_vllm_dir = confucius_checkpoints_dir / "t2s-vllm"
-        confucius_vllm_ready = (
-            (confucius_vllm_dir / "model.safetensors").exists()
-            and (confucius_vllm_dir / "config.json").exists()
-        )
-        if confucius_vllm_ready:
-            print(f"Confucius vLLM directory already ready: {confucius_vllm_dir}")
-        else:
-            confucius_python = Path(CONFUCIUS_PYTHON)
-            if not confucius_python.exists():
-                raise FileNotFoundError(f"Confucius image venv Python not found: {confucius_python}")
-
-            convert_cmd = [
-                str(confucius_python),
-                "tools/convert_t2s_vllm.py",
-                "--config",
-                str(confucius_modal_config),
-                "--output",
-                str(confucius_vllm_dir),
-            ]
-            local_t2s_checkpoint = confucius_checkpoints_dir / "t2s_model.safetensors"
-            if local_t2s_checkpoint.exists():
-                convert_cmd.extend(["--checkpoint", str(local_t2s_checkpoint)])
-
-            convert_env = dict(os.environ)
-            convert_env["PYTHONPATH"] = str(confucius_persistent_path)
-            convert_env.setdefault("HF_HOME", f"{PERSISTENT_CACHE_DIR}/huggingface")
-            convert_env.setdefault("TORCH_HOME", f"{PERSISTENT_CACHE_DIR}/torch")
-            print(f"Converting Confucius T2S model for vLLM: {' '.join(convert_cmd)}")
-            convert_result = subprocess.run(
-                convert_cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-                cwd=str(confucius_persistent_path),
-                env=convert_env,
-            )
-            if convert_result.stdout.strip():
-                print(convert_result.stdout.strip())
-            if convert_result.stderr.strip():
-                print(convert_result.stderr.strip())
-
-        confucius_vllm_ready = (
-            (confucius_vllm_dir / "model.safetensors").exists()
-            and (confucius_vllm_dir / "config.json").exists()
-        )
-        confucius_ready = (
-            (confucius_persistent_path / "fastapi_app.py").exists()
-            and confucius_modal_config.exists()
-            and confucius_vllm_ready
-            and (confucius_persistent_path / "resources" / "voice.mp3").exists()
-        )
-        print(f"Confucius4-TTS readiness: {confucius_ready}")
-        print(f"  repo: {confucius_persistent_path}")
-        print(f"  config: {confucius_modal_config}")
-        print(f"  checkpoints: {confucius_checkpoints_dir}")
-        print(f"  pretrained: {confucius_pretrained_dir}")
-        print(f"  vLLM: {confucius_vllm_dir} ({'ready' if confucius_vllm_ready else 'missing'})")
-
-        # Step 5: List complete application structure for verification
-        print("\n📋 Persistent application structure:")
-        def show_tree(path, prefix="", max_depth=3, current_depth=0):
-            if current_depth >= max_depth:
-                return
-            items = sorted(list(path.iterdir()))
-            for i, item in enumerate(items):
-                is_last = i == len(items) - 1
-                current_prefix = "└── " if is_last else "├── "
-                print(f"{prefix}{current_prefix}{item.name}")
-                if item.is_dir() and current_depth < max_depth - 1:
-                    extension = "    " if is_last else "│   "
-                    show_tree(item, prefix + extension, max_depth, current_depth + 1)
-        
-        show_tree(persistent_app_path)
-        
-        print("\n✅ IndexTTS v2 application and models preparation completed!")
-        print(f"📁 Persistent app location: {persistent_app_path}")
-        print(f"📁 IndexTTS model location: {checkpoints_dir}")
-        print(f"📁 Voice Design model location: {voice_design_dir}")
-        print("🚀 Ready for inference deployment!")
-        
-        return {
-            "status": "success",
-            "message": (
-                "IndexTTS v2 application and core models prepared; "
-                "see stable_audio3_ready for gated optional models"
-            ),
-            "app_dir": str(persistent_app_path),
-            "model_dir": str(checkpoints_dir),
-            "voice_design_dir": str(voice_design_dir),
-            "moss_transcribe_dir": str(moss_transcribe_dir),
-            "moss_transcribe_ready": moss_transcribe_ready,
-            "hy_mt_dir": str(hy_mt_dir),
-            "hy_mt_ready": hy_mt_ready,
-            "stable_audio3_root": str(stable_audio_root),
-            "stable_audio3_dirs": {key: str(path) for key, path in stable_audio_dirs.items()},
-            "vllm_ready": vllm_dir.exists(),
-            "voice_design_ready": voice_design_dir.exists(),
-            "stable_audio3_ready": {
-                key: (path / "model_config.json").exists()
-                and ((path / "model.safetensors").exists() or (path / "model.ckpt").exists())
-                for key, path in stable_audio_dirs.items()
-            },
-            "repo_update": repo_update_status,
-            "confucius_repo_update": confucius_repo_update_status,
-            "confucius_vllm_patch": confucius_vllm_patch_status,
-            "confucius": {
-                "repo_dir": str(confucius_persistent_path),
-                "config": str(confucius_modal_config),
-                "checkpoints_dir": str(confucius_checkpoints_dir),
-                "pretrained_dir": str(confucius_pretrained_dir),
-                "outputs_dir": str(confucius_outputs_dir),
-                "vllm_dir": str(confucius_vllm_dir),
-                "ready": confucius_ready,
-                "vllm_ready": confucius_vllm_ready,
-            },
-            "index25": {
-                "repo_dir": str(indextts25_persistent_path),
-                "model_dir": str(indextts25_model_dir),
-                "data_dir": INDEXTTS25_PERSISTENT_DATA_DIR,
-                "ready": indextts25_ready,
-            },
-        }
-        
-    except subprocess.CalledProcessError as e:
-        error_msg = f"Failed to download model: {e.stderr}"
-        print(f"❌ {error_msg}")
-        return {
-            "status": "error", 
-            "message": error_msg,
-            "stdout": e.stdout,
-            "stderr": e.stderr,
-            "repo_update": repo_update_status,
-            "confucius_repo_update": confucius_repo_update_status,
-            "confucius_vllm_patch": locals().get("confucius_vllm_patch_status"),
-        }
-    except Exception as e:
-        error_msg = f"Model preparation failed: {str(e)}"
-        print(f"❌ {error_msg}")
-        return {
-            "status": "error",
-            "message": error_msg,
-            "repo_update": repo_update_status,
-            "confucius_repo_update": confucius_repo_update_status,
-            "confucius_vllm_patch": locals().get("confucius_vllm_patch_status"),
-        }
-
-
-
-@app.function(
-    image=image,
-    timeout=180,
-    volumes={
-        PERSISTENT_APP_DIR: app_storage,
-        PERSISTENT_CACHE_DIR: cache_storage
-    }
-)
-def clear_cache():
-    """
-    Function to clear persistent caches while preserving the app and models.
-    
-    Usage:
-        modal run deploy_vllm_indextts_v2.py::clear_cache
-    """
-    import os
-    import shutil
-    import glob
-    from pathlib import Path
-    
-    print("🧹 Starting cache clearing process for IndexTTS v2...")
-    print("⚠️  This will clear caches but preserve the app and models.")
-    
-    # Clear general persistent caches
-    cache_dirs_to_clear = [
-        "/persistent_cache/huggingface",
-        "/persistent_cache/torch", 
-        "/persistent_cache/transformers",
-        "/persistent_cache/cuda_cache",
-        "/persistent_cache/vllm_cache",
-        "/persistent_cache/torch_compile_cache",  # torch.compile artifacts
-        "/persistent_cache/confucius",
-        INDEXTTS25_PERSISTENT_DATA_DIR,
-        "/persistent_cache/triton",
-    ]
-    
-    # Clear app-specific caches (but keep the app and models)
-    persistent_app_path = Path(PERSISTENT_APP_DIR)
-    app_cache_dirs_to_clear = []
-    if persistent_app_path.exists():
-        app_cache_dirs_to_clear = [
-            persistent_app_path / "speaker_presets",
-            persistent_app_path / "emotion_cache",
-            persistent_app_path / "emb_cache",
-            persistent_app_path / "outputs",
-            persistent_app_path / CONFUCIUS_APP_SUBDIR / "outputs",
-        ]
-    
-    # Calculate total cache size before clearing
-    total_size_before = 0
-    all_dirs = cache_dirs_to_clear + [str(d) for d in app_cache_dirs_to_clear]
-    
-    for cache_dir in all_dirs:
-        if os.path.exists(cache_dir):
-            try:
-                for dirpath, dirnames, filenames in os.walk(cache_dir):
-                    for filename in filenames:
-                        filepath = os.path.join(dirpath, filename)
-                        total_size_before += os.path.getsize(filepath)
-            except Exception as e:
-                print(f"⚠️ Could not calculate size for {cache_dir}: {e}")
-    
-    print(f"💾 Total cache size before clearing: {total_size_before / (1024 * 1024):.2f} MB")
-    
-    # Clear cache directories
-    cleared_dirs = []
-    failed_dirs = []
-    
-    # Clear general caches
-    for cache_dir in cache_dirs_to_clear:
+    def execute_operation(action, target, emit):
+        app_storage.reload()
+        cache_storage.reload()
+        setup = ModelSetup(Path(PERSISTENT_APP_DIR), Path(RUNTIME_SOURCE_DIR),
+                           emit=emit, patch_confucius=_ensure_confucius_vllm_patch_compatibility)
         try:
-            if os.path.exists(cache_dir):
-                print(f"🗑️ Clearing cache directory: {cache_dir}")
-                shutil.rmtree(cache_dir)
-                # Recreate empty directory
-                os.makedirs(cache_dir, exist_ok=True)
-                cleared_dirs.append(cache_dir)
-                print(f"✅ Cleared: {cache_dir}")
-            else:
-                print(f"⏭️ Skipped (doesn't exist): {cache_dir}")
-        except Exception as e:
-            failed_dirs.append({"dir": cache_dir, "error": str(e)})
-            print(f"❌ Failed to clear {cache_dir}: {e}")
-    
-    # Clear app-specific caches
-    for cache_dir in app_cache_dirs_to_clear:
-        try:
-            if cache_dir.exists():
-                print(f"🗑️ Clearing app cache directory: {cache_dir}")
-                shutil.rmtree(str(cache_dir))
-                # Recreate empty directory
-                cache_dir.mkdir(exist_ok=True)
-                cleared_dirs.append(str(cache_dir))
-                print(f"✅ Cleared: {cache_dir}")
-            else:
-                print(f"⏭️ Skipped (doesn't exist): {cache_dir}")
-        except Exception as e:
-            failed_dirs.append({"dir": str(cache_dir), "error": str(e)})
-            print(f"❌ Failed to clear {cache_dir}: {e}")
-    
-    # Also clear any CUDA/vLLM compilation caches
-    additional_cache_patterns = [
-        "/tmp/nvcc_*",  # CUDA compilation temps
-        "/tmp/tmpxft_*",  # More CUDA temps
-        "/tmp/cuda_*",  # CUDA runtime temps
-        "/tmp/vllm_*",  # vLLM temps
-    ]
-    
-    for pattern in additional_cache_patterns:
-        try:
-            for path in glob.glob(pattern):
-                if os.path.exists(path):
-                    if os.path.isfile(path):
-                        os.unlink(path)
-                    else:
-                        shutil.rmtree(path)
-                    cleared_dirs.append(path)
-                    print(f"✅ Cleared: {path}")
-        except Exception as e:
-            failed_dirs.append({"pattern": pattern, "error": str(e)})
-            print(f"❌ Failed to clear pattern {pattern}: {e}")
-    
-    # Summary
-    print("\n🧹 Cache clearing completed!")
-    print(f"✅ Successfully cleared: {len(cleared_dirs)} directories/files")
-    print(f"❌ Failed to clear: {len(failed_dirs)} directories/files")
-    print(f"💾 Total space freed: {total_size_before / (1024 * 1024):.2f} MB")
-    
-    if failed_dirs:
-        print("\n⚠️ Failed operations:")
-        for failed in failed_dirs:
-            print(f"  - {failed}")
-    
-    print("\n📋 What was preserved:")
-    print("  ✅ Application code and files")
-    print("  ✅ Model weights and checkpoints")
-    print("  ✅ Application directory structure")
-    
-    print("\n📋 What was cleared:")
-    print("  🗑️ Speaker preset caches")
-    print("  🗑️ Emotion analysis caches")
-    print("  🗑️ Embedding caches")
-    print("  🗑️ PyTorch/HuggingFace caches")
-    print("  🗑️ CUDA compilation caches")
-    print("  🗑️ Output files")
-    
-    print("\n📋 Next steps:")
-    print("  1. Caches will rebuild automatically on next use")
-    print("  2. No need to re-download models or re-copy application")
-    print("  3. Redeploy with: modal deploy deploy_vllm_indextts_v2.py")
-    
-    return {
-        "status": "completed",
-        "cleared_count": len(cleared_dirs),
-        "failed_count": len(failed_dirs),
-        "space_freed_mb": total_size_before / (1024 * 1024)
-    }
+            setup.execute(action, target)
+        finally:
+            # Keep partial downloads for resume, including after a failure.
+            cache_storage.commit()
+            app_storage.commit()
+
+    return create_manager_app(get_state=get_state, execute_operation=execute_operation)
+
 
 def legacy_serve_without_snapshot():
     """
@@ -1231,8 +474,8 @@ def legacy_serve_without_snapshot():
         "/persistent_cache/vllm_cache",
         "/persistent_cache/torch_compile_cache",
         "/persistent_cache/confucius",
-        INDEXTTS25_PERSISTENT_DATA_DIR,
         "/persistent_cache/triton",
+        INDEXTTS25_PERSISTENT_DATA_DIR,
     ]
     
     print("\n   Creating cache directories:")
@@ -1270,7 +513,7 @@ def legacy_serve_without_snapshot():
     # 2.1: Verify persistent application exists  
     persistent_app_path = Path(PERSISTENT_APP_DIR)
     if not persistent_app_path.exists():
-        print("❌ Persistent application not found! Run prepare_model first.")
+        print("❌ Persistent application not found! Open the prepare_model web manager first.")
         raise FileNotFoundError(f"Application not found at {persistent_app_path}")
     
     print(f"   ✅ Application: {persistent_app_path}")
@@ -1598,6 +841,14 @@ def _build_webui_command(persistent_app_path: Path, gpu_profile=None) -> List[st
     ]
 
 
+def _updated_runtime_source(persistent_app_path: Path) -> Path:
+    import sys
+    sys.path.insert(0, RUNTIME_SOURCE_DIR)
+    from indextts_web.infrastructure.model_setup import repository_source
+
+    return repository_source(persistent_app_path, Path(RUNTIME_SOURCE_DIR))
+
+
 def _configure_persistent_runtime():
     from pathlib import Path
 
@@ -1658,8 +909,8 @@ def _configure_persistent_runtime():
         "/persistent_cache/vllm_cache",
         "/persistent_cache/torch_compile_cache",
         "/persistent_cache/confucius",
-        INDEXTTS25_PERSISTENT_DATA_DIR,
         "/persistent_cache/triton",
+        INDEXTTS25_PERSISTENT_DATA_DIR,
     ]
     for cache_dir in cache_dirs:
         os.makedirs(cache_dir, exist_ok=True)
@@ -1685,7 +936,7 @@ def _configure_persistent_runtime():
     persistent_app_path = Path(PERSISTENT_APP_DIR)
     if not persistent_app_path.exists():
         raise FileNotFoundError(
-            f"Application not found at {persistent_app_path}. Run prepare_model first."
+            f"Application not found at {persistent_app_path}. Open the prepare_model web manager first."
         )
 
     checkpoints_dir = persistent_app_path / "checkpoints"
@@ -1734,7 +985,7 @@ def _configure_persistent_runtime():
     ]
     if missing_confucius_paths:
         raise FileNotFoundError(
-            "Confucius4-TTS persistent setup is incomplete. Run prepare_model first. "
+            "Confucius4-TTS persistent setup is incomplete. Open the prepare_model web manager first. "
             + "; ".join(missing_confucius_paths)
         )
 
@@ -1766,7 +1017,7 @@ def _configure_persistent_runtime():
     ]
     if missing_indextts25_paths:
         raise FileNotFoundError(
-            "IndexTTS 2.5 vLLM-Omni persistent setup is incomplete. Run prepare_model first. "
+            "IndexTTS 2.5 vLLM-Omni persistent setup is incomplete. Open the prepare_model web manager first. "
             + "; ".join(missing_indextts25_paths)
         )
 
@@ -1789,7 +1040,6 @@ def _configure_persistent_runtime():
         confucius_output_dir,
         confucius_compile_cache_dir,
         confucius_profile_dir,
-        Path(PERSISTENT_CACHE_DIR) / "triton",
     ):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -1842,9 +1092,11 @@ def _configure_gpu_runtime(persistent_app_path: Path) -> Path:
     from indextts_web.gpu_profiles import PROFILE_ENV, runtime_gpu_profile
     from indextts_web.infrastructure.modal_runtime import prepare_runtime_code
 
+    source = _updated_runtime_source(persistent_app_path)
     runtime_path = prepare_runtime_code(
-        Path(RUNTIME_SOURCE_DIR), persistent_app_path,
+        source, persistent_app_path,
         Path(tempfile.mkdtemp(prefix="indextts-runtime-")) / "app",
+        managed_source=source != Path(RUNTIME_SOURCE_DIR),
     )
     profile = runtime_gpu_profile(modal=True)
     profile.check_startup_memory(non_vllm_gib=float(os.environ.get("INDEXTTS_NON_VLLM_RESERVE_GIB", "8")))
@@ -1859,6 +1111,7 @@ def _configure_gpu_runtime(persistent_app_path: Path) -> Path:
         directory = cache_root / subdir
         directory.mkdir(parents=True, exist_ok=True)
         os.environ[variable] = str(directory)
+    os.environ["VLLM_CACHE"] = str(cache_root / "vllm")
     os.chdir(runtime_path)
     print(f"[GPU profile] {profile.to_json()}")
     print(f"Using deployed source: {runtime_path}; persistent data: {persistent_app_path}")
@@ -1882,6 +1135,8 @@ def _commit_snapshot_volumes(phase: str) -> None:
 @app.cls(
     image=image,
     gpu="RTX-PRO-6000",  # Manually choose "L4", "L40S", or "RTX-PRO-6000"; VRAM tuning is automatic.
+    cpu=2.0,
+    memory=8192,
     timeout=3600,
     scaledown_window=300,
     volumes={
@@ -1931,7 +1186,7 @@ class IndexTTSVllmServer:
             timeout=SNAPSHOT_REQUEST_TIMEOUT,
             internal=True,
         )
-        # Warmup creates compiler caches and application data on both Volumes.
+        # Persist compiler caches and application data before snapshot capture.
         # Returning from snap=True permits capture, so commit synchronously here.
         _commit_snapshot_volumes("before snapshot capture")
 

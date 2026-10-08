@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import shlex
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -51,6 +52,9 @@ class ModalGpuCommandTests(unittest.TestCase):
                         self.assertIn("indextts_web.services.tts.confucius_launcher", conf)
                         self.assertIn(f"PYTHONPATH={root / deploy.CONFUCIUS_APP_SUBDIR}{os.pathsep}{root}", conf)
                         self.assertIn("--compile-s2a", conf)
+                        self.assertEqual(conf[conf.index("--compile-cache-dir") + 1],
+                                         str(Path(deploy.PERSISTENT_CACHE_DIR) / "confucius"
+                                             / profile.cache_key / "torchinductor"))
                         self.assertEqual(conf[conf.index("--warmup-mode") + 1],
                                          "background" if size == 96 else "foreground")
                         self.assertEqual(float(conf[conf.index("--vllm-gpu-memory-utilization") + 1]),
@@ -58,6 +62,11 @@ class ModalGpuCommandTests(unittest.TestCase):
                         omni = shlex.split(command[command.index("--indextts25_start_command") + 1])
                         self.assertIn(deploy.INDEXTTS25_VLLM, omni)
                         self.assertIn("--enable-sleep-mode", omni)
+                        for variable, subdir in (("TORCHINDUCTOR_CACHE_DIR", "torchinductor"),
+                                                 ("TRITON_CACHE_DIR", "triton"), ("CUDA_CACHE_PATH", "cuda")):
+                            self.assertIn(f"{variable}={root / 'data' / 'cache' / profile.cache_key / subdir}",
+                                          omni)
+                        self.assertIn(f"HF_HOME={root / 'data' / 'cache' / 'huggingface'}", omni)
                         config = yaml.safe_load(Path(omni[omni.index("--deploy-config") + 1]).read_text())
                         self.assertEqual(tuple(stage["max_num_seqs"] for stage in config["stages"]), batches)
 
@@ -222,6 +231,34 @@ class SnapshotWarmupTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SnapshotVolumeTests(unittest.TestCase):
+    def test_snapshot_creation_uses_existing_volume_compiler_artifacts_directly(self):
+        profile = resolve_gpu_profile(gpu(96), {}, modal=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            volume = root / "volume"
+            artifact = volume / "gpu-profiles" / profile.cache_key / "torchinductor/kernel.so"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"compiled artifact")
+            namespace = {"Path": Path, "os": os, "print": Mock(), "RUNTIME_SOURCE_DIR": str(ROOT),
+                         "PERSISTENT_CACHE_DIR": str(volume),
+                         "_updated_runtime_source": lambda path: ROOT}
+            configure = load_definition(ROOT / "deploy_vllm_indextts_v2.py", "_configure_gpu_runtime", namespace)
+            with patch.dict(os.environ, {"HF_HOME": str(volume / "huggingface")}, clear=True), \
+                    patch.object(sys, "path", list(sys.path)), patch.object(os, "chdir"), \
+                    patch("tempfile.mkdtemp", return_value=str(root / "runtime")), \
+                    patch("indextts_web.infrastructure.modal_runtime.prepare_runtime_code", return_value=ROOT), \
+                    patch("indextts_web.gpu_profiles.runtime_gpu_profile", return_value=profile), \
+                    patch("shutil.copytree", side_effect=AssertionError("Compiler caches must not be copied")):
+                configure(root / "app")
+                for variable, subdir in (("TORCHINDUCTOR_CACHE_DIR", "torchinductor"),
+                                         ("TRITON_CACHE_DIR", "triton"), ("CUDA_CACHE_PATH", "cuda"),
+                                         ("VLLM_CACHE_ROOT", "vllm"), ("VLLM_CACHE", "vllm")):
+                    expected = volume / "gpu-profiles" / profile.cache_key / subdir
+                    self.assertEqual(Path(os.environ[variable]), expected)
+                    self.assertTrue(expected.is_dir())
+                self.assertEqual(os.environ["HF_HOME"], str(volume / "huggingface"))
+                self.assertEqual(artifact.read_bytes(), b"compiled artifact")
+
     def run_snapshot_start(self, fail_volume=None, fail_commit=None):
         # Model a fresh mount: local writes only become restorable after commit.
         pending = {"cache": set(), "app": set()}
