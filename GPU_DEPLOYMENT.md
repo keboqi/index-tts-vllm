@@ -52,6 +52,21 @@ failure aborts snapshot creation. Snapshots require committed cache directories;
 an uncommitted path can prevent restore before any Python hook runs. See
 [Modal Volume commit semantics](https://modal.com/docs/guide/volumes#volume-commits-and-reloads).
 
+The image and startup environment set `ORT_DISABLE_TELEMETRY=1` before ONNX
+Runtime imports, including in subprocesses. This avoids its
+`Microsoft/DeveloperTools/.onnxruntime` device ID/offline cache on the shared
+cache Volume, implicated in a `9p` restore failure with a missing `Microsoft`
+directory. The Python telemetry API runs too late to prevent initialization;
+the [ONNX Runtime initialization code](https://github.com/microsoft/onnxruntime/blob/v1.30.0/onnxruntime/core/platform/posix/telemetry.cc)
+checks the environment before creating this state. Redeploy to replace existing
+snapshots; existing models do not need preparation again.
+
+Several initial snapshot creations can be normal: Modal generally needs 2–3
+snapshots per GPU type to cover different worker types. A reused snapshot logs
+`Restoring Function from memory snapshot.` followed by engine wake/readiness,
+without model initialization or snapshot warmup. See
+[Modal's snapshot coverage explanation](https://modal.com/docs/guide/memory-snapshots#i-havent-changed-my-function-why-do-i-still-see-memory-snapshots-being-created-sometimes).
+
 ## Modal build dependency resolution
 
 For pip's `resolution-too-deep`, use the complete main-environment manifest

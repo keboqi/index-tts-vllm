@@ -251,6 +251,9 @@ if modal.is_local():
             "print('Qwen3-ASR environment ready')\"",
         )
         .env({
+            # Disable before runtime imports: ORT's Microsoft cache tree on the
+            # shared Volume was implicated in a 9p snapshot restore failure.
+            "ORT_DISABLE_TELEMETRY": "1",
             "CLEARVOICE_PYTHON": CLEARVOICE_PYTHON,
             "QWEN_OMNIVAD_PYTHON": QWEN_ASR_PYTHON,
             "QWEN_OMNIVAD_MODEL_DIR": "/persistent_app/checkpoints/qwen_omnivad",
@@ -1209,6 +1212,7 @@ def legacy_serve_without_snapshot():
         "TORCHINDUCTOR_CACHE_DIR": "/persistent_cache/torch_compile_cache",
         "TRITON_CACHE_DIR": "/persistent_cache/triton",
         "XDG_CACHE_HOME": "/persistent_cache",
+        "ORT_DISABLE_TELEMETRY": "1",
         "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
         "TORCHINDUCTOR_AUTOGRAD_CACHE": "1",
     }
@@ -1609,6 +1613,9 @@ def _configure_persistent_runtime():
         "TORCHINDUCTOR_CACHE_DIR": "/persistent_cache/torch_compile_cache",
         "TRITON_CACHE_DIR": "/persistent_cache/triton",
         "XDG_CACHE_HOME": "/persistent_cache",
+        # Set before imports/subprocesses; the Python telemetry API is too late
+        # to prevent ORT from creating its device ID and offline cache files.
+        "ORT_DISABLE_TELEMETRY": "1",
         "TORCHINDUCTOR_FX_GRAPH_CACHE": "1",
         "TORCHINDUCTOR_AUTOGRAD_CACHE": "1",
         "TORCHINDUCTOR_COMPILE_THREADS": "1",
