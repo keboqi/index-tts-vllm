@@ -4,10 +4,13 @@ import ast
 import contextlib
 import io
 import json
+import os
+import shlex
 import subprocess
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 class ColabDependencyCheckTests(unittest.TestCase):
@@ -69,6 +72,83 @@ class ColabDependencyCheckTests(unittest.TestCase):
                                            (self.KNOWN_CONFLICTS, 1, "pip failed")):
             with self.subTest(returncode=returncode, stderr=stderr), self.assertRaises(subprocess.CalledProcessError):
                 self.run_check(stdout, returncode=returncode, stderr=stderr)
+
+
+class ColabClearVoiceSetupTests(unittest.TestCase):
+    def setUp(self):
+        path = Path(__file__).resolve().parent.parent / "index_tts_vllm_colab.ipynb"
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        self.trees = [ast.parse("".join(cell["source"])) for cell in notebook["cells"] if cell["cell_type"] == "code"]
+        function = next(node for tree in self.trees for node in tree.body
+                        if isinstance(node, ast.FunctionDef) and node.name == "setup_clearvoice")
+        self.calls = []
+        self.run_env = {"PATH": "/main/bin", "VIRTUAL_ENV": "/main", "CLEARVOICE_PYTHON": "/stale/python"}
+        self.namespace = {
+            "RUN_ENV": self.run_env, "NOTEBOOK_DIR": Path("/content"),
+            "WORKSPACE_DIR": Path("/content/index-tts-vllm"), "UV": ["python", "-m", "uv"], "os": os,
+            "subprocess": SimpleNamespace(check_output=Mock(return_value="3.12\n")),
+            "run_logged": lambda command, **options: self.calls.append((command, options)),
+        }
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), self.namespace)
+
+    def setup_worker(self, *, enabled=True, existing=False):
+        with patch.object(Path, "is_file", return_value=existing), contextlib.redirect_stdout(io.StringIO()):
+            self.namespace["setup_clearvoice"](enabled)
+
+    def test_installs_isolated_manifest_and_exports_worker_interpreter(self):
+        self.setup_worker()
+        create = next(command for command, _ in self.calls if "venv" in command)
+        self.assertNotIn("--system-site-packages", create)
+        install, options = next((command, options) for command, options in self.calls if "-r" in command)
+        self.assertEqual(Path(install[install.index("-r") + 1]).name, "requirements-clearvoice.txt")
+        self.assertNotIn("-c", install)
+        self.assertEqual(install[install.index("--torch-backend") + 1], "cu128")
+        worker_python = str(Path("/content/venv_index_tts_clearvoice/bin/python"))
+        self.assertEqual(install[install.index("--python") + 1], worker_python)
+        self.assertEqual(self.run_env["CLEARVOICE_PYTHON"], worker_python)
+        self.assertEqual(options["env"]["VIRTUAL_ENV"], str(Path(worker_python).parent.parent))
+        self.assertTrue(any("indextts_web.services.audio.clearvoice_worker" in command for command, _ in self.calls))
+
+    def test_rerun_reuses_environment_and_revalidates_worker(self):
+        self.setup_worker(existing=True)
+        self.assertFalse(any("venv" in command for command, _ in self.calls))
+        self.assertTrue(any("check" in command for command, _ in self.calls))
+        self.assertIn("CLEARVOICE_PYTHON", self.run_env)
+
+    def test_disabled_worker_clears_stale_configuration_without_installing(self):
+        self.setup_worker(enabled=False)
+        self.assertEqual(self.calls, [])
+        self.assertNotIn("CLEARVOICE_PYTHON", self.run_env)
+
+    def test_failed_install_does_not_publish_an_unavailable_worker(self):
+        self.namespace["run_logged"] = Mock(side_effect=subprocess.CalledProcessError(1, ["uv"]))
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.setup_worker(existing=True)
+        self.assertNotIn("CLEARVOICE_PYTHON", self.run_env)
+
+    def test_terminal_launcher_preserves_optional_worker_path(self):
+        tree = next(tree for tree in self.trees if any(
+            isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "persistent_env"
+                                                for target in node.targets) for node in tree.body))
+        start = next(i for i, node in enumerate(tree.body) if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "persistent_env" for target in node.targets))
+        end = next(i for i, node in enumerate(tree.body[start:], start) if isinstance(node, ast.Expr)
+                   and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute)
+                   and node.value.func.attr == "write_text")
+        script = compile(ast.Module(body=tree.body[start:end], type_ignores=[]), "<terminal launcher>", "exec")
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                env = {"CLEARVOICE_PYTHON": "/content/clearvoice worker/bin/python"} if enabled else {}
+                scope = {"RUN_ENV": env, "VENV_DIR": Path("/main"), "PYTHON": "/main/bin/python",
+                         "COLAB_DIR": Path("/repo/.colab"), "SERVER_PORT": 8000,
+                         "ENABLE_CLOUDFLARE_TUNNEL": True, "ENABLE_WARMUP": False,
+                         "STARTUP_TIMEOUT_SECONDS": 1800, "shlex": shlex}
+                exec(script, scope)
+                exports = [shlex.split(line) for line in scope["launcher_text"].splitlines()
+                           if line.startswith("export CLEARVOICE_PYTHON=")]
+                expected = [["export", "CLEARVOICE_PYTHON=/content/clearvoice worker/bin/python"]] if enabled else []
+                self.assertEqual(exports, expected)
+                self.assertIn("unset PYTHONPATH PYTHONHOME MPLBACKEND CLEARVOICE_PYTHON", scope["launcher_text"])
 
 
 if __name__ == "__main__":
