@@ -18163,6 +18163,7 @@ def get_voice_design_manager() -> Qwen3VoiceDesignManager:
                 "./checkpoints/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
             ),
             device=os.environ.get("QWEN3_TTS_DEVICE", "cuda:0"),
+            use_flash_attention=_env_flag("QWEN3_TTS_USE_FLASH_ATTENTION", True),
         )
         # Get the speaker manager from TTSManager instance
         tts_instance = TTSManager.get_instance()

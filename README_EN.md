@@ -12,12 +12,14 @@ design, Stable Audio 3 music/SFX, video downloads, and reference enhancement.
 For Google Colab, open [index_tts_vllm_colab.ipynb](index_tts_vllm_colab.ipynb)
 and select **G4 GPU**. The notebook clones this repository, creates an isolated
 Python 3.12/CUDA environment, downloads IndexTTS 2.0 weights, and exposes the
-WebUI through a temporary Cloudflare URL. Google Drive output/preset storage
-is optional and off by default. ClearVoice, MOSS transcription, and Qwen3-ASR +
-OmniVAD are installed in separate environments by default. The launcher starts
-the local MOSS Transformers service without Docker; ASR weights download on first
-use. Warmup and S2Mel compilation share one switch, off by default. Confucius and
-IndexTTS 2.5 still require their own setup.
+WebUI through a temporary Cloudflare URL. Its defaults follow quick start:
+main dependencies, IndexTTS 2.0 and HY-MT weights, and optional backend source
+checkouts. Optional services install and download their models on first use;
+preparation and extra model download controls all default off. Check them before
+running to prepare a feature ahead of launch. Google Drive storage is off by
+default. Warmup and S2Mel compilation share one switch, also off by default.
+See [Colab setup and deployment parity](docs/colab_setup_parity.md) for the
+service options, remaining credentials, and validation limits.
 
 The setup script targets Linux with an NVIDIA CUDA GPU. It installs audio
 utilities and Python dependencies, downloads IndexTTS 2.0 weights and HY-MT

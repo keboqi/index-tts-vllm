@@ -2,20 +2,263 @@
 
 import ast
 import contextlib
+import hashlib
 import io
 import json
 import os
 import queue
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from indextts_web.config import load_settings
 from indextts_web.gpu_profiles import GIB, GpuInfo, resolve_gpu_profile
+from tests.support import ROOT, load_definition
+
+
+def notebook_cell(title):
+    notebook = json.loads((ROOT / "index_tts_vllm_colab.ipynb").read_text(encoding="utf-8"))
+    return next("".join(cell["source"]) for cell in notebook["cells"]
+                if cell["cell_type"] == "code" and title in "".join(cell["source"]).splitlines()[0])
+
+
+class ColabModelOptionsTests(unittest.TestCase):
+    def options(self, **overrides):
+        tree = ast.parse(notebook_cell("5. Download models"))
+        flags = {"DOWNLOAD_HY_MT": True, "DOWNLOAD_VOICE_DESIGN": False, "DOWNLOAD_MOSS_MODEL": False,
+                 "STABLE_AUDIO_DOWNLOAD": "off", "USE_HF_SECRET": False, **overrides}
+        tree.body = [node for node in tree.body if not (isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in flags for target in node.targets))]
+        scope = {**flags, "INSTALL_OPTIONAL_FEATURES": True, "WORKSPACE_DIR": Path("/repo"),
+                 "PYTHON": "/venv/bin/python", "RUN_ENV": {}, "run_logged": Mock()}
+        exec(compile(tree, "<Colab model options>", "exec"), scope)
+        return scope
+
+    def test_default_models_and_voice_design_lazy_download(self):
+        scope = self.options()
+        self.assertEqual(scope["targets"], ["index", "hy-mt"])
+        self.assertEqual(scope["RUN_ENV"]["QWEN3_VOICE_DESIGN_MODEL"], "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+
+    def test_hy_mt_download_off_enables_huggingface_fallback(self):
+        scope = self.options(DOWNLOAD_HY_MT=False)
+        self.assertEqual(scope["targets"], ["index"])
+        self.assertEqual(scope["RUN_ENV"]["HY_MT_TRANSLATION_LOCAL_DIR"], "")
+
+    def test_explicit_voice_design_and_gated_model_downloads(self):
+        scope = self.options(DOWNLOAD_VOICE_DESIGN=True, STABLE_AUDIO_DOWNLOAD="all")
+        self.assertEqual(scope["targets"], ["index", "hy-mt", "voice-design", "stable-audio-medium",
+                                           "stable-audio-small-music", "stable-audio-small-sfx"])
+        self.assertEqual(scope["RUN_ENV"]["QWEN3_VOICE_DESIGN_MODEL"],
+                         str(Path("/repo/checkpoints/Qwen3-TTS-12Hz-1.7B-VoiceDesign")))
+
+    def test_downloads_use_modal_catalog_and_reject_incomplete_bundles(self):
+        from indextts_web.infrastructure import model_setup
+        scope = self.options(STABLE_AUDIO_DOWNLOAD="small-sfx")
+        hub = ModuleType("huggingface_hub")
+        hub.snapshot_download = Mock()
+        argv = ["-c", "/repo", json.dumps(scope["targets"])]
+        with patch.dict(sys.modules, {"huggingface_hub": hub}), patch.object(sys, "argv", argv), \
+                patch.object(model_setup, "missing_model_files", return_value=[]) as validate, \
+                contextlib.redirect_stdout(io.StringIO()):
+            exec(scope["MODEL_DOWNLOAD_SOURCE"], {})
+        self.assertEqual([call.kwargs["repo_id"] for call in hub.snapshot_download.call_args_list],
+                         ["garyswansrs/index_tts_2_vllm", "tencent/Hy-MT2-1.8B", "stabilityai/stable-audio-3-small-sfx"])
+        self.assertEqual(validate.call_count, 3)
+        with patch.dict(sys.modules, {"huggingface_hub": hub}), patch.object(sys, "argv", argv), \
+                patch.object(model_setup, "missing_model_files", return_value=["missing-shard.safetensors"]), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "missing-shard"):
+            exec(scope["MODEL_DOWNLOAD_SOURCE"], {})
+
+    def test_additional_model_downloads_and_service_preparation_default_off(self):
+        for title in ("3. Install Python", "5. Download models", "6. Launch"):
+            tree = ast.parse(notebook_cell(title))
+            for node in tree.body:
+                if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and (target.id.startswith("PREPARE_") or target.id in {
+                            "DOWNLOAD_VOICE_DESIGN", "DOWNLOAD_MOSS_MODEL", "DOWNLOAD_QWEN_MODELS",
+                            "DOWNLOAD_CLEARVOICE_MODELS", "ENABLE_WARMUP",
+                        }):
+                            self.assertIs(node.value.value, False, target.id)
+
+
+class ColabPreparationTests(unittest.TestCase):
+    def test_checked_tts_services_use_shared_wake_and_sleep_routes_without_synthesis(self):
+        tree = ast.parse(notebook_cell("6. Launch"))
+        launcher = next(node.value.value for node in tree.body if isinstance(node, ast.Assign)
+                        and any(isinstance(t, ast.Name) and t.id == "LAUNCHER_SOURCE" for t in node.targets))
+        function = next(node for node in ast.parse(launcher).body
+                        if isinstance(node, ast.FunctionDef) and node.name == "prepare_tts_services")
+        import urllib.request
+        for keys in ([], ["confucius_vllm", "indextts25_omni"]):
+            with self.subTest(keys=keys), patch.dict(os.environ, {"COLAB_PREPARE_TTS": json.dumps(keys)}), \
+                    patch.object(urllib.request, "urlopen", side_effect=lambda *_a, **_kw: io.BytesIO(b'{"status":"success"}')) as http:
+                scope = {"json": json, "os": os, "events": queue.Queue(), "port": 8000,
+                         "startup_timeout": 1800, "urllib": SimpleNamespace(request=urllib.request),
+                         "preparation_errors": [], "preparation_done": Mock()}
+                exec(compile(ast.Module(body=[function], type_ignores=[]), "<TTS preparation>", "exec"), scope)
+                scope["prepare_tts_services"]()
+                self.assertEqual(scope["preparation_errors"], [])
+                scope["preparation_done"].set.assert_called_once()
+                self.assertEqual([call.args[0].full_url.rsplit("/", 1)[-1] for call in http.call_args_list],
+                                 [action for _ in keys for action in ("wake", "unload")])
+
+    def test_failed_service_preparation_is_reported_and_signals_completion(self):
+        tree = ast.parse(notebook_cell("6. Launch"))
+        launcher = next(node.value.value for node in tree.body if isinstance(node, ast.Assign)
+                        and any(isinstance(t, ast.Name) and t.id == "LAUNCHER_SOURCE" for t in node.targets))
+        function = next(node for node in ast.parse(launcher).body
+                        if isinstance(node, ast.FunctionDef) and node.name == "prepare_tts_services")
+        scope = {"json": json, "os": os, "events": queue.Queue(), "port": 8000, "startup_timeout": 1800,
+                 "urllib": SimpleNamespace(request=SimpleNamespace(Request=Mock(), urlopen=Mock(side_effect=OSError("setup failed")))),
+                 "preparation_errors": [], "preparation_done": Mock()}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "<TTS preparation>", "exec"), scope)
+        with patch.dict(os.environ, {"COLAB_PREPARE_TTS": '["confucius_vllm"]'}):
+            scope["prepare_tts_services"]()
+        self.assertEqual(str(scope["preparation_errors"][0]), "setup failed")
+        scope["preparation_done"].set.assert_called_once()
+
+    def test_lazy_wrappers_preserve_worker_arguments_and_use_one_installer(self):
+        tree = ast.parse(notebook_cell("3. Install Python"))
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name in {"optional_runtime_command", "write_optional_wrappers"}]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = {"WORKSPACE_DIR": root, "NOTEBOOK_DIR": root, "CACHE_DIR": root / "cache", "PYTHON": root / "bin/python"}
+            exec(compile(ast.Module(body=functions, type_ignores=[]), "<optional wrappers>", "exec"), scope)
+            scope["write_optional_wrappers"]()
+            for kind in ("clearvoice", "qwen-asr"):
+                wrapper = (root / ".colab" / (kind + "-python")).read_text()
+                self.assertIn("indextts_web.infrastructure.optional_runtime", wrapper)
+                self.assertTrue(wrapper.endswith('"$@"\n'))
+                self.assertIn("--exec-python --", wrapper)
+            manager = (root / ".colab/moss-start.sh").read_text()
+            self.assertIn("--start-moss", manager)
+            self.assertIn("| tee", manager)
+            self.assertNotIn("docker", manager)
+
+
+class ColabNodeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.cache = Path(self.temp.name)
+        self.node = self.cache / "old-node"
+        self.node.write_text("stub")
+        tree = ast.parse(notebook_cell("3. Install Python"))
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "setup_node")
+        self.calls = []
+        self.scope = {"CACHE_DIR": self.cache, "Path": Path, "RUN_ENV": {"PATH": "/usr/bin"},
+                      "shutil": SimpleNamespace(which=Mock(return_value=str(self.node))),
+                      "subprocess": SimpleNamespace(check_output=Mock(return_value="v18.0.0\n"), CalledProcessError=subprocess.CalledProcessError),
+                      "run_logged": self.run_command}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "<Colab Node setup>", "exec"), self.scope)
+
+    def run_command(self, command, **kwargs):
+        self.calls.append(command)
+        if command[0] == "curl":
+            Path(command[-1]).write_bytes(b"test node archive")
+
+    def test_uses_existing_supported_node_without_downloading(self):
+        self.scope["subprocess"].check_output.return_value = "v22.0.0\n"
+        self.scope["setup_node"]()
+        self.assertEqual(self.scope["RUN_ENV"]["YTDLP_NODE_PATH"], str(self.node))
+        self.assertEqual(self.calls, [])
+
+    def test_downloads_and_verifies_archive_before_installing(self):
+        import urllib.request
+        checksum = hashlib.sha256(b"test node archive").hexdigest()
+        manifest = f"{checksum}  node-v22.1.0-linux-x64.tar.xz\n".encode()
+        with patch.object(urllib.request, "urlopen", return_value=io.BytesIO(manifest)):
+            self.scope["setup_node"]()
+        self.assertEqual([command[0] for command in self.calls[:2]], ["curl", "tar"])
+        self.assertEqual(self.scope["RUN_ENV"]["YTDLP_NODE_PATH"], str(self.cache / "node/bin/node"))
+
+    def test_checksum_failure_never_extracts_or_exports_node(self):
+        import urllib.request
+        manifest = f"{'0' * 64}  node-v22.1.0-linux-x64.tar.xz\n".encode()
+        with patch.object(urllib.request, "urlopen", return_value=io.BytesIO(manifest)), \
+                self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+            self.scope["setup_node"]()
+        self.assertEqual(len(self.calls), 1)
+        self.assertNotIn("YTDLP_NODE_PATH", self.scope["RUN_ENV"])
+
+
+class ColabOptionalRepositoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        tree = ast.parse(notebook_cell("2. Clone"))
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "provision_optional_repository")
+        self.commands = []
+        self.entrypoint = "scripts/serve.sh"
+        self.scope = {"WORKSPACE_DIR": self.root / "app", "run_logged": self.clone}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "<optional checkout>", "exec"), self.scope)
+
+    def clone(self, command):
+        self.commands.append(command)
+        destination = Path(command[-1])
+        (destination / ".git").mkdir(parents=True)
+        entrypoint = destination / self.entrypoint
+        entrypoint.parent.mkdir(parents=True)
+        entrypoint.write_text("stub")
+
+    def provision(self, enabled=True):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.scope["provision_optional_repository"]("Backend", "https://example.com/backend.git",
+                                                       "backend", self.entrypoint, enabled)
+
+    def test_clone_provisions_source_without_building_environment_or_downloading_models(self):
+        self.provision()
+        self.assertEqual(self.commands, [["git", "clone", "--depth", "1", "https://example.com/backend.git",
+                                          str(self.root / "backend")]])
+
+    def test_rerun_reuses_source_without_pulling_or_resetting(self):
+        self.provision()
+        self.commands.clear()
+        self.provision()
+        self.assertEqual(self.commands, [])
+
+    def test_disabled_repository_does_nothing(self):
+        self.provision(enabled=False)
+        self.assertEqual(self.commands, [])
+        self.assertFalse((self.root / "backend").exists())
+
+    def test_incomplete_checkout_is_preserved_and_reported(self):
+        (self.root / "backend").mkdir()
+        preserved = self.root / "backend/user-data.txt"
+        preserved.write_text("keep")
+        with self.assertRaisesRegex(RuntimeError, "Incomplete"):
+            self.provision()
+        self.assertEqual(preserved.read_text(), "keep")
+        self.assertEqual(self.commands, [])
+
+
+class VoiceDesignConfigCompatibilityTests(unittest.TestCase):
+    def test_standalone_and_modal_defaults_preserved_with_optional_flash_override(self):
+        for override in (None, "0", "1"):
+            with self.subTest(override=override), patch.dict(os.environ, {}, clear=True):
+                if override is not None:
+                    os.environ["QWEN3_TTS_USE_FLASH_ATTENTION"] = override
+                    os.environ["QWEN3_VOICE_DESIGN_MODEL"] = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+                manager = SimpleNamespace(preset_manager=object())
+                scope = {"os": os, "_voice_design_manager": None, "Qwen3TTSConfig": Mock(),
+                         "Qwen3VoiceDesignManager": Mock(return_value=manager), "APP_DIR": ROOT,
+                         "SPEAKER_REFERENCE_DIR": "speaker_presets/references",
+                         "TTSManager": SimpleNamespace(get_instance=lambda: None)}
+                scope["_env_flag"] = load_definition(ROOT / "fastapi_webui_v2_impl.py", "_env_flag", {"os": os})
+                load_definition(ROOT / "fastapi_webui_v2_impl.py", "get_voice_design_manager", scope)()
+                kwargs = scope["Qwen3TTSConfig"].call_args.kwargs
+                self.assertEqual(kwargs["use_flash_attention"], override != "0")
+                expected = "./checkpoints/Qwen3-TTS-12Hz-1.7B-VoiceDesign" if override is None else "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+                self.assertEqual(kwargs["voice_design_model_path"], expected)
 
 
 class ColabDependencyCheckTests(unittest.TestCase):
@@ -92,6 +335,7 @@ class ColabClearVoiceSetupTests(unittest.TestCase):
             "RUN_ENV": self.run_env, "NOTEBOOK_DIR": Path("/content"),
             "WORKSPACE_DIR": Path("/content/index-tts-vllm"), "UV": ["python", "-m", "uv"], "os": os,
             "subprocess": SimpleNamespace(check_output=Mock(return_value="3.12\n")),
+            "optional_runtime_command": lambda kind: ["python", "-m", "optional_runtime", kind],
             "run_logged": lambda command, **options: self.calls.append((command, options)),
         }
         exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), self.namespace)
@@ -100,36 +344,21 @@ class ColabClearVoiceSetupTests(unittest.TestCase):
         with patch.object(Path, "is_file", return_value=existing), contextlib.redirect_stdout(io.StringIO()):
             self.namespace["setup_clearvoice"](enabled)
 
-    def test_installs_isolated_manifest_and_exports_worker_interpreter(self):
+    def test_checked_option_delegates_to_same_installer_as_first_use(self):
         self.setup_worker()
-        create = next(command for command, _ in self.calls if "venv" in command)
-        self.assertNotIn("--system-site-packages", create)
-        install, options = next((command, options) for command, options in self.calls if "-r" in command)
-        self.assertEqual(Path(install[install.index("-r") + 1]).name, "requirements-clearvoice.txt")
-        self.assertNotIn("-c", install)
-        self.assertEqual(install[install.index("--torch-backend") + 1], "cu128")
-        worker_python = str(Path("/content/venv_index_tts_clearvoice/bin/python"))
-        self.assertEqual(install[install.index("--python") + 1], worker_python)
-        self.assertEqual(self.run_env["CLEARVOICE_PYTHON"], worker_python)
-        self.assertEqual(options["env"]["VIRTUAL_ENV"], str(Path(worker_python).parent.parent))
-        self.assertTrue(any("indextts_web.services.audio.clearvoice_worker" in command for command, _ in self.calls))
+        self.assertEqual(self.calls[0][0], ["python", "-m", "optional_runtime", "clearvoice", "--force"])
+        self.assertEqual(self.run_env["CLEARVOICE_PYTHON"], str(Path("/content/index-tts-vllm/.colab/clearvoice-python")))
 
-    def test_rerun_reuses_environment_and_revalidates_worker(self):
-        self.setup_worker(existing=True)
-        self.assertFalse(any("venv" in command for command, _ in self.calls))
-        self.assertTrue(any("check" in command for command, _ in self.calls))
-        self.assertIn("CLEARVOICE_PYTHON", self.run_env)
-
-    def test_disabled_worker_clears_stale_configuration_without_installing(self):
+    def test_default_deferred_worker_remains_available_without_installing(self):
         self.setup_worker(enabled=False)
         self.assertEqual(self.calls, [])
-        self.assertNotIn("CLEARVOICE_PYTHON", self.run_env)
+        self.assertEqual(self.run_env["CLEARVOICE_PYTHON"], str(Path("/content/index-tts-vllm/.colab/clearvoice-python")))
 
-    def test_failed_install_does_not_publish_an_unavailable_worker(self):
+    def test_failed_preparation_remains_on_demand_and_reports_failure(self):
         self.namespace["run_logged"] = Mock(side_effect=subprocess.CalledProcessError(1, ["uv"]))
         with self.assertRaises(subprocess.CalledProcessError):
-            self.setup_worker(existing=True)
-        self.assertNotIn("CLEARVOICE_PYTHON", self.run_env)
+            self.setup_worker()
+        self.assertTrue(self.run_env["CLEARVOICE_PYTHON"].endswith("clearvoice-python"))
 
     def test_terminal_launcher_preserves_optional_worker_path(self):
         tree = next(tree for tree in self.trees if any(
@@ -148,11 +377,22 @@ class ColabClearVoiceSetupTests(unittest.TestCase):
                     "COLAB_MOSS_PYTHON": "/content/moss/bin/python",
                     "MOSS_TRANSCRIBE_BACKEND": "http", "MOSS_TRANSCRIBE_MANAGE_BACKEND": "0",
                     "MOSS_TRANSCRIBE_SGLANG_URL": "http://127.0.0.1:8003",
+                    "MOSS_TRANSCRIBE_MANAGER_SCRIPT": "/repo/.colab/moss-start.sh",
                     "MOSS_TRANSCRIBE_DEVICE": "cuda:0",
                     "MOSS_TRANSCRIBE_MODEL": "OpenMOSS-Team/MOSS-Transcribe-Diarize",
                     "QWEN_OMNIVAD_PYTHON": "/content/qwen/bin/python",
                     "QWEN_OMNIVAD_MODEL_DIR": "/repo/checkpoints/qwen_omnivad",
                     "QWEN_OMNIVAD_CACHE_DIR": "/content/cache/qwen_omnivad",
+                    "YTDLP_NODE_PATH": "/content/node/bin/node",
+                    "QWEN3_VOICE_DESIGN_MODEL": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+                    "QWEN3_TTS_USE_FLASH_ATTENTION": "0",
+                    "CUDA_CACHE_PATH": "/content/cache/cuda",
+                    "TORCHINDUCTOR_CACHE_DIR": "/content/cache/torchinductor",
+                    "TORCHINDUCTOR_COMPILE_THREADS": "1",
+                    "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512",
+                    "ORT_DISABLE_TELEMETRY": "1",
+                    "CONFUCIUS_USE_TORCH_COMPILE": "0", "WARMUP": "0",
+                    "COLAB_PREPARE_TTS": '["confucius_vllm"]',
                 }
                 if enabled:
                     env.update(asr_env)
@@ -192,6 +432,7 @@ class ColabASRSetupTests(unittest.TestCase):
             "RUN_ENV": self.env, "NOTEBOOK_DIR": root, "WORKSPACE_DIR": root,
             "CACHE_DIR": root / "cache", "UV": ["python", "-m", "uv"], "os": os,
             "subprocess": SimpleNamespace(check_output=Mock(return_value="3.12\n")),
+            "optional_runtime_command": lambda kind: ["python", "-m", "optional_runtime", kind],
             "run_logged": lambda command, **options: self.calls.append((command, options)),
         }
         exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), self.scope)
@@ -200,51 +441,37 @@ class ColabASRSetupTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.scope["setup_asr"](kind, enabled)
 
-    def test_both_workers_install_clean_environments_and_validate_before_exporting(self):
-        for kind, key in (("moss", "COLAB_MOSS_PYTHON"), ("qwen-asr", "QWEN_OMNIVAD_PYTHON")):
+    def test_checked_workers_delegate_to_common_optional_installer(self):
+        for kind in ("moss", "qwen-asr"):
             with self.subTest(kind=kind):
                 self.calls.clear()
                 self.setup_asr(kind)
-                create = next(command for command, _ in self.calls if "venv" in command)
-                self.assertNotIn("--system-site-packages", create)
-                install, options = next((command, options) for command, options in self.calls if "-r" in command)
-                self.assertEqual(Path(install[install.index("-r") + 1]).name, f"requirements-colab-{kind}.txt")
-                self.assertEqual(install[install.index("--torch-backend") + 1], "cu128")
-                self.assertEqual(install[install.index("--python") + 1], self.env[key])
-                self.assertNotEqual(options["env"]["VIRTUAL_ENV"], "/main")
-                self.assertTrue(any("check" in command for command, _ in self.calls))
-                smoke = next(command[-1] for command, _ in self.calls if "-c" in command and "import torch" in command[-1])
-                self.assertIn("torch.cuda.is_available()", smoke)
-                self.assertNotIn("from_pretrained(", smoke)
+                self.assertEqual(self.calls[0][0], ["python", "-m", "optional_runtime", kind, "--force"])
 
-    def test_qwen_uses_vetted_diarization_constraints_with_its_transformers_pin(self):
-        self.setup_asr("qwen-asr")
-        constraints = (self.scope["CACHE_DIR"] / "constraints-qwen-asr.txt").read_text()
-        self.assertEqual(constraints, "torch==2.8.0\nwhisperx==3.3.1\n")
-        self.assertTrue(any("indextts_web.services.translation.qwen_worker" in command for command, _ in self.calls))
-        self.assertEqual(self.env["QWEN_OMNIVAD_MODEL_DIR"], str(self.scope["WORKSPACE_DIR"] / "checkpoints/qwen_omnivad"))
-
-    def test_moss_uses_http_service_without_managed_docker_startup(self):
+    def test_moss_preparation_exports_interpreter_for_early_service_start(self):
         self.setup_asr("moss")
         self.assertEqual(self.env["MOSS_TRANSCRIBE_BACKEND"], "http")
         self.assertEqual(self.env["MOSS_TRANSCRIBE_MANAGE_BACKEND"], "0")
-        self.assertFalse(any("-c" in command for command, _ in self.calls if "-r" in command))
+        self.assertEqual(self.env["COLAB_MOSS_PYTHON"], str(self.scope["NOTEBOOK_DIR"] / "venv_index_tts_moss/bin/python"))
 
-    def test_disabled_workers_clear_stale_interpreters_and_never_install(self):
+    def test_unchecked_moss_uses_lazy_local_manager_without_docker(self):
         self.setup_asr("moss", enabled=False)
-        self.setup_asr("qwen-asr", enabled=False)
         self.assertEqual(self.calls, [])
         self.assertNotIn("COLAB_MOSS_PYTHON", self.env)
-        self.assertNotIn("QWEN_OMNIVAD_PYTHON", self.env)
-        self.assertEqual(self.env["MOSS_TRANSCRIBE_MANAGE_BACKEND"], "0")
+        self.assertEqual(self.env["MOSS_TRANSCRIBE_MANAGE_BACKEND"], "1")
+        self.assertTrue(self.env["MOSS_TRANSCRIBE_MANAGER_SCRIPT"].endswith("moss-start.sh"))
 
-    def test_failed_validation_does_not_export_worker(self):
-        for kind, key in (("moss", "COLAB_MOSS_PYTHON"), ("qwen-asr", "QWEN_OMNIVAD_PYTHON")):
-            with self.subTest(kind=kind):
-                self.scope["run_logged"] = Mock(side_effect=subprocess.CalledProcessError(1, ["uv"]))
-                with self.assertRaises(subprocess.CalledProcessError):
-                    self.setup_asr(kind)
-                self.assertNotIn(key, self.env)
+    def test_unchecked_qwen_exports_lazy_interpreter_without_installing(self):
+        self.setup_asr("qwen-asr", enabled=False)
+        self.assertEqual(self.calls, [])
+        self.assertTrue(self.env["QWEN_OMNIVAD_PYTHON"].endswith("qwen-asr-python"))
+        self.assertEqual(self.env["QWEN_OMNIVAD_MODEL_DIR"], str(self.scope["WORKSPACE_DIR"] / "checkpoints/qwen_omnivad"))
+
+    def test_failed_moss_preparation_never_publishes_direct_interpreter(self):
+        self.scope["run_logged"] = Mock(side_effect=subprocess.CalledProcessError(1, ["uv"]))
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.setup_asr("moss")
+        self.assertNotIn("COLAB_MOSS_PYTHON", self.env)
 
 
 class ColabMossServiceTests(unittest.TestCase):
