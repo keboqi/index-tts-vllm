@@ -1,0 +1,14 @@
+# Independent Python 3.12 environment; use the main constraints except Transformers.
+# The notebook writes that derived constraint file and passes it with -c.
+torch==2.8.0
+torchaudio==2.8.0
+torchvision==0.23.0
+qwen-asr==0.0.6
+transformers==4.57.6
+omnivad
+whisperx
+nemo_toolkit[asr]
+litai
+json-repair
+pydub
+google-genai

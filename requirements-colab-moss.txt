@@ -1,0 +1,9 @@
+# Independent Python 3.12 environment: MOSS needs Transformers 5.x.
+torch==2.8.0
+torchaudio==2.8.0
+torchvision==0.23.0
+transformers==5.6.0
+numpy==1.26.4
+librosa==0.11.0
+numba==0.61.2
+moss-transcribe-diarize @ git+https://github.com/OpenMOSS/MOSS-Transcribe-Diarize.git@61bc29cd4120be7b5d3b761b64cd5dff57263642

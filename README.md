@@ -11,7 +11,9 @@
 Google Colab 用户可打开 [index_tts_vllm_colab.ipynb](index_tts_vllm_colab.ipynb)，
 选择 **G4 GPU** 后按顺序运行。笔记本会克隆本仓库、创建独立 Python 3.12/CUDA
 环境、下载 IndexTTS 2.0 权重，并通过临时 Cloudflare 链接访问 WebUI。
-可选将输出和音色预设保存到 Google Drive；独立后端服务需另行配置。
+Google Drive 存储默认关闭。默认安装 ClearVoice、MOSS 转写与 Qwen3-ASR + OmniVAD
+独立环境；启动器会运行无需 Docker 的本地 MOSS Transformers 服务，ASR 权重在首次
+使用时下载。预热与 S2Mel 编译共用开关，默认关闭。Confucius 与 IndexTTS 2.5 仍需另行配置。
 
 自动安装脚本面向 Linux 和 NVIDIA CUDA GPU。它会安装音频工具和 Python
 依赖，下载 IndexTTS 2.0 与 HY-MT 翻译权重，准备可选后端仓库，然后在

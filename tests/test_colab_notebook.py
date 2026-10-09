@@ -5,12 +5,14 @@ import contextlib
 import io
 import json
 import os
+import queue
 import shlex
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from indextts_web.config import load_settings
 from indextts_web.gpu_profiles import GIB, GpuInfo, resolve_gpu_profile
@@ -142,6 +144,18 @@ class ColabClearVoiceSetupTests(unittest.TestCase):
         for enabled in (True, False):
             with self.subTest(enabled=enabled):
                 env = {"CLEARVOICE_PYTHON": "/content/clearvoice worker/bin/python"} if enabled else {}
+                asr_env = {
+                    "COLAB_MOSS_PYTHON": "/content/moss/bin/python",
+                    "MOSS_TRANSCRIBE_BACKEND": "http", "MOSS_TRANSCRIBE_MANAGE_BACKEND": "0",
+                    "MOSS_TRANSCRIBE_SGLANG_URL": "http://127.0.0.1:8003",
+                    "MOSS_TRANSCRIBE_DEVICE": "cuda:0",
+                    "MOSS_TRANSCRIBE_MODEL": "OpenMOSS-Team/MOSS-Transcribe-Diarize",
+                    "QWEN_OMNIVAD_PYTHON": "/content/qwen/bin/python",
+                    "QWEN_OMNIVAD_MODEL_DIR": "/repo/checkpoints/qwen_omnivad",
+                    "QWEN_OMNIVAD_CACHE_DIR": "/content/cache/qwen_omnivad",
+                }
+                if enabled:
+                    env.update(asr_env)
                 env["INDEXTTS_USE_TORCH_COMPILE"] = str(int(enabled))
                 scope = {"RUN_ENV": env, "VENV_DIR": Path("/main"), "PYTHON": "/main/bin/python",
                          "COLAB_DIR": Path("/repo/.colab"), "SERVER_PORT": 8000,
@@ -154,6 +168,150 @@ class ColabClearVoiceSetupTests(unittest.TestCase):
                 self.assertEqual(exports, expected)
                 self.assertIn(f"export INDEXTTS_USE_TORCH_COMPILE={int(enabled)}", scope["launcher_text"])
                 self.assertIn("unset PYTHONPATH PYTHONHOME MPLBACKEND CLEARVOICE_PYTHON", scope["launcher_text"])
+                for key, value in asr_env.items():
+                    expected = f"export {key}={shlex.quote(value)}"
+                    self.assertEqual(expected in scope["launcher_text"], enabled)
+                self.assertIn("COLAB_MOSS_PYTHON QWEN_OMNIVAD_PYTHON\n", scope["launcher_text"])
+
+
+class ColabASRSetupTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        (root / "constraints-main.txt").write_text("torch==2.8.0\ntransformers==4.57.3\nwhisperx==3.3.1\n")
+        path = Path(__file__).resolve().parent.parent / "index_tts_vllm_colab.ipynb"
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        trees = [ast.parse("".join(cell["source"])) for cell in notebook["cells"] if cell["cell_type"] == "code"]
+        function = next(node for tree in trees for node in tree.body
+                        if isinstance(node, ast.FunctionDef) and node.name == "setup_asr")
+        self.calls = []
+        self.env = {"PATH": "/main/bin", "VIRTUAL_ENV": "/main",
+                    "COLAB_MOSS_PYTHON": "stale", "QWEN_OMNIVAD_PYTHON": "stale"}
+        self.scope = {
+            "RUN_ENV": self.env, "NOTEBOOK_DIR": root, "WORKSPACE_DIR": root,
+            "CACHE_DIR": root / "cache", "UV": ["python", "-m", "uv"], "os": os,
+            "subprocess": SimpleNamespace(check_output=Mock(return_value="3.12\n")),
+            "run_logged": lambda command, **options: self.calls.append((command, options)),
+        }
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), self.scope)
+
+    def setup_asr(self, kind, enabled=True):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.scope["setup_asr"](kind, enabled)
+
+    def test_both_workers_install_clean_environments_and_validate_before_exporting(self):
+        for kind, key in (("moss", "COLAB_MOSS_PYTHON"), ("qwen-asr", "QWEN_OMNIVAD_PYTHON")):
+            with self.subTest(kind=kind):
+                self.calls.clear()
+                self.setup_asr(kind)
+                create = next(command for command, _ in self.calls if "venv" in command)
+                self.assertNotIn("--system-site-packages", create)
+                install, options = next((command, options) for command, options in self.calls if "-r" in command)
+                self.assertEqual(Path(install[install.index("-r") + 1]).name, f"requirements-colab-{kind}.txt")
+                self.assertEqual(install[install.index("--torch-backend") + 1], "cu128")
+                self.assertEqual(install[install.index("--python") + 1], self.env[key])
+                self.assertNotEqual(options["env"]["VIRTUAL_ENV"], "/main")
+                self.assertTrue(any("check" in command for command, _ in self.calls))
+                smoke = next(command[-1] for command, _ in self.calls if "-c" in command and "import torch" in command[-1])
+                self.assertIn("torch.cuda.is_available()", smoke)
+                self.assertNotIn("from_pretrained(", smoke)
+
+    def test_qwen_uses_vetted_diarization_constraints_with_its_transformers_pin(self):
+        self.setup_asr("qwen-asr")
+        constraints = (self.scope["CACHE_DIR"] / "constraints-qwen-asr.txt").read_text()
+        self.assertEqual(constraints, "torch==2.8.0\nwhisperx==3.3.1\n")
+        self.assertTrue(any("indextts_web.services.translation.qwen_worker" in command for command, _ in self.calls))
+        self.assertEqual(self.env["QWEN_OMNIVAD_MODEL_DIR"], str(self.scope["WORKSPACE_DIR"] / "checkpoints/qwen_omnivad"))
+
+    def test_moss_uses_http_service_without_managed_docker_startup(self):
+        self.setup_asr("moss")
+        self.assertEqual(self.env["MOSS_TRANSCRIBE_BACKEND"], "http")
+        self.assertEqual(self.env["MOSS_TRANSCRIBE_MANAGE_BACKEND"], "0")
+        self.assertFalse(any("-c" in command for command, _ in self.calls if "-r" in command))
+
+    def test_disabled_workers_clear_stale_interpreters_and_never_install(self):
+        self.setup_asr("moss", enabled=False)
+        self.setup_asr("qwen-asr", enabled=False)
+        self.assertEqual(self.calls, [])
+        self.assertNotIn("COLAB_MOSS_PYTHON", self.env)
+        self.assertNotIn("QWEN_OMNIVAD_PYTHON", self.env)
+        self.assertEqual(self.env["MOSS_TRANSCRIBE_MANAGE_BACKEND"], "0")
+
+    def test_failed_validation_does_not_export_worker(self):
+        for kind, key in (("moss", "COLAB_MOSS_PYTHON"), ("qwen-asr", "QWEN_OMNIVAD_PYTHON")):
+            with self.subTest(kind=kind):
+                self.scope["run_logged"] = Mock(side_effect=subprocess.CalledProcessError(1, ["uv"]))
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.setup_asr(kind)
+                self.assertNotIn(key, self.env)
+
+
+class ColabMossServiceTests(unittest.TestCase):
+    def setUp(self):
+        root = Path(__file__).resolve().parent.parent
+        notebook = json.loads((root / "index_tts_vllm_colab.ipynb").read_text(encoding="utf-8"))
+        code = next("".join(cell["source"]) for cell in notebook["cells"] if "LAUNCHER_SOURCE =" in "".join(cell["source"]))
+        launcher = next(ast.literal_eval(node.value) for node in ast.parse(code).body
+                        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "LAUNCHER_SOURCE" for t in node.targets))
+        tree = ast.parse(launcher)
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {"start", "start_moss_service"}]
+        self.process = Mock(returncode=None)
+        self.process.poll.return_value = None
+        self.env = {"COLAB_MOSS_PYTHON": "/content/moss/bin/python"}
+        self.scope = {
+            "os": SimpleNamespace(environ=self.env), "workspace": root,
+            "port": 8000, "startup_timeout": 1800, "processes": [], "relay": Mock(),
+            "socket": SimpleNamespace(socket=MagicMock()), "threading": SimpleNamespace(Thread=Mock()),
+            "subprocess": SimpleNamespace(Popen=Mock(return_value=self.process), PIPE=-1, STDOUT=-2),
+            "queue": queue, "events": Mock(), "json": json,
+            "time": SimpleNamespace(monotonic=Mock(side_effect=[0, 0])),
+            "urllib": SimpleNamespace(request=SimpleNamespace(urlopen=Mock()), error=SimpleNamespace(HTTPError=OSError)),
+        }
+        self.scope["events"].get.side_effect = queue.Empty
+        response = io.BytesIO(b'{"service":"moss-transcribe","state":"unloaded"}')
+        self.scope["urllib"].request.urlopen.return_value = response
+        exec(compile(ast.Module(body=functions, type_ignores=[]), "<Colab MOSS launcher>", "exec"), self.scope)
+        main = next(node for node in tree.body if isinstance(node, ast.Try))
+        calls = [node.value for node in main.body if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)]
+        self.assertLess(next(i for i, c in enumerate(calls) if isinstance(c.func, ast.Name) and c.func.id == "start_moss_service"),
+                        next(i for i, c in enumerate(calls) if isinstance(c.func, ast.Name) and c.func.id == "server_command"))
+
+    def start_moss(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return self.scope["start_moss_service"]()
+
+    def test_starts_local_server_and_checks_identity_without_loading_weights(self):
+        self.assertIs(self.start_moss(), self.process)
+        call = self.scope["subprocess"].Popen.call_args
+        self.assertEqual(call.args[0][:4], ["/content/moss/bin/python", "-m", "uvicorn", "moss_transcribe_server:app"])
+        self.assertTrue(call.kwargs["start_new_session"])
+        self.assertEqual(self.scope["processes"], [self.process])
+        self.assertEqual(self.scope["urllib"].request.urlopen.call_args.args[0], "http://127.0.0.1:8003/model/status")
+
+    def test_disabled_service_does_not_start(self):
+        self.env.clear()
+        self.assertIsNone(self.start_moss())
+        self.scope["subprocess"].Popen.assert_not_called()
+
+    def test_port_collision_fails_before_start(self):
+        self.scope["port"] = 8003
+        with self.assertRaisesRegex(ValueError, "reserved"):
+            self.start_moss()
+        self.scope["subprocess"].Popen.assert_not_called()
+
+    def test_failed_service_remains_owned_for_launcher_cleanup(self):
+        self.process.poll.return_value = 1
+        self.process.returncode = 1
+        with self.assertRaisesRegex(RuntimeError, "exited with code 1"):
+            self.start_moss()
+        self.assertEqual(self.scope["processes"], [self.process])
+
+    def test_timeout_keeps_process_owned_for_cleanup(self):
+        self.scope["time"].monotonic.side_effect = [0, 121]
+        with self.assertRaisesRegex(TimeoutError, "startup timed out"):
+            self.start_moss()
+        self.assertEqual(self.scope["processes"], [self.process])
 
 
 class ColabWarmupTests(unittest.TestCase):

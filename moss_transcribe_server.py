@@ -1,4 +1,4 @@
-"""Local pure-Python MOSS transcription service for Modal."""
+"""Local pure-Python MOSS transcription service for Modal and Colab."""
 
 from __future__ import annotations
 

@@ -7,6 +7,23 @@ import moss_transcribe_pipeline as pipeline
 
 
 class MossBackendSelectionTests(unittest.TestCase):
+    def test_colab_http_backend_works_without_native_package_or_docker(self) -> None:
+        response = {"text": "local Transformers service"}
+        with (
+            mock.patch.object(pipeline, "MOSS_TRANSCRIBE_BACKEND", "http"),
+            mock.patch.object(pipeline, "MOSS_TRANSCRIBE_MANAGE_BACKEND", False),
+            mock.patch.object(pipeline, "_check_health", return_value=True),
+            mock.patch.object(pipeline, "_python_backend_available", return_value=False),
+            mock.patch.object(pipeline, "_start_managed_backend") as managed_start,
+            mock.patch.object(pipeline, "_transcribe_with_python") as native,
+            mock.patch.object(pipeline, "_transcribe_with_sglang", return_value=response) as http,
+        ):
+            result = pipeline._transcribe(b"audio", input_mime_type="audio/wav")
+        self.assertEqual(result, response)
+        http.assert_called_once()
+        managed_start.assert_not_called()
+        native.assert_not_called()
+
     def test_auto_starts_managed_sglang_before_native_fallback(self) -> None:
         response = {"text": "managed"}
         with (
