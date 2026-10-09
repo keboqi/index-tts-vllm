@@ -9,6 +9,12 @@ design, Stable Audio 3 music/SFX, video downloads, and reference enhancement.
 
 ## Quick start
 
+For Google Colab, open [index_tts_vllm_colab.ipynb](index_tts_vllm_colab.ipynb)
+and select **G4 GPU**. The notebook clones this repository, creates an isolated
+Python 3.12/CUDA environment, downloads IndexTTS 2.0 weights, and exposes the
+WebUI through a temporary Cloudflare URL. Google Drive output/preset storage
+is optional. Separate backend services are not provisioned by the notebook.
+
 The setup script targets Linux with an NVIDIA CUDA GPU. It installs audio
 utilities and Python dependencies, downloads IndexTTS 2.0 weights and HY-MT
 translation weights, provisions optional sibling backend repositories, and
