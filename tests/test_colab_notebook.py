@@ -10,7 +10,10 @@ import subprocess
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
+
+from indextts_web.config import load_settings
+from indextts_web.gpu_profiles import GIB, GpuInfo, resolve_gpu_profile
 
 
 class ColabDependencyCheckTests(unittest.TestCase):
@@ -139,16 +142,85 @@ class ColabClearVoiceSetupTests(unittest.TestCase):
         for enabled in (True, False):
             with self.subTest(enabled=enabled):
                 env = {"CLEARVOICE_PYTHON": "/content/clearvoice worker/bin/python"} if enabled else {}
+                env["INDEXTTS_USE_TORCH_COMPILE"] = str(int(enabled))
                 scope = {"RUN_ENV": env, "VENV_DIR": Path("/main"), "PYTHON": "/main/bin/python",
                          "COLAB_DIR": Path("/repo/.colab"), "SERVER_PORT": 8000,
-                         "ENABLE_CLOUDFLARE_TUNNEL": True, "ENABLE_WARMUP": False,
+                         "ENABLE_CLOUDFLARE_TUNNEL": True, "ENABLE_WARMUP": enabled,
                          "STARTUP_TIMEOUT_SECONDS": 1800, "shlex": shlex}
                 exec(script, scope)
                 exports = [shlex.split(line) for line in scope["launcher_text"].splitlines()
                            if line.startswith("export CLEARVOICE_PYTHON=")]
                 expected = [["export", "CLEARVOICE_PYTHON=/content/clearvoice worker/bin/python"]] if enabled else []
                 self.assertEqual(exports, expected)
+                self.assertIn(f"export INDEXTTS_USE_TORCH_COMPILE={int(enabled)}", scope["launcher_text"])
                 self.assertIn("unset PYTHONPATH PYTHONHOME MPLBACKEND CLEARVOICE_PYTHON", scope["launcher_text"])
+
+
+class ColabWarmupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parent.parent
+        notebook = json.loads((root / "index_tts_vllm_colab.ipynb").read_text(encoding="utf-8"))
+        code = ["".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code"]
+        launch_tree = ast.parse(code[-1])
+        cls.default = next(node.value.value for node in launch_tree.body if isinstance(node, ast.Assign)
+                           and any(isinstance(target, ast.Name) and target.id == "ENABLE_WARMUP" for target in node.targets))
+        source = next(node.value.value for node in launch_tree.body if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "LAUNCHER_SOURCE" for target in node.targets))
+        command = next(node for node in ast.parse(source).body
+                       if isinstance(node, ast.FunctionDef) and node.name == "server_command")
+        cls.command_code = compile(ast.Module(body=[command], type_ignores=[]), "<server command>", "exec")
+        production = ast.parse((root / "fastapi_webui_v2_impl.py").read_text(encoding="utf-8"))
+        cls.model_call = next(node for node in ast.walk(production) if isinstance(node, ast.Assign)
+                              and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+                              and node.value.func.id == "IndexTTS2")
+        lifespan = next(node for node in production.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "lifespan")
+        warmup = next(node for node in lifespan.body if isinstance(node, ast.If)
+                      and isinstance(node.test, ast.Attribute) and node.test.attr == "use_torch_compile")
+        runner = ast.parse("async def run_warmup():\n    pass\n").body[0]
+        runner.body = [warmup]
+        cls.warmup_code = compile(ast.fix_missing_locations(ast.Module(body=[runner], type_ignores=[])), "<warmup>", "exec")
+        engine = ast.parse((root / "indextts/infer_vllm_v2.py").read_text(encoding="utf-8"))
+        constructor = next(node for node in engine.body if isinstance(node, ast.ClassDef) and node.name == "IndexTTS2")
+        constructor = next(node for node in constructor.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+        compile_setting = next(node for node in constructor.body if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Attribute) and target.attr == "use_torch_compile" for target in node.targets))
+        compile_branch = next(node for node in constructor.body if isinstance(node, ast.If)
+                              and isinstance(node.test, ast.Attribute) and node.test.attr == "use_torch_compile")
+        cls.compile_code = compile(ast.Module(body=[compile_setting, compile_branch], type_ignores=[]), "<s2mel compile>", "exec")
+
+    def test_default_disables_both_warmup_and_compilation(self):
+        self.assertIs(self.default, False)
+
+    def test_one_switch_controls_environment_s2mel_and_startup_warmup(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), contextlib.redirect_stdout(io.StringIO()):
+                env = {"INDEXTTS_USE_TORCH_COMPILE": str(int(not enabled))}
+                scope = {"os": SimpleNamespace(environ=env), "warmup_enabled": enabled,
+                         "sys": SimpleNamespace(executable="/venv/bin/python"), "workspace": Path("/repo"), "port": 8000}
+                exec(self.command_code, scope)
+                command = scope["server_command"]()
+                self.assertEqual(env["INDEXTTS_USE_TORCH_COMPILE"], str(int(enabled)))
+                settings = load_settings(command[3:], environ=env)
+                # G4's automatic compilation default must respect the single switch.
+                gpu = GpuInfo("RTX PRO 6000", 96 * GIB, 96 * GIB, "12.0")
+                profile = resolve_gpu_profile(gpu, {}).with_settings(settings)
+                settings = profile.apply_settings(settings)
+                factory = Mock()
+                exec(compile(ast.Module(body=[self.model_call], type_ignores=[]), "<model routing>", "exec"),
+                     {"IndexTTS2": factory, "self": SimpleNamespace(), "SETTINGS": settings, "GPU_PROFILE": profile})
+                compiler = Mock()
+                engine = SimpleNamespace(gpu_profile=profile, s2mel=SimpleNamespace(enable_torch_compile=compiler))
+                exec(self.compile_code, {"self": engine, "use_torch_compile": factory.call_args.kwargs["use_torch_compile"]})
+                warmup = AsyncMock()
+                scope = {"SETTINGS": settings, "warmup_model": warmup}
+                exec(self.warmup_code, scope)
+                # AsyncMock completes immediately; no Windows event-loop sockets are needed.
+                with self.assertRaises(StopIteration):
+                    scope["run_warmup"]().send(None)
+                self.assertIs(settings.use_torch_compile, enabled)
+                self.assertEqual(compiler.call_count, int(enabled))
+                self.assertEqual(warmup.await_count, int(enabled))
 
 
 if __name__ == "__main__":
