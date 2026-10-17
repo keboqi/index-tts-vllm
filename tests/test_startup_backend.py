@@ -105,7 +105,7 @@ class StartupBackendTests(unittest.IsolatedAsyncioTestCase):
     def test_modal_endpoints_have_separate_gpu_snapshots_and_unique_labels(self):
         tree = source_tree(ROOT / "deploy_vllm_indextts_v2.py")
         labels = []
-        for name in ("IndexTTSVllmServer", "Drama3SglangServer"):
+        for name in ("IndexTTSVllmServer", "QuickStartServer", "Drama3SglangServer"):
             cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name)
             decorator = next(item for item in cls.decorator_list
                              if isinstance(item, ast.Call) and getattr(item.func, "attr", "") == "cls")
@@ -115,7 +115,7 @@ class StartupBackendTests(unittest.IsolatedAsyncioTestCase):
             serve = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "serve")
             labels.append(ast.literal_eval(next(item.value for item in serve.decorator_list[0].keywords
                                                 if item.arg == "label")))
-        self.assertEqual(labels, ["tts", "tts-drama3"])
+        self.assertEqual(labels, ["tts", "tts-quick", "tts-drama3"])
 
     def test_drama_modal_capture_warms_pipeline_without_sleeping(self):
         events = []
@@ -134,6 +134,21 @@ class StartupBackendTests(unittest.IsolatedAsyncioTestCase):
         builder.assert_called_once_with(ROOT, startup_tts_backend="drama3")
         self.assertEqual(popen.call_args.kwargs["env"]["DRAMA3_MODAL_SNAPSHOT_CAPTURE"], "1")
         self.assertEqual(events, ["before model startup", "/internal/snapshot/warmup", "persist", "before snapshot capture"])
+
+    def test_quick_start_endpoint_preloads_no_backend(self):
+        events = []
+        builder = Mock(return_value=["python", "webui.py"])
+        namespace = {"print": Mock(), "os": os, "subprocess": SimpleNamespace(Popen=Mock()),
+                     "_configure_persistent_runtime": Mock(return_value=ROOT), "_build_webui_command": builder,
+                     "_commit_snapshot_volumes": lambda phase: events.append(phase),
+                     "_start_moss_transcribe_server": Mock(), "_wait_moss_ready": Mock(),
+                     "_wait_ready": Mock(), "_call_local_json": lambda path, **kwargs: events.append(path),
+                     "SNAPSHOT_STARTUP_TIMEOUT": 1800}
+        start = load_definition(ROOT / "deploy_vllm_indextts_v2.py", "QuickStartServer.start", namespace)
+        start(SimpleNamespace())
+        namespace["_configure_persistent_runtime"].assert_called_once_with(startup_tts_backend="none")
+        builder.assert_called_once_with(ROOT, startup_tts_backend="none")
+        self.assertEqual(events, ["before model startup", "before snapshot capture"])
 
     def test_external_reference_presets_do_not_require_index_embeddings(self):
         namespace = {"os": os, "time": time}

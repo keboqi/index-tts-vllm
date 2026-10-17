@@ -92,6 +92,9 @@ class Drama3Tests(unittest.IsolatedAsyncioTestCase):
                             ("--drama3_data_dir", "/persistent_cache/drama3-serving"),
                             ("--drama3_max_parallel_segments", "32")):
             self.assertEqual(command[command.index(flag) + 1], value)
+        quick = build(Path("/persistent_app"), profile, startup_tts_backend="none")
+        self.assertEqual(quick[quick.index("--tts_backend") + 1], "index")
+        self.assertEqual(quick[quick.index("--startup_tts_backend") + 1], "none")
 
     async def test_sleep_refuses_active_jobs_and_cancel_keeps_gpu_lease(self):
         self.manager.gpu_coordinator = GpuWorkCoordinator(enabled=True)

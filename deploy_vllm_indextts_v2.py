@@ -815,7 +815,8 @@ def _build_webui_command(persistent_app_path: Path, gpu_profile=None, *, startup
         "--qwenemo_gpu_memory_utilization",
         str(gpu_profile.emotion.gpu_memory_utilization),
         "--tts_backend",
-        startup_tts_backend or DEFAULT_TTS_BACKEND,
+        # "none" loads nothing at startup; requests still default to IndexTTS.
+        DEFAULT_TTS_BACKEND if startup_tts_backend in (None, "none") else startup_tts_backend,
         "--startup_tts_backend",
         startup_tts_backend or DEFAULT_TTS_BACKEND,
         "--drama3_venv",
@@ -1266,6 +1267,76 @@ class IndexTTSVllmServer:
         _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
 
     @modal.web_server(port=VLLM_PORT, startup_timeout=SNAPSHOT_STARTUP_TIMEOUT, label="tts")
+    def serve(self):
+        pass
+
+    @modal.exit()
+    def stop(self):
+        for proc_name in ("server_proc", "moss_server_proc"):
+            proc = getattr(self, proc_name, None)
+            if proc is None or proc.poll() is not None:
+                continue
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+@app.cls(
+    image=image,
+    gpu="RTX-PRO-6000",  # Manually choose "L4", "L40S", or "RTX-PRO-6000"; VRAM tuning is automatic.
+    cpu=2.0,
+    memory=8192,
+    timeout=3600,
+    scaledown_window=300,
+    volumes={
+        PERSISTENT_APP_DIR: app_storage,
+        PERSISTENT_CACHE_DIR: cache_storage,
+    },
+    min_containers=0,
+    max_containers=1,
+    secrets=[modal.Secret.from_name("custom-secret")],
+    enable_memory_snapshot=True,
+    experimental_options={"enable_gpu_snapshot": True},
+)
+@modal.concurrent(max_inputs=100)  # 100 concurrent requests
+class QuickStartServer:
+    """
+    Serve the WebUI without preloading any TTS backend; each loads on first use.
+    """
+
+    @modal.enter(snap=True)
+    def start(self):
+        persistent_app_path = _configure_persistent_runtime(startup_tts_backend="none")
+        cmd = _build_webui_command(persistent_app_path, startup_tts_backend="none")
+        _commit_snapshot_volumes("before model startup")
+
+        self.moss_server_proc = _start_moss_transcribe_server(persistent_app_path)
+        _wait_moss_ready(self.moss_server_proc)
+
+        print(f"Starting FastAPI server: {' '.join(cmd)}")
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        self.server_proc = subprocess.Popen(cmd, cwd=str(persistent_app_path), env=env)
+
+        # No backend is resident, so there is nothing to warm up or sleep.
+        _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
+        _commit_snapshot_volumes("before snapshot capture")
+
+    @modal.enter(snap=False)
+    def wake_up(self):
+        from indextts_web.gpu_profiles import runtime_gpu_profile
+        from indextts_web.infrastructure.gpu import probe_gpu
+
+        profile = runtime_gpu_profile(modal=True)
+        actual = probe_gpu()
+        if actual.capability != profile.gpu.capability or actual.total_bytes < profile.gpu.total_bytes:
+            raise RuntimeError("Snapshot GPU does not match its startup profile; redeploy to rebuild the snapshot")
+        _wait_moss_ready(self.moss_server_proc)
+        _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
+
+    @modal.web_server(port=VLLM_PORT, startup_timeout=SNAPSHOT_STARTUP_TIMEOUT, label="tts-quick")
     def serve(self):
         pass
 
