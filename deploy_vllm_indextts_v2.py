@@ -263,9 +263,10 @@ if modal.is_local():
         "VLLM_CACHE": "/persistent_cache/vllm_cache",
         "TRITON_CACHE_DIR": "/persistent_cache/triton",
         "VLLM_SERVER_DEV_MODE": "1",
-        # Modal containers do not provide a Docker daemon. Run MOSS directly
-        # through Transformers.
-        "MOSS_TRANSCRIBE_MANAGE_BACKEND": "0",
+        # Modal containers do not provide a Docker daemon. The WebUI starts the
+        # isolated Transformers MOSS server on the first transcription.
+        "MOSS_TRANSCRIBE_MANAGE_BACKEND": "1",
+        "MOSS_TRANSCRIBE_SERVER_PYTHON": MOSS_TRANSCRIBE_PYTHON,
         "MOSS_TRANSCRIBE_BACKEND": "http",
         "MOSS_TRANSCRIBE_DEVICE": "cuda:0",
         "MOSS_TRANSCRIBE_MODEL": "/persistent_app/checkpoints/MOSS-Transcribe-Diarize",
@@ -657,48 +658,15 @@ def _wait_ready(proc: subprocess.Popen, *, timeout_seconds: int) -> None:
     )
 
 
-def _start_moss_transcribe_server(persistent_app_path: Path) -> subprocess.Popen:
-    """Start the isolated pure-Python MOSS service (no Docker daemon)."""
-    server_script = persistent_app_path / "moss_transcribe_server.py"
-    if not server_script.exists():
-        raise FileNotFoundError(f"MOSS server script not found: {server_script}")
-    if not Path(MOSS_TRANSCRIBE_PYTHON).exists():
-        raise FileNotFoundError(
-            f"MOSS virtual environment Python not found: {MOSS_TRANSCRIBE_PYTHON}"
-        )
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(persistent_app_path)
-    env["PYTHONUNBUFFERED"] = "1"
-    cmd = [
-        MOSS_TRANSCRIBE_PYTHON,
-        "-m",
-        "uvicorn",
-        "moss_transcribe_server:app",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(MOSS_TRANSCRIBE_PORT),
-    ]
-    print(f"Starting isolated MOSS transcription server: {' '.join(cmd)}")
-    return subprocess.Popen(cmd, cwd=str(persistent_app_path), env=env)
-
-
-def _wait_moss_ready(proc: subprocess.Popen, *, timeout_seconds: int = 120) -> None:
-    deadline = time.monotonic() + timeout_seconds
-    url = f"http://127.0.0.1:{MOSS_TRANSCRIBE_PORT}/v1/models"
-    last_error = None
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            raise RuntimeError(f"MOSS transcription server exited with code {proc.returncode}")
-        try:
-            with urllib.request.urlopen(url, timeout=3) as response:
-                if 200 <= response.status < 300:
-                    print("MOSS transcription server is ready.")
-                    return
-        except (OSError, urllib.error.URLError, TimeoutError) as exc:
-            last_error = exc
-            time.sleep(1)
-    raise TimeoutError(f"Timed out waiting for MOSS server. Last error: {last_error}")
+def _stop_webui(proc: Optional[subprocess.Popen]) -> None:
+    # The WebUI stops its on-demand children (MOSS, TTS servers) on shutdown.
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 def _build_confucius_start_command(confucius_repo_path: Path, gpu_profile) -> str:
@@ -907,7 +875,10 @@ def _configure_persistent_runtime(*, startup_tts_backend="index"):
         "VLLM_SERVER_DEV_MODE": "1",
         "INDEXTTS_ENABLE_VLLM_SLEEP_MODE": "1",
         "MOSS_TRANSCRIBE_MANAGE_BACKEND": os.environ.get(
-            "MOSS_TRANSCRIBE_MANAGE_BACKEND", "0"
+            "MOSS_TRANSCRIBE_MANAGE_BACKEND", "1"
+        ),
+        "MOSS_TRANSCRIBE_SERVER_PYTHON": os.environ.get(
+            "MOSS_TRANSCRIBE_SERVER_PYTHON", MOSS_TRANSCRIBE_PYTHON
         ),
         "MOSS_TRANSCRIBE_BACKEND": os.environ.get(
             "MOSS_TRANSCRIBE_BACKEND", "http"
@@ -1081,9 +1052,9 @@ def _configure_persistent_runtime(*, startup_tts_backend="index"):
         "cache/cuda",
     ):
         (indextts25_data_path / relative_path).mkdir(parents=True, exist_ok=True)
-    print(f"IndexTTS 2.5 vLLM-Omni repo: {indextts25_repo_path}")
-    print(f"IndexTTS 2.5 model: {indextts25_model_path}")
-    print(f"IndexTTS 2.5 isolated environment: {INDEXTTS25_VENV_DIR}")
+    # Only paths and environment are prepared here; the WebUI starts the
+    # IndexTTS 2.5 and Confucius4-TTS servers on their first request.
+    print(f"IndexTTS 2.5 vLLM-Omni configured (starts on first use): {indextts25_repo_path}")
 
     for path in (
         confucius_output_dir,
@@ -1108,10 +1079,9 @@ def _configure_persistent_runtime(*, startup_tts_backend="index"):
         "CONFUCIUS_POSTPROCESS_CONCURRENCY": "2",
         "CONFUCIUS_API_INFERENCE_WORKERS": "1",
     }
-    print("Configuring Confucius4-TTS runtime environment:")
+    print("Confucius4-TTS configured (starts on first use).")
     for key, value in confucius_env_vars.items():
         os.environ[key] = value
-        print(f"  {key}={value}")
 
     existing_pythonpath = os.environ.get("PYTHONPATH")
     pythonpath_parts = [str(persistent_app_path)]
@@ -1218,9 +1188,6 @@ class IndexTTSVllmServer:
         cmd = _build_webui_command(persistent_app_path)
         _commit_snapshot_volumes("before model startup")
 
-        self.moss_server_proc = _start_moss_transcribe_server(persistent_app_path)
-        _wait_moss_ready(self.moss_server_proc)
-
         print(f"Starting FastAPI server: {' '.join(cmd)}")
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
@@ -1256,7 +1223,6 @@ class IndexTTSVllmServer:
         actual = probe_gpu()
         if actual.capability != profile.gpu.capability or actual.total_bytes < profile.gpu.total_bytes:
             raise RuntimeError("Snapshot GPU does not match its startup profile; redeploy to rebuild the snapshot")
-        _wait_moss_ready(self.moss_server_proc)
         print("Waking vLLM engines after memory snapshot restore...")
         _call_local_json(
             "/internal/snapshot/wake",
@@ -1272,15 +1238,7 @@ class IndexTTSVllmServer:
 
     @modal.exit()
     def stop(self):
-        for proc_name in ("server_proc", "moss_server_proc"):
-            proc = getattr(self, proc_name, None)
-            if proc is None or proc.poll() is not None:
-                continue
-            proc.terminate()
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        _stop_webui(getattr(self, "server_proc", None))
 
 
 @app.cls(
@@ -1297,43 +1255,24 @@ class IndexTTSVllmServer:
     min_containers=0,
     max_containers=1,
     secrets=[modal.Secret.from_name("custom-secret")],
-    enable_memory_snapshot=True,
-    experimental_options={"enable_gpu_snapshot": True},
 )
 @modal.concurrent(max_inputs=100)  # 100 concurrent requests
 class QuickStartServer:
     """
     Serve the WebUI without preloading any TTS backend; each loads on first use.
+    Nothing heavy is resident at startup, so no memory snapshot is taken.
     """
 
-    @modal.enter(snap=True)
+    @modal.enter()
     def start(self):
         persistent_app_path = _configure_persistent_runtime(startup_tts_backend="none")
         cmd = _build_webui_command(persistent_app_path, startup_tts_backend="none")
-        _commit_snapshot_volumes("before model startup")
-
-        self.moss_server_proc = _start_moss_transcribe_server(persistent_app_path)
-        _wait_moss_ready(self.moss_server_proc)
 
         print(f"Starting FastAPI server: {' '.join(cmd)}")
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
         self.server_proc = subprocess.Popen(cmd, cwd=str(persistent_app_path), env=env)
 
-        # No backend is resident, so there is nothing to warm up or sleep.
-        _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
-        _commit_snapshot_volumes("before snapshot capture")
-
-    @modal.enter(snap=False)
-    def wake_up(self):
-        from indextts_web.gpu_profiles import runtime_gpu_profile
-        from indextts_web.infrastructure.gpu import probe_gpu
-
-        profile = runtime_gpu_profile(modal=True)
-        actual = probe_gpu()
-        if actual.capability != profile.gpu.capability or actual.total_bytes < profile.gpu.total_bytes:
-            raise RuntimeError("Snapshot GPU does not match its startup profile; redeploy to rebuild the snapshot")
-        _wait_moss_ready(self.moss_server_proc)
         _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
 
     @modal.web_server(port=VLLM_PORT, startup_timeout=SNAPSHOT_STARTUP_TIMEOUT, label="tts-quick")
@@ -1342,15 +1281,7 @@ class QuickStartServer:
 
     @modal.exit()
     def stop(self):
-        for proc_name in ("server_proc", "moss_server_proc"):
-            proc = getattr(self, proc_name, None)
-            if proc is None or proc.poll() is not None:
-                continue
-            proc.terminate()
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        _stop_webui(getattr(self, "server_proc", None))
 
 
 def _prepare_drama3_snapshot_runtime() -> Path:
@@ -1407,9 +1338,6 @@ class Drama3SglangServer:
         cmd[cmd.index("--drama3_data_dir") + 1] = str(runtime_data)
         _commit_snapshot_volumes("before model startup")
 
-        self.moss_server_proc = _start_moss_transcribe_server(persistent_app_path)
-        _wait_moss_ready(self.moss_server_proc)
-
         print(f"Starting FastAPI server: {' '.join(cmd)}")
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
@@ -1445,7 +1373,6 @@ class Drama3SglangServer:
         actual = probe_gpu()
         if actual.capability != profile.gpu.capability or actual.total_bytes < profile.gpu.total_bytes:
             raise RuntimeError("Snapshot GPU does not match its startup profile; redeploy to rebuild the snapshot")
-        _wait_moss_ready(self.moss_server_proc)
         print("Verifying Drama 3 after GPU snapshot restore...")
         _call_local_json(
             "/internal/snapshot/wake",
@@ -1461,15 +1388,7 @@ class Drama3SglangServer:
 
     @modal.exit()
     def stop(self):
-        for proc_name in ("server_proc", "moss_server_proc"):
-            proc = getattr(self, proc_name, None)
-            if proc is None or proc.poll() is not None:
-                continue
-            proc.terminate()
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        _stop_webui(getattr(self, "server_proc", None))
         try:
             _persist_drama3_snapshot_runtime()
             cache_storage.commit()

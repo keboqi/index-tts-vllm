@@ -11,17 +11,20 @@ from typing import Any
 
 
 class MossModelClient:
-    def __init__(self, *, url: str, enabled: bool, api_key: str = "") -> None:
+    def __init__(self, *, url: str, enabled: bool, api_key: str = "", launcher=None) -> None:
         self.url = url.rstrip("/")
         self.enabled = enabled
         self.api_key = api_key
+        # Starts a stopped on-demand server (blocking); None when MOSS is external.
+        self.launcher = launcher
 
     @classmethod
-    def from_env(cls):
+    def from_env(cls, launcher=None):
         return cls(
             url=os.getenv("MOSS_TRANSCRIBE_SGLANG_URL", "http://127.0.0.1:8003"),
             enabled=os.getenv("MOSS_TRANSCRIBE_BACKEND", "auto").strip().lower() in {"http", "server", "sglang"},
             api_key=os.getenv("MOSS_TRANSCRIBE_API_KEY", ""),
+            launcher=launcher,
         )
 
     def _request(self, action: str | None = None) -> dict[str, Any]:
@@ -48,7 +51,11 @@ class MossModelClient:
                 return []
             status = {"state": "unavailable", "error": str(exc)}
         except (OSError, ValueError, RuntimeError) as exc:
-            status = {"state": "unavailable", "error": str(exc)}
+            if self.launcher is not None and isinstance(exc, OSError):
+                # The on-demand server is not running yet; waking starts it.
+                status = {"state": "unloaded", "capabilities": ["wake"]}
+            else:
+                status = {"state": "unavailable", "error": str(exc)}
         state = status.get("state", "unavailable")
         actions = {
             "loaded": ["sleep", "unload"], "sleeping": ["wake", "unload"], "unloaded": ["wake"],
@@ -63,4 +70,6 @@ class MossModelClient:
     async def change(self, action: str) -> dict[str, Any]:
         if not self.enabled or action not in {"sleep", "wake", "unload"}:
             raise ValueError("MOSS lifecycle control is not configured for this action")
+        if action == "wake" and self.launcher is not None:
+            await asyncio.to_thread(self.launcher)
         return await asyncio.to_thread(self._request, action)

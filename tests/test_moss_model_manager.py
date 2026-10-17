@@ -49,6 +49,18 @@ class MossClientTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"MOSS_TRANSCRIBE_BACKEND": "python"}):
             self.assertEqual(await MossModelClient.from_env().inventory(), [])
 
+    async def test_on_demand_server_reports_wake_and_starts_on_wake(self):
+        launcher = Mock()
+        client = MossModelClient(url="http://127.0.0.1:8003", enabled=True, launcher=launcher)
+        with patch("urllib.request.urlopen", side_effect=OSError("connection refused")):
+            row = (await client.inventory())[0]
+        self.assertEqual((row["state"], row["actions"]), ("unloaded", ["wake"]))
+        launcher.assert_not_called()
+        payload = {"service": "moss-transcribe", "state": "loaded", "capabilities": ["sleep", "wake", "unload"]}
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps(payload).encode())):
+            await client.change("wake")
+        launcher.assert_called_once_with()
+
 
 class ModelManagerRoutingTests(unittest.IsolatedAsyncioTestCase):
     def namespace(self):

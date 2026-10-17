@@ -186,25 +186,23 @@ class SnapshotWarmupTests(unittest.IsolatedAsyncioTestCase):
                      "subprocess": SimpleNamespace(Popen=Mock()),
                      "_configure_persistent_runtime": lambda: ROOT,
                      "_commit_snapshot_volumes": lambda phase: events.append(phase),
-                     "_start_moss_transcribe_server": Mock(),
-                     "_wait_moss_ready": lambda proc: events.append("moss"),
                      "_build_webui_command": lambda path: ["python", "webui.py"],
                      "_wait_ready": lambda proc, **kwargs: events.append("ready"),
                      "_call_local_json": lambda path, **kwargs: events.append(path),
                      "SNAPSHOT_REQUEST_TIMEOUT": 900, "SNAPSHOT_STARTUP_TIMEOUT": 1800}
         start = load_definition(ROOT / "deploy_vllm_indextts_v2.py", "IndexTTSVllmServer.start", namespace)
         start(SimpleNamespace())
-        self.assertEqual(events, ["before model startup", "moss", "ready", "/internal/snapshot/warmup",
+        self.assertEqual(events, ["before model startup", "ready", "/internal/snapshot/warmup",
                                   "/internal/snapshot/sleep?level=1", "before snapshot capture"])
 
     def test_restore_validates_gpu_and_readiness_without_repeating_warmup(self):
         events = []
-        namespace = {"print": Mock(), "_wait_moss_ready": lambda proc: events.append("moss"),
+        namespace = {"print": Mock(),
                      "_call_local_json": lambda path, **kwargs: events.append(path),
                      "_wait_ready": lambda proc, **kwargs: events.append("ready"),
                      "SNAPSHOT_REQUEST_TIMEOUT": 900, "SNAPSHOT_STARTUP_TIMEOUT": 1800}
         restore = load_definition(ROOT / "deploy_vllm_indextts_v2.py", "IndexTTSVllmServer.wake_up", namespace)
-        server = SimpleNamespace(moss_server_proc=Mock(), server_proc=Mock())
+        server = SimpleNamespace(server_proc=Mock())
         for size in (24, 48, 96):
             events.clear()
             with self.subTest(size=size), \
@@ -212,7 +210,7 @@ class SnapshotWarmupTests(unittest.IsolatedAsyncioTestCase):
                           return_value=resolve_gpu_profile(gpu(size), {}, modal=True)), \
                     patch("indextts_web.infrastructure.gpu.probe_gpu", return_value=gpu(size)):
                 restore(server)
-                self.assertEqual(events, ["moss", "/internal/snapshot/wake", "ready"])
+                self.assertEqual(events, ["/internal/snapshot/wake", "ready"])
         events.clear()
         with patch("indextts_web.gpu_profiles.runtime_gpu_profile",
                    return_value=resolve_gpu_profile(gpu(96), {}, modal=True)), \
@@ -298,8 +296,6 @@ class SnapshotVolumeTests(unittest.TestCase):
                      "cache_storage": volumes["cache"], "app_storage": volumes["app"],
                      "_configure_persistent_runtime": configure,
                      "_build_webui_command": build_command,
-                     "_start_moss_transcribe_server": Mock(side_effect=start_worker),
-                     "_wait_moss_ready": Mock(),
                      "subprocess": SimpleNamespace(Popen=Mock(side_effect=start_worker)),
                      "_wait_ready": Mock(), "_call_local_json": Mock(side_effect=snapshot_request),
                      "SNAPSHOT_REQUEST_TIMEOUT": 900, "SNAPSHOT_STARTUP_TIMEOUT": 1800}
@@ -318,7 +314,6 @@ class SnapshotVolumeTests(unittest.TestCase):
                 start(SimpleNamespace())
             self.assertIsInstance(error.exception.__cause__, OSError)
             if fail_commit == 1:
-                namespace["_start_moss_transcribe_server"].assert_not_called()
                 namespace["subprocess"].Popen.assert_not_called()
             else:
                 self.assertEqual(namespace["_call_local_json"].call_args.args[0],

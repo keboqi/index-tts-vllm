@@ -167,7 +167,7 @@ cache storage, so snapshot restore does not depend on newly created open Volume
 files. Cache/log copies are persisted before capture and at shutdown. Both
 volumes are committed after the
 download and generation. The deployment now registers three independent web
-endpoints, both with CPU and GPU snapshots enabled:
+endpoints; `tts` and `tts-drama3` have CPU and GPU snapshots enabled:
 
 | Modal class | Endpoint label | Startup/default TTS backend |
 | --- | --- | --- |
@@ -176,8 +176,8 @@ endpoints, both with CPU and GPU snapshots enabled:
 | `Drama3SglangServer` | `tts-drama3` | Drama3 (`drama3`) |
 
 Deploy with `modal deploy deploy_vllm_indextts_v2.py`; Modal prints all URLs.
-The `tts-quick` endpoint snapshots only the WebUI and MOSS service, so it starts
-fastest; each TTS backend loads on its first request.
+The `tts-quick` endpoint takes no snapshot: it starts only the WebUI, and each
+TTS backend loads on its first request.
 Each endpoint performs its own initial setup and inference warmup before
 snapshot capture. Subsequent containers restore that endpoint's ready pipeline.
 The Drama3 snapshot captures its running SGLang GPU workers directly and verifies
@@ -195,7 +195,9 @@ bash sglang_omni_moss_transcribe.sh deploy
 ```
 
 It starts lazily on the first MOSS transcription request. Modal instead uses
-the dedicated [moss_transcribe_server.py](moss_transcribe_server.py) service.
+the dedicated [moss_transcribe_server.py](moss_transcribe_server.py) service,
+which the WebUI also starts on the first transcription (or Models panel wake)
+through `MOSS_TRANSCRIBE_SERVER_PYTHON`; no endpoint starts it at boot.
 
 Install only the optional integrations needed for a manual deployment:
 

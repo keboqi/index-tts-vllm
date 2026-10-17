@@ -105,6 +105,9 @@ MOSS_TRANSCRIBE_MANAGER_SCRIPT = (
     os.getenv("MOSS_TRANSCRIBE_MANAGER_SCRIPT", "sglang_omni_moss_transcribe.sh").strip()
     or "sglang_omni_moss_transcribe.sh"
 )
+# Python of an isolated MOSS environment. When set, the managed backend is the
+# bundled moss_transcribe_server.py, launched on first use (Modal).
+MOSS_TRANSCRIBE_SERVER_PYTHON = os.getenv("MOSS_TRANSCRIBE_SERVER_PYTHON", "").strip()
 MOSS_TRANSCRIBE_START_TIMEOUT = _env_float(
     "MOSS_TRANSCRIBE_START_TIMEOUT",
     3600.0,
@@ -206,6 +209,47 @@ def _resolve_bash() -> Optional[str]:
     return shutil.which(requested)
 
 
+def _server_python() -> Optional[str]:
+    path = MOSS_TRANSCRIBE_SERVER_PYTHON
+    return path if path and os.path.isfile(path) else None
+
+
+def can_launch_moss_server() -> bool:
+    return MOSS_TRANSCRIBE_MANAGE_BACKEND and _server_python() is not None
+
+
+_SERVER_PROCESS: Optional[subprocess.Popen] = None
+
+
+def _start_server_process() -> None:
+    """Launch the bundled MOSS server; its model still loads on first request."""
+    global _SERVER_PROCESS
+    if _SERVER_PROCESS is not None and _SERVER_PROCESS.poll() is None:
+        return
+    parsed_url = urllib.parse.urlparse(MOSS_TRANSCRIBE_SGLANG_URL)
+    cmd = [
+        _server_python(), "-m", "uvicorn", "moss_transcribe_server:app",
+        "--host", parsed_url.hostname or "127.0.0.1", "--port", str(parsed_url.port or 8003),
+    ]
+    print(f"[MOSS] Starting transcription server: {' '.join(cmd)}")
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    _SERVER_PROCESS = subprocess.Popen(cmd, cwd=_SCRIPT_DIR, env=env, stdin=subprocess.DEVNULL)
+
+
+def stop_moss_server(timeout: float = 30.0) -> None:
+    global _SERVER_PROCESS
+    process, _SERVER_PROCESS = _SERVER_PROCESS, None
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def is_moss_transcribe_available() -> bool:
     if MOSS_TRANSCRIBE_BACKEND in {"python", "transformers", "auto"}:
         try:
@@ -221,6 +265,8 @@ def is_moss_transcribe_available() -> bool:
         return True
     if not MOSS_TRANSCRIBE_MANAGE_BACKEND:
         return False
+    if _server_python() is not None:
+        return True
     return _resolve_manager_script() is not None and _resolve_bash() is not None
 
 
@@ -254,6 +300,9 @@ def _managed_backend_env() -> Dict[str, str]:
 
 
 def _start_managed_backend() -> None:
+    if _server_python() is not None:
+        _start_server_process()
+        return
     script_path = _resolve_manager_script()
     if script_path is None:
         raise RuntimeError(
@@ -307,14 +356,23 @@ def _ensure_backend_ready() -> None:
         deadline = time.monotonic() + MOSS_TRANSCRIBE_START_TIMEOUT
         while time.monotonic() < deadline:
             if _check_health(timeout=5.0):
-                print("[MOSS] SGLang-Omni backend is healthy.")
+                print("[MOSS] Transcription backend is healthy.")
                 return
+            if _SERVER_PROCESS is not None and _SERVER_PROCESS.poll() is not None:
+                raise RuntimeError(
+                    f"MOSS transcription server exited with code {_SERVER_PROCESS.returncode}"
+                )
             time.sleep(2.0)
 
     raise RuntimeError(
         "Timed out waiting for the MOSS transcription SGLang backend to become "
         f"healthy at {MOSS_TRANSCRIBE_SGLANG_URL}."
     )
+
+
+def ensure_moss_server() -> None:
+    """Start the MOSS backend if needed and wait until it answers."""
+    _ensure_backend_ready()
 
 
 def _cache_key(

@@ -224,12 +224,20 @@ except ImportError:
 # MOSS-Transcribe-Diarize via SGLang-Omni (optional)
 try:
     from moss_transcribe_pipeline import (
+        can_launch_moss_server,
+        ensure_moss_server,
         is_moss_transcribe_available,
+        stop_moss_server,
         _run_moss_transcribe_pipeline_sync,
     )
 except ImportError:
     def is_moss_transcribe_available() -> bool:
         return False
+    def can_launch_moss_server() -> bool:
+        return False
+    def stop_moss_server() -> None:
+        return None
+    ensure_moss_server = None  # type: ignore[assignment]
     _run_moss_transcribe_pipeline_sync = None  # type: ignore[assignment]
 
 # Configuration
@@ -3717,7 +3725,7 @@ stable_audio3_manager = StableAudio3Manager(STABLE_AUDIO3_CHECKPOINT_DIR)
 # Serializes explicit model teardown with other manager operations.  Individual
 # inference backends retain their own generation locks as well.
 _model_manager_lock = asyncio.Lock()
-moss_model_client = MossModelClient.from_env()
+moss_model_client = MossModelClient.from_env(launcher=ensure_moss_server if can_launch_moss_server() else None)
 
 
 def _cuda_memory_summary() -> Dict[str, Any]:
@@ -4444,7 +4452,8 @@ class ManagedConfuciusBackend:
             return
         if self._keepalive_task is not None and not self._keepalive_task.done():
             return
-        print(f"[Confucius4-TTS] Keepalive enabled every {interval:.0f}s.")
+        # Only a health timer: the backend starts on its first request.
+        print(f"[Confucius4-TTS] Keepalive enabled every {interval:.0f}s (backend not started).")
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
     async def stop_keepalive(self) -> None:
@@ -12658,6 +12667,7 @@ async def lifespan(app: FastAPI):
     await confucius_backend_manager.shutdown()
     await indextts25_backend_manager.shutdown()
     await drama3_backend_manager.shutdown()
+    await _run_blocking(stop_moss_server)
     # Shutdown the thread executor
     CONCURRENCY.shutdown()
 
