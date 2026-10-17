@@ -205,8 +205,11 @@ class QwenRoutingTests(unittest.IsolatedAsyncioTestCase):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
                 continue
             if node.func.attr == "run_commands":
-                commands.extend(eval(compile(ast.Expression(arg), "<image command>", "eval"), vars(deploy))
-                                for arg in node.args)
+                for arg in node.args:
+                    # Starred arguments expand to several commands (e.g. the Drama 3 venv install).
+                    value = eval(compile(ast.Expression(arg.value if isinstance(arg, ast.Starred) else arg),
+                                         "<image command>", "eval"), vars(deploy))
+                    commands.extend(value if isinstance(arg, ast.Starred) else [value])
             if node.func.attr == "env":
                 image_env.update(eval(compile(ast.Expression(node.args[0]), "<image env>", "eval"), vars(deploy)))
         installations = [command for command in commands if "pip install" in command and "qwen-asr==" in command]

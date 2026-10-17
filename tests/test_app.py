@@ -3,7 +3,7 @@ import sys
 import unittest
 from contextlib import asynccontextmanager
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import APIRouter
 from fastapi.testclient import TestClient
@@ -52,6 +52,7 @@ class AppAssemblyTests(unittest.TestCase):
 
     def test_lifespan_health_and_endpoint_metadata_are_preserved(self):
         source = self.source()
+        source.SETTINGS = load_settings(["--startup_tts_backend", "index"], environ={})
 
         @source.app.post("/speak", status_code=202, summary="Generate speech", response_model=dict[str, str])
         async def speak():
@@ -70,7 +71,7 @@ class AppAssemblyTests(unittest.TestCase):
             health = client.get("/health")
             self.assertEqual(health.status_code, 200)
             self.assertTrue(health.json()["ready"])
-            self.assertEqual(set(health.json()["tts_backends"]), {"index", "index25", "confucius"})
+            self.assertEqual(set(health.json()["tts_backends"]), {"index", "index25", "confucius", "drama3"})
         self.assertEqual(source.events, ["startup", "shutdown"])
         operation = app.openapi()["paths"]["/speak"]["post"]
         self.assertEqual(operation["summary"], "Generate speech")
@@ -84,11 +85,33 @@ class AppAssemblyTests(unittest.TestCase):
         routes.add_api_route("/api/unclassified", endpoint, methods=["GET"])
         with self.assertRaisesRegex(RuntimeError, "unclassified"):
             build_routers(routes.routes)
+
         routes = APIRouter()
         routes.add_api_route("/speak", endpoint, methods=["POST"])
         routes.add_api_route("/speak", endpoint, methods=["POST"])
         with self.assertRaisesRegex(RuntimeError, "duplicate.*POST /speak"):
             build_routers(routes.routes)
+
+    def test_default_health_is_ready_without_loading_a_backend(self):
+        source = self.source()
+        source.SETTINGS = load_settings([], environ={})
+        with TestClient(create_app(legacy=source)) as client:
+            response = client.get("/health")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["startup_tts_backend"], "none")
+            self.assertFalse(source.tts_manager.is_ready())
+
+    def test_drama_health_uses_selected_pipeline_without_index_initialization(self):
+        source = self.source()
+        source.SETTINGS = load_settings(["--startup_tts_backend", "drama3"], environ={})
+        source.drama3_backend_manager = SimpleNamespace(status=AsyncMock(return_value={"ready": True}))
+        with TestClient(create_app(legacy=source)) as client:
+            response = client.get("/health")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["startup_tts_backend"], "drama3")
+            self.assertFalse(source.tts_manager.is_ready())
+            source.drama3_backend_manager.status.return_value = {"ready": False}
+            self.assertEqual(client.get("/health").status_code, 503)
 
     def test_public_launcher_exports_and_invokes_application_entrypoint(self):
         entrypoint = ModuleType("indextts_web.main")

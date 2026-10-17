@@ -94,8 +94,15 @@ class SpeakerPresetManager:
             return False
             
         if self.tts_model is None:
-            self.logger.error("TTS model not provided")
-            return False
+            # External TTS backends consume durable reference audio directly.
+            self.presets[preset_name] = {
+                'audio_path': audio_path, 'audio_hash': self._get_audio_hash(audio_path),
+                'description': description, 'cache_file': str(self._get_cache_path(preset_name)),
+                'created_at': time.time(), 'last_used': time.time(), 'reference_only': True,
+            }
+            self._memory_cache.pop(preset_name, None)
+            self._save_presets()
+            return True
             
         try:
             self.logger.info(f"Processing speaker preset: {preset_name}")
@@ -106,7 +113,8 @@ class SpeakerPresetManager:
             
             # Check if preset already exists and hasn't changed
             if preset_name in self.presets:
-                if self.presets[preset_name].get('audio_hash') == audio_hash:
+                if (self.presets[preset_name].get('audio_hash') == audio_hash
+                        and not self.presets[preset_name].get('reference_only')):
                     self.logger.info(f"Preset {preset_name} already exists and unchanged")
                     # Ensure it's loaded in memory cache
                     if preset_name not in self._memory_cache:
@@ -260,6 +268,13 @@ class SpeakerPresetManager:
             self.logger.warning(f"Speaker preset '{preset_name}' not found")
             return None
         
+        if self.presets[preset_name].get('reference_only'):
+            if self.tts_model is None:
+                return None
+            preset = self.presets[preset_name]
+            if not self.add_speaker_preset(preset_name, preset['audio_path'], preset.get('description', '')):
+                return None
+
         # Check memory cache first (fast path)
         if preset_name in self._memory_cache:
             # Update last used time (lightweight operation)

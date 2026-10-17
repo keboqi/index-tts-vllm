@@ -102,7 +102,7 @@ you deliberately assign its default port to the WebUI.
 
 ## Optional backends and features
 
-The default TTS backend is `index` (IndexTTS 2.0). Select `index25` or
+The default TTS backend is `index` (IndexTTS 2.0). Select `drama3`, `index25` or
 `confucius` in the UI, per API request, or with `--tts_backend`.
 
 | Backend | Checkout / environment | Local API | Behavior |
@@ -110,6 +110,7 @@ The default TTS backend is `index` (IndexTTS 2.0). Select `index25` or
 | IndexTTS 2.0 | This repository's model environment | Main WebUI | Emotion text/audio, duration controls, chunk streaming |
 | IndexTTS 2.5 | `../index-tts-2.5-vllm-omni-experiment`; isolated Python 3.11 environment | `127.0.0.1:8092` | Lazy provisioning/startup; Chinese, English, Japanese, Spanish, Arabic |
 | Confucius4-TTS | `../Confucius4-TTS`; managed sibling launcher | `127.0.0.1:8001` | Lazy startup; multilingual synthesis; IndexTTS emotion text controls ignored |
+| Drama 3 | Isolated SGLang-Omni Python 3.12 environment | `127.0.0.1:8096` | Text-described emotion, reference voices, sleep/wake; target durations automatically use FFmpeg |
 
 Set `--indextts25_repo_dir` / `--confucius_repo_dir` for custom checkout
 locations. Each backend also supports `--*_start_command`, `--*_start_timeout`,
@@ -117,6 +118,70 @@ and `--*_request_timeout` for custom service setup. External synthesis streams
 emit keepalives during startup; IndexTTS 2.5 returns completed audio because
 its model is non-streaming. Managed backend switching sleeps/stops competing
 TTS engines; it does not release every auxiliary model's GPU allocations.
+
+Drama 3 uses the pinned `fishaudio/drama-3` checkpoint and SGLang-Omni runtime
+adapted from `minimax_h3`. Select **Drama 3 (SGLang-Omni)** in either synthesis
+or translation, or send `"tts_backend": "drama3"` in an API request. The
+`emotion_text` description is prepended to every inference chunk as
+`[description] spoken text`. Emotion weight/audio and per-request seed are
+not supported. Reference audio comes from uploaded clips or speaker presets;
+the cloning API also accepts an optional `reference_text` transcript.
+
+Drama 3 has no native duration control. Every positive `speech_length` target
+automatically uses FFmpeg after synthesis, even with `duration_control: "original"`.
+Streaming endpoints send keepalives while generating and then deliver the
+completed audio. Long text is split using the existing sentence limit, with
+the emotion prefix applied to each chunk.
+
+For a manual Linux GPU installation, install `uv` in the WebUI environment
+and launch with `python fastapi_webui_v2.py --tts_backend drama3`. First use
+prepares `.venv-drama3` and downloads the pinned checkpoint (about 44 GB).
+The default engine/codec budgets target a 96 GB GPU; smaller GPUs require
+appropriate memory settings and enough space for the model itself.
+Use `--drama3_venv`, `--drama3_model_dir` (model storage root),
+`--drama3_data_dir`, `--drama3_engine_memory`, `--drama3_codec_memory`,
+`--drama3_max_parallel_segments`, and `--drama3_port` to override defaults.
+Corresponding `DRAMA3_*` environment variables are listed in `.env.example`.
+
+The model manager sleeps/wakes `drama3_sglang`, and switching to other TTS
+engines releases Drama 3's GPU allocations. CUDA checkpoint sleep requires
+Linux x86_64, NVIDIA driver 610+ and sufficient host RAM; unsupported or failed
+transitions fall back to stopping/restarting the isolated server. Set
+`DRAMA3_SLEEP=off` to always use stop/restart.
+
+By default (`--startup_tts_backend none`) the server starts without loading any
+TTS backend; each backend, including IndexTTS2, loads on demand the first time
+it is used. Use `--startup_tts_backend index` or `--startup_tts_backend drama3`
+to load a pipeline before readiness instead. `STARTUP_TTS_BACKEND` provides the
+same setting through the environment. A startup selection also becomes the
+default inference/UI backend unless `--tts_backend` explicitly selects a
+different default; with `none`, the default inference backend is `index`.
+Reference speaker presets work without loading IndexTTS2 embeddings.
+
+`deploy_vllm_indextts_v2.py` bakes the isolated Drama 3 environment into the
+Modal image. Weights download lazily under `/persistent_app/checkpoints/drama3`,
+while reusable compiler caches and copied diagnostics use
+`/persistent_cache/drama3-serving`. The Drama3 snapshot endpoint runs its live
+logs, references and kernels under `/tmp/drama3-serving`, seeded from persistent
+cache storage, so snapshot restore does not depend on newly created open Volume
+files. Cache/log copies are persisted before capture and at shutdown. Both
+volumes are committed after the
+download and generation. The deployment now registers two independent web
+endpoints, both with CPU and GPU snapshots enabled:
+
+| Modal class | Endpoint label | Startup/default TTS backend |
+| --- | --- | --- |
+| `IndexTTSVllmServer` | `tts` | IndexTTS2 (`index`) |
+| `Drama3SglangServer` | `tts-drama3` | Drama3 (`drama3`) |
+
+Deploy with `modal deploy deploy_vllm_indextts_v2.py`; Modal prints both URLs.
+Each endpoint performs its own initial setup and inference warmup before
+snapshot capture. Subsequent containers restore that endpoint's ready pipeline.
+The Drama3 snapshot captures its running SGLang GPU workers directly and verifies
+readiness on restore, without repeating model loading or warmup. NVIDIA driver
+checkpoint jobs are disabled during this Modal capture to avoid nesting two
+checkpoint mechanisms. Its first manual sleep after restore uses stop/restart;
+later ordinary launches can use driver sleep/wake when supported.
 
 The translation workflow supports MOSS Transcribe+Diarize (default), Gemini,
 WhisperX, Qwen3-ASR + OmniVAD, and NVIDIA Parakeet. The local MOSS Docker manager

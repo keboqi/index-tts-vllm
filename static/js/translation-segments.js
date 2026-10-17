@@ -181,14 +181,14 @@ function toggleSegmentExpand(card) {
                 if (hasCustomBackingSelection()) {
                     const file = translateCustomBackingInput.files[0];
                     translateCustomBackingSummary.textContent = `Selected: ${file ? file.name : ''}`;
-                    translateCustomBackingSummary.style.color = '#0a7c4a';
+                    translateCustomBackingSummary.style.color = 'var(--success)';
                 } else if (translateBackingAvailableFromSession) {
                     translateCustomBackingSummary.textContent = 'Using stored backing track from current session.';
-                    translateCustomBackingSummary.style.color = '#0a7c4a';
+                    translateCustomBackingSummary.style.color = 'var(--success)';
                 } else {
                     translateCustomBackingSummary.textContent =
                         'No custom backing selected. Upload audio here to override the extracted instrumental when mix-back is enabled.';
-                    translateCustomBackingSummary.style.color = '#666';
+                    translateCustomBackingSummary.style.color = 'var(--text-muted)';
                 }
             }
             updateAdditionalSettingsSummary();
@@ -943,7 +943,7 @@ function toggleSegmentExpand(card) {
                 if (segmentPayload.type !== 'speech') {
                     if (statusEl) {
                         statusEl.textContent = 'Only speech segments can be previewed.';
-                        statusEl.style.color = '#d93025';
+                        statusEl.style.color = 'var(--danger)';
                     }
                     return;
                 }
@@ -972,7 +972,7 @@ function toggleSegmentExpand(card) {
                 }
                 if (statusEl) {
                     statusEl.textContent = 'Generating preview...';
-                    statusEl.style.color = '#666';
+                    statusEl.style.color = 'var(--text-muted)';
                 }
                 const response = await fetch(ENDPOINTS.TRANSLATE_SEGMENT_PREVIEW, {
                     method: 'POST',
@@ -991,7 +991,7 @@ function toggleSegmentExpand(card) {
                     }
                     if (statusEl) {
                         statusEl.textContent = errorMessage;
-                        statusEl.style.color = '#d93025';
+                        statusEl.style.color = 'var(--danger)';
                     }
                     showStatus(errorMessage, 'error', 'translateSegmentsStatus');
                     return;
@@ -1001,7 +1001,7 @@ function toggleSegmentExpand(card) {
                     const message = 'Preview failed: missing audio.';
                     if (statusEl) {
                         statusEl.textContent = message;
-                        statusEl.style.color = '#d93025';
+                        statusEl.style.color = 'var(--danger)';
                     }
                     showStatus(message, 'error', 'translateSegmentsStatus');
                     return;
@@ -1028,7 +1028,7 @@ function toggleSegmentExpand(card) {
                 const message = error && error.message ? error.message : 'Preview failed.';
                 if (statusEl) {
                     statusEl.textContent = message;
-                    statusEl.style.color = '#d93025';
+                    statusEl.style.color = 'var(--danger)';
                 }
                 showStatus(message, 'error', 'translateSegmentsStatus');
             } finally {

@@ -113,7 +113,7 @@ async function loadSpeakers() {
                         const previewUrl = info.preview_url;
                         const previewSection = previewUrl
                             ? `<audio controls preload="none" src="${previewUrl.replace(/"/g, '&quot;')}"></audio>`
-                            : `<small style="color: #888;">No preview available</small>`;
+                            : `<small class="muted">No preview available</small>`;
 
                         html += `
                                 <div class="speaker-item">
@@ -220,7 +220,7 @@ async function loadSpeakers() {
         function showVoiceDesignStatus(message, type = 'info') {
             const statusDiv = document.getElementById('voiceDesignStatus');
             statusDiv.textContent = message;
-            statusDiv.style.color = type === 'error' ? '#ef4444' : type === 'success' ? '#10b981' : 'var(--text-secondary)';
+            statusDiv.style.color = type === 'error' ? 'var(--danger)' : type === 'success' ? 'var(--success)' : 'var(--text-secondary)';
         }
 
         async function generateVoiceDesign() {
@@ -284,7 +284,7 @@ async function loadSpeakers() {
                         saveBtn.disabled = false;
                         showVoiceDesignStatus('✅ Voice generated successfully! You can save it to Speaker Presets.', 'success');
                     } else {
-                        saveStatusDiv.innerHTML = '<span style="color: #f59e0b;">⚠️ IndexTTS is still initializing. Preset saving will be available shortly.</span>';
+                        saveStatusDiv.innerHTML = '<span class="text-warning">⚠️ IndexTTS is still initializing. Preset saving will be available shortly.</span>';
                         saveBtn.disabled = true;
                         showVoiceDesignStatus('✅ Voice generated successfully! Preset saving will be available once IndexTTS is ready.', 'success');
                     }
@@ -308,14 +308,14 @@ async function loadSpeakers() {
             const saveStatusDiv = document.getElementById('voiceDesignSaveStatus');
 
             if (!presetName) {
-                saveStatusDiv.innerHTML = '<span style="color: #ef4444;">Please enter a preset name.</span>';
+                saveStatusDiv.innerHTML = '<span class="text-danger">Please enter a preset name.</span>';
                 return;
             }
 
             // Show loading state
             saveBtn.disabled = true;
             saveBtn.innerHTML = '⏳ Saving...';
-            saveStatusDiv.innerHTML = '<span style="color: var(--text-secondary);">Saving to Speaker Presets...</span>';
+            saveStatusDiv.innerHTML = '<span class="text-secondary">Saving to Speaker Presets...</span>';
 
             try {
                 const response = await fetch(ENDPOINTS.DESIGN_VOICE_SAVE_PRESET, {
@@ -329,17 +329,17 @@ async function loadSpeakers() {
                 const result = await response.json();
 
                 if (response.ok && result.success) {
-                    saveStatusDiv.innerHTML = `<span style="color: #10b981;">✅ Saved as "${presetName}" in Speaker Presets!</span>`;
+                    saveStatusDiv.innerHTML = `<span class="text-success">✅ Saved as "${presetName}" in Speaker Presets!</span>`;
                     // Refresh speaker list
                     loadSpeakerList();
                     loadSpeakers();
                 } else {
                     const errorMsg = result.detail || result.error || 'Failed to save preset';
-                    saveStatusDiv.innerHTML = `<span style="color: #ef4444;">❌ ${errorMsg}</span>`;
+                    saveStatusDiv.innerHTML = `<span class="text-danger">❌ ${errorMsg}</span>`;
                 }
             } catch (error) {
                 console.error('Save preset error:', error);
-                saveStatusDiv.innerHTML = `<span style="color: #ef4444;">❌ Error: ${error.message}</span>`;
+                saveStatusDiv.innerHTML = `<span class="text-danger">❌ Error: ${error.message}</span>`;
             } finally {
                 saveBtn.disabled = false;
                 saveBtn.innerHTML = '💾 Save Preset';

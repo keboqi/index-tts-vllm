@@ -101,11 +101,13 @@
                 ['Chinese', 'Chinese'],
             ]),
             index25: INDEXTTS25_DESTINATION_LANGUAGES,
+            drama3: MULTILINGUAL_TTS_DESTINATION_LANGUAGES,
             confucius: MULTILINGUAL_TTS_DESTINATION_LANGUAGES,
         });
         const DEFAULT_TRANSLATE_DESTINATION_BY_BACKEND = Object.freeze({
             index: 'Chinese',
             index25: 'Chinese',
+            drama3: 'Chinese',
             confucius: 'Chinese',
         });
 
@@ -1139,7 +1141,7 @@
                     if (isSelected) {
                         cardClasses.push('selected');
                     }
-                    const borderStyle = isSelected ? 'border: 2px solid #6370ff; box-shadow: 0 0 0 2px rgba(99,112,255,0.2);' : '';
+                    const borderStyle = isSelected ? 'border: 2px solid var(--accent); box-shadow: 0 0 0 2px var(--accent-ring);' : '';
                     const vocalsUrl = chunk.vocals_url
                         ? `${chunk.vocals_url}?session=${chunk.session_id}&t=${cacheBuster}`
                         : '';
@@ -1163,8 +1165,8 @@
                         audioRowHtml += `</div>`;
                     }
                     const statusBadge = chunk.generated
-                        ? '<span style="background: rgba(16, 185, 129, 0.18); color: var(--brand-emerald); padding: 2px 8px; border-radius: 12px; font-size: 0.8em;">Generated</span>'
-                        : '<span style="background: rgba(251, 191, 36, 0.25); color: #9b6f00; padding: 2px 8px; border-radius: 12px; font-size: 0.8em;">Pending</span>';
+                        ? '<span class="badge-status is-done">Generated</span>'
+                        : '<span class="badge-status is-pending">Pending</span>';
                     return `
                             <div class="${cardClasses.join(' ')}" data-session-id="${chunk.session_id}" style="${borderStyle}padding:10px;">
                                 <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">

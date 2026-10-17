@@ -113,7 +113,7 @@ const CHUNK_SPLIT_MIN_SILENCE_MS = Number(document.querySelector('meta[name="chu
             const gpu = data.gpu || {};
             if (gpu.available) {
                 const pct = gpu.total_mb ? Math.round(gpu.used_mb / gpu.total_mb * 100) : 0;
-                gpuEl.innerHTML = `<strong>GPU Memory: ${pct}% used</strong><br><span style="color: var(--text-secondary)">${Number(gpu.used_mb).toLocaleString()} MiB used / ${Number(gpu.total_mb).toLocaleString()} MiB total · ${Number(gpu.free_mb).toLocaleString()} MiB free</span>`;
+                gpuEl.innerHTML = `<strong>GPU Memory: ${pct}% used</strong><br><span class="text-secondary">${Number(gpu.used_mb).toLocaleString()} MiB used / ${Number(gpu.total_mb).toLocaleString()} MiB total · ${Number(gpu.free_mb).toLocaleString()} MiB free</span>`;
             } else {
                 gpuEl.textContent = 'CUDA GPU memory information is unavailable.';
             }
@@ -123,13 +123,13 @@ const CHUNK_SPLIT_MIN_SILENCE_MS = Number(document.querySelector('meta[name="chu
                     : (model.state === 'sleeping' ? ['wake'] : ['unload']);
                 const buttons = actions.filter(action => ['sleep', 'wake', 'unload'].includes(action)).map(action => {
                     const label = action === 'wake' ? (model.state === 'unloaded' ? 'Load' : 'Wake')
-                        : action === 'sleep' || (action === 'unload' && (model.key.endsWith('_vllm') || model.key === 'indextts25_omni')) ? 'Sleep' : 'Unload';
+                        : action === 'sleep' || (action === 'unload' && (model.key.endsWith('_vllm') || model.key === 'indextts25_omni' || model.key === 'drama3_sglang')) ? 'Sleep' : 'Unload';
                     return `<button type="button" class="btn ${action === 'unload' ? 'btn-danger' : 'btn-secondary'}" data-action="models-${action}" data-model-key="${escapeHtml(model.key)}" ${model.busy ? 'disabled' : ''}>${label}</button>`;
                 }).join('');
                 return `
-                    <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px; border:1px solid var(--border); border-radius:10px; background:var(--surface-muted);">
-                        <div><strong>${escapeHtml(model.name)}</strong><br><small style="color:var(--text-secondary)">${escapeHtml(model.kind || 'Optional model')} · ${escapeHtml(model.state || 'loaded')}${model.busy ? ' · busy' : ''}${model.error ? ` · ${escapeHtml(model.error)}` : ''}</small></div>
-                        <div style="display:flex; gap:8px;">${buttons}</div>
+                    <div class="list-row">
+                        <div><strong>${escapeHtml(model.name)}</strong><br><small>${escapeHtml(model.kind || 'Optional model')} · ${escapeHtml(model.state || 'loaded')}${model.busy ? ' · busy' : ''}${model.error ? ` · ${escapeHtml(model.error)}` : ''}</small></div>
+                        <div class="btn-group">${buttons}</div>
                     </div>`;
             });
             listEl.innerHTML = rows.join('');
@@ -236,17 +236,10 @@ const CHUNK_SPLIT_MIN_SILENCE_MS = Number(document.querySelector('meta[name="chu
                 return;
             }
 
-            // Bind tabs directly so their behavior does not depend on the
-            // dimensions or hit-testing of the full-width app container.
-            root.querySelectorAll('.hero-card[data-tab]').forEach((tabCard) => {
-                tabCard.addEventListener('click', () => {
-                    switchTab(tabCard.dataset.tab);
-                });
-                tabCard.addEventListener('keydown', (e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        switchTab(tabCard.dataset.tab);
-                    }
+            // Nav items are <button>s, so click also covers Enter/Space.
+            root.querySelectorAll('.nav-item[data-tab]').forEach((navItem) => {
+                navItem.addEventListener('click', () => {
+                    switchTab(navItem.dataset.tab);
                 });
             });
 
@@ -339,27 +332,26 @@ const CHUNK_SPLIT_MIN_SILENCE_MS = Number(document.querySelector('meta[name="chu
 
         function switchTab(evtOrName, maybeTabName) {
             const tabName = typeof evtOrName === 'string' ? evtOrName : maybeTabName;
-            const trigger = (evtOrName && evtOrName.currentTarget) ? evtOrName.currentTarget : null;
 
             document.querySelectorAll('.tab-content').forEach(content => {
                 content.classList.remove('active');
             });
 
-            document.querySelectorAll('.hero-card[data-tab]').forEach(card => {
-                card.classList.remove('active');
+            document.querySelectorAll('.nav-item[data-tab]').forEach(item => {
+                const isActive = item.dataset.tab === tabName;
+                item.classList.toggle('active', isActive);
+                item.setAttribute('aria-selected', isActive ? 'true' : 'false');
+                if (isActive && typeof item.scrollIntoView === 'function') {
+                    // Keeps the active item visible in the horizontally scrolling mobile nav.
+                    item.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+                }
             });
 
             const content = document.getElementById(tabName);
             if (content) {
                 content.classList.add('active');
-            }
-
-            if (trigger) {
-                trigger.classList.add('active');
-            } else {
-                const heroForTab = document.querySelector(`.hero-card[data-tab="${tabName}"]`);
-                if (heroForTab) {
-                    heroForTab.classList.add('active');
+                if (typeof history !== 'undefined' && history.replaceState && location.hash !== `#${tabName}`) {
+                    history.replaceState(null, '', `#${tabName}`);
                 }
             }
 
@@ -378,8 +370,19 @@ const CHUNK_SPLIT_MIN_SILENCE_MS = Number(document.querySelector('meta[name="chu
                 loadModelManager();
             }
 
-            if (content && window.matchMedia('(max-width: 1024px)').matches) {
-                content.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            if (content && typeof window.scrollTo === 'function') {
+                window.scrollTo({ top: 0 });
+            }
+        }
+
+        function restoreTabFromHash() {
+            if (typeof location === 'undefined') {
+                return;
+            }
+            const tabName = decodeURIComponent((location.hash || '').slice(1));
+            const content = tabName ? document.getElementById(tabName) : null;
+            if (content && content.classList && content.classList.contains('tab-content')) {
+                switchTab(tabName);
             }
         }
 

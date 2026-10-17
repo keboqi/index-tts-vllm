@@ -21,6 +21,7 @@ class IndexWakeTests(unittest.IsolatedAsyncioTestCase):
             "GpuWakeError": GpuWakeError, "GPU_COORDINATOR": GpuWorkCoordinator(enabled=True),
             "GPU_PROFILE": SimpleNamespace(index=SimpleNamespace(gpu_memory_utilization=0.25),
                                            emotion=SimpleNamespace(gpu_memory_utilization=0.125)),
+            "drama3_backend_manager": SimpleNamespace(sleep_vllm=AsyncMock(), process_running=lambda: False),
             "indextts25_backend_manager": SimpleNamespace(process_running=lambda: False),
             "confucius_backend_manager": SimpleNamespace(_process_running=lambda: False),
             "_release_translation_gpu_models": AsyncMock(), "_release_cuda_cache": Mock(),
@@ -55,6 +56,21 @@ class IndexWakeTests(unittest.IsolatedAsyncioTestCase):
         self.manager.tts.wake_emotion_vllm.side_effect = lambda: events.append("emotion")
         await self.manager.ensure_awake()
         self.assertEqual(events, ["reclaim", "gpt", "emotion"])
+
+    async def test_index_initializes_lazily_after_external_backend_startup(self):
+        self.manager._initialized = False
+        self.manager._indextts_vllm_sleeping = False
+        self.manager._emotion_vllm_sleeping = False
+
+        async def initialize():
+            self.manager._initialized = True
+            return True
+
+        self.manager.initialize = AsyncMock(side_effect=initialize)
+        await self.manager.ensure_awake()
+        self.manager.initialize.assert_awaited_once()
+        self.ns["drama3_backend_manager"].sleep_vllm.assert_awaited_once()
+        self.assertTrue(self.manager.is_ready())
 
     async def test_failed_emotion_wake_preserves_state_and_retry_does_not_remap_gpt(self):
         self.manager.tts.wake_emotion_vllm.side_effect = RuntimeError("out of memory")
@@ -192,7 +208,8 @@ class HyMtLifecycleTests(unittest.TestCase):
         ns = {"Dict": dict, "Any": Any, "List": list, "sys": SimpleNamespace(modules={"whisperx_pipeline": translator}),
               "tts_manager": SimpleNamespace(is_ready=lambda: False),
               "confucius_backend_manager": SimpleNamespace(_process_running=lambda: False),
-              "indextts25_backend_manager": SimpleNamespace(process_running=lambda: False),
+              "drama3_backend_manager": SimpleNamespace(sleep_vllm=AsyncMock(), process_running=lambda: False),
+            "indextts25_backend_manager": SimpleNamespace(process_running=lambda: False),
               "stable_audio3_manager": SimpleNamespace(status=lambda: {}, unload=lambda _: []),
               "_voice_design_manager": None, "_enhancement_model": None, "_super_res_model": None,
               "_audio_separator": None, "_audio_separator_runtime_lock": threading.RLock(),

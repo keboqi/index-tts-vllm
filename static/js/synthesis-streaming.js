@@ -59,16 +59,19 @@ async function handleRegularRequest(text, speaker, emotionText, emotionWeight, d
                 const audioUrl = URL.createObjectURL(blob);
 
                 document.getElementById('audioResult').innerHTML = `
-                            <h3>🎵 Generated Speech (${duration}s)</h3>
-                        <audio controls autoplay preload="none" style="width: 100%; margin: 10px 0;">
-                                <source src="${audioUrl}" type="audio/mpeg">
-                            </audio>
-                            <br>
-                            <a href="${audioUrl}" download="speech.mp3" class="btn">💾 Download</a>
+                            <div class="result-card">
+                                <h4>🎵 Generated Speech (${duration}s)</h4>
+                                <audio controls autoplay preload="none">
+                                    <source src="${audioUrl}" type="audio/mpeg">
+                                </audio>
+                                <div class="btn-group mt-2">
+                                    <a href="${audioUrl}" download="speech.mp3" class="btn btn-secondary btn-sm">💾 Download</a>
+                                </div>
+                            </div>
                         `;
                 // Show enhanced status message with emotion info
                 let statusMessage = `Speech generated in ${duration}s! 🚀`;
-                if ((ttsBackend === 'index' || ttsBackend === 'index25') && emotionText && emotionText.trim()) {
+                if ((ttsBackend === 'index' || ttsBackend === 'index25' || ttsBackend === 'drama3') && emotionText && emotionText.trim()) {
                     statusMessage += ` 😊 Emotion: "${emotionText}" (${emotionWeight})`;
                 }
                 statusMessage += formatSpeakerEffectsStatus(speakerEffects);
@@ -218,9 +221,9 @@ async function handleRegularRequest(text, speaker, emotionText, emotionWeight, d
                             showStatus(message, 'info');
                             if (firstChunkTime === null) {
                                 document.getElementById('audioResult').innerHTML = `
-                                    <div style="background: rgba(30, 41, 59, 0.55); padding: 16px; border-radius: 10px; margin: 10px 0; border: 1px solid var(--border);">
-                                        <h3 style="margin: 0 0 8px 0;">External backend warming up...</h3>
-                                        <div style="color: var(--text-muted);">${message}</div>
+                                    <div class="result-card">
+                                        <h4><span class="loading"></span>External backend warming up...</h4>
+                                        <div class="muted">${message}</div>
                                     </div>
                                 `;
                             }
@@ -258,19 +261,19 @@ async function handleRegularRequest(text, speaker, emotionText, emotionWeight, d
 
                             // Show real-time performance indicator
                             document.getElementById('audioResult').innerHTML = `
-                                <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 15px; color: white; margin: 10px 0;">
-                                    <h3 style="margin: 0; display: flex; align-items: center; gap: 10px;">
+                                <div class="result-card is-accent">
+                                    <h4>
                                         <span class="loading"></span>
                                         Streaming in progress...
-                                    </h3>
-                                    <div style="margin-top: 15px; background: rgba(255,255,255,0.2); padding: 15px; border-radius: 10px;">
-                                        <div style="font-size: 1.2em; margin-bottom: 5px;">
+                                    </h4>
+                                    <div class="result-inset">
+                                        <div class="text-secondary">
                                             ⚡ First Chunk Generated
                                         </div>
-                                        <div style="font-size: 2em; font-weight: bold;">
+                                        <div class="metric-big">
                                             ${ttfb}s
                                         </div>
-                                        <div style="font-size: 0.9em; opacity: 0.9; margin-top: 5px;">
+                                        <div class="text-sm muted mt-1">
                                             🎵 Audio playing • Receiving chunk ${chunkCount}/${chunkCount}...
                                         </div>
                                     </div>
@@ -282,19 +285,19 @@ async function handleRegularRequest(text, speaker, emotionText, emotionWeight, d
                             if (currentDisplay.includes('Streaming in progress')) {
                                 const ttfb = ((firstChunkTime - startTime) / 1000).toFixed(2);
                                 document.getElementById('audioResult').innerHTML = `
-                                    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 15px; color: white; margin: 10px 0;">
-                                        <h3 style="margin: 0; display: flex; align-items: center; gap: 10px;">
+                                    <div class="result-card is-accent">
+                                        <h4>
                                             <span class="loading"></span>
                                             Streaming in progress...
-                                        </h3>
-                                        <div style="margin-top: 15px; background: rgba(255,255,255,0.2); padding: 15px; border-radius: 10px;">
-                                            <div style="font-size: 1.2em; margin-bottom: 5px;">
+                                        </h4>
+                                        <div class="result-inset">
+                                            <div class="text-secondary">
                                                 ⚡ First Chunk Generated
                                             </div>
-                                            <div style="font-size: 2em; font-weight: bold;">
+                                            <div class="metric-big">
                                                 ${ttfb}s
                                             </div>
-                                            <div style="font-size: 0.9em; opacity: 0.9; margin-top: 5px;">
+                                            <div class="text-sm muted mt-1">
                                                 🎵 Audio playing • Received ${chunkCount} chunks...
                                             </div>
                                         </div>
@@ -345,33 +348,31 @@ async function handleRegularRequest(text, speaker, emotionText, emotionWeight, d
                             const firstChunkPercent = ((firstChunkDuration / totalGenTime) * 100).toFixed(0);
 
                             document.getElementById('audioResult').innerHTML = `
-                                <h3>🎵 Streamed Speech (${chunkCount} chunks)</h3>
-                                <audio controls src="${audioUrl}" style="width: 100%; margin: 10px 0;"></audio>
-                                <br>
-                                <div style="background: rgba(30, 41, 59, 0.5); padding: 15px; border-radius: 10px; margin: 10px 0; border: 1px solid var(--border);">
-                                    <h4 style="margin-top: 0;">⚡ Performance Metrics</h4>
-                                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px;">
-                                        <div style="background: white; padding: 10px; border-radius: 5px; border-left: 4px solid #667eea;">
-                                            <strong style="color: #667eea;">⏱️ First Chunk:</strong><br>
-                                            <span style="font-size: 1.5em; font-weight: bold;">${firstChunkDuration}s</span>
+                                <div class="result-card">
+                                    <h4>🎵 Streamed Speech (${chunkCount} chunks)</h4>
+                                    <audio controls src="${audioUrl}"></audio>
+                                    <div class="metric-grid">
+                                        <div class="metric">
+                                            <strong>⏱️ First chunk</strong><br>
+                                            <span class="metric-big">${firstChunkDuration}s</span>
                                         </div>
-                                        <div style="background: white; padding: 10px; border-radius: 5px; border-left: 4px solid #764ba2;">
-                                            <strong style="color: #764ba2;">🕐 Total Time:</strong><br>
-                                            <span style="font-size: 1.5em; font-weight: bold;">${totalGenTime}s</span>
+                                        <div class="metric is-violet">
+                                            <strong>🕐 Total time</strong><br>
+                                            <span class="metric-big">${totalGenTime}s</span>
                                         </div>
                                     </div>
-                                    <div style="background: white; padding: 10px; border-radius: 5px;">
-                                        <strong>📊 First Chunk Speed:</strong> ${firstChunkPercent}% of total time<br>
-                                        <div style="background: rgba(51, 65, 85, 0.5); height: 10px; border-radius: 5px; margin-top: 5px; overflow: hidden;">
-                                            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); height: 100%; width: ${firstChunkPercent}%;"></div>
-                                        </div>
+                                    <div class="text-sm text-secondary">
+                                        <strong>📊 First chunk speed:</strong> ${firstChunkPercent}% of total time
+                                        <div class="meter"><span style="width: ${firstChunkPercent}%;"></span></div>
+                                    </div>
+                                    <div class="btn-group mt-2">
+                                        <a href="${audioUrl}" download="speech.mp3" class="btn btn-secondary btn-sm">💾 Download</a>
                                     </div>
                                 </div>
-                                <a href="${audioUrl}" download="speech.mp3" class="btn">💾 Download</a>
                             `;
 
                             let statusMessage = `✅ Streaming complete! First chunk: ${firstChunkDuration}s, Total: ${totalGenTime}s (${chunkCount} chunks)`;
-                            if ((ttsBackend === 'index' || ttsBackend === 'index25') && emotionText && emotionText.trim()) {
+                            if ((ttsBackend === 'index' || ttsBackend === 'index25' || ttsBackend === 'drama3') && emotionText && emotionText.trim()) {
                                 statusMessage += ` 😊 Emotion: "${emotionText}" (${emotionWeight})`;
                             }
                             statusMessage += formatSpeakerEffectsStatus(speakerEffects);

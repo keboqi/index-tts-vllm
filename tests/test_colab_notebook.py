@@ -559,8 +559,10 @@ class ColabWarmupTests(unittest.TestCase):
         cls.model_call = next(node for node in ast.walk(production) if isinstance(node, ast.Assign)
                               and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
                               and node.value.func.id == "IndexTTS2")
-        lifespan = next(node for node in production.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "lifespan")
-        warmup = next(node for node in lifespan.body if isinstance(node, ast.If)
+        startup = ast.parse((root / "indextts_web/services/tts/startup.py").read_text(encoding="utf-8"))
+        initialize = next(node for node in startup.body
+                          if isinstance(node, ast.AsyncFunctionDef) and node.name == "initialize_backend")
+        warmup = next(node for node in ast.walk(initialize) if isinstance(node, ast.If)
                       and isinstance(node.test, ast.Attribute) and node.test.attr == "use_torch_compile")
         runner = ast.parse("async def run_warmup():\n    pass\n").body[0]
         runner.body = [warmup]
@@ -598,7 +600,7 @@ class ColabWarmupTests(unittest.TestCase):
                 engine = SimpleNamespace(gpu_profile=profile, s2mel=SimpleNamespace(enable_torch_compile=compiler))
                 exec(self.compile_code, {"self": engine, "use_torch_compile": factory.call_args.kwargs["use_torch_compile"]})
                 warmup = AsyncMock()
-                scope = {"SETTINGS": settings, "warmup_model": warmup}
+                scope = {"legacy": SimpleNamespace(SETTINGS=settings, warmup_model=warmup)}
                 exec(self.warmup_code, scope)
                 # AsyncMock completes immediately; no Windows event-loop sockets are needed.
                 with self.assertRaises(StopIteration):

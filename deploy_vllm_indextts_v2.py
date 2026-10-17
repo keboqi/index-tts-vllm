@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import List, Dict, Optional
 
 # The image supports Ada (L4/L40S) and RTX PRO 6000 Blackwell.
@@ -42,6 +42,8 @@ INDEXTTS25_REPO_REF = "0a7d9aaeb9a0516c124669966aeed907e29b811d"
 INDEXTTS25_IMAGE_DIR = "/app/index-tts-2.5-vllm-omni-experiment"
 INDEXTTS25_APP_SUBDIR = "index-tts-2.5-vllm-omni-experiment"
 INDEXTTS25_VENV_DIR = "/opt/indextts25-venv"
+DRAMA3_VENV_DIR = "/opt/drama3-sglang-venv"
+DRAMA3_SNAPSHOT_DATA_DIR = "/tmp/drama3-serving"
 INDEXTTS25_PYTHON = f"{INDEXTTS25_VENV_DIR}/bin/python"
 INDEXTTS25_VLLM = f"{INDEXTTS25_VENV_DIR}/bin/vllm"
 INDEXTTS25_TORCH_BACKEND = "cu130"
@@ -81,6 +83,9 @@ def _ignore_runtime_source(path) -> bool:
 image = None
 if modal.is_local():
     from indextts_web.infrastructure.modal_dependencies import install_main_dependencies
+    from indextts_web.services.tts.drama3_serving.requirements import (
+        DRAMA3_SGLANG_READY_MARKER, drama3_sglang_fingerprint, drama3_sglang_install_commands,
+    )
 
     # Create Modal image for IndexTTS v2 with vLLM optimization
     image = (
@@ -226,6 +231,12 @@ if modal.is_local():
             "assert torch.version.cuda, 'Qwen ASR requires CUDA Torch'; "
             "print('Qwen3-ASR environment ready')\"",
         )
+        .run_commands(
+            # Keep SGLang's Torch 2.13 stack separate from the main vLLM stack.
+            *(shlex.join(command) for command in drama3_sglang_install_commands(PurePosixPath(DRAMA3_VENV_DIR))),
+            f"printf '%s' {shlex.quote(drama3_sglang_fingerprint())} > "
+            f"{DRAMA3_VENV_DIR}/{DRAMA3_SGLANG_READY_MARKER}",
+        )
         # copy=True makes source changes part of the image/snapshot identity. Use
         # these exact local sources at startup, not the code in the model Volume.
         .add_local_dir(str(DEPLOY_SOURCE_ROOT), RUNTIME_SOURCE_DIR,
@@ -265,6 +276,10 @@ if modal.is_local():
         "TORCH_CPP_LOG_LEVEL": "ERROR",
         # Disable ONNX Runtime telemetry before application imports.
         "ORT_DISABLE_TELEMETRY": "1",
+        "DRAMA3_VENV": DRAMA3_VENV_DIR,
+        "DRAMA3_MODEL_DIR": "/persistent_app/checkpoints/drama3",
+        "DRAMA3_DATA_DIR": "/persistent_cache/drama3-serving",
+        "DRAMA3_MODAL_COMMIT_VOLUMES": "audio-studio-app,audio-studio-cache",
         "CLEARVOICE_PYTHON": CLEARVOICE_PYTHON,
         "QWEN_OMNIVAD_PYTHON": QWEN_ASR_PYTHON,
         "QWEN_OMNIVAD_MODEL_DIR": "/persistent_app/checkpoints/qwen_omnivad",
@@ -432,7 +447,7 @@ def legacy_serve_without_snapshot():
     Serve the IndexTTS v2 FastAPI application by running python fastapi_webui_v2.py directly.
     """
     import os
-    from pathlib import Path
+    from pathlib import Path, PurePosixPath
     import subprocess
     
     print("🚀 Starting IndexTTS v2 vLLM FastAPI WebUI...")
@@ -476,6 +491,14 @@ def legacy_serve_without_snapshot():
         "/persistent_cache/confucius",
         "/persistent_cache/triton",
         INDEXTTS25_PERSISTENT_DATA_DIR,
+        "/persistent_cache/drama3-serving",
+        "/persistent_cache/drama3-serving/logs",
+        "/persistent_cache/drama3-serving/media/references",
+        "/persistent_cache/drama3-serving/cache/torchinductor",
+        "/persistent_cache/drama3-serving/cache/triton",
+        "/persistent_cache/drama3-serving/cache/cuda",
+        "/persistent_cache/drama3-serving/cache/flashinfer",
+        "/persistent_cache/drama3-serving/cache/xdg",
     ]
     
     print("\n   Creating cache directories:")
@@ -772,7 +795,7 @@ def _build_indextts25_start_command(indextts25_repo_path: Path, gpu_profile) -> 
     return " ".join(shlex.quote(str(part)) for part in parts)
 
 
-def _build_webui_command(persistent_app_path: Path, gpu_profile=None) -> List[str]:
+def _build_webui_command(persistent_app_path: Path, gpu_profile=None, *, startup_tts_backend=None) -> List[str]:
     """Build one launch command shared by snapshot and legacy entry points."""
     if gpu_profile is None:
         from indextts_web.gpu_profiles import runtime_gpu_profile
@@ -792,7 +815,17 @@ def _build_webui_command(persistent_app_path: Path, gpu_profile=None) -> List[st
         "--qwenemo_gpu_memory_utilization",
         str(gpu_profile.emotion.gpu_memory_utilization),
         "--tts_backend",
-        DEFAULT_TTS_BACKEND,
+        startup_tts_backend or DEFAULT_TTS_BACKEND,
+        "--startup_tts_backend",
+        startup_tts_backend or DEFAULT_TTS_BACKEND,
+        "--drama3_venv",
+        DRAMA3_VENV_DIR,
+        "--drama3_model_dir",
+        str(persistent_app_path / "checkpoints" / "drama3"),
+        "--drama3_data_dir",
+        f"{PERSISTENT_CACHE_DIR}/drama3-serving",
+        "--drama3_max_parallel_segments",
+        str(min(32, gpu_profile.parallel_segments)),
         "--confucius_repo_dir",
         str(persistent_app_path / CONFUCIUS_APP_SUBDIR),
         "--confucius_host",
@@ -849,8 +882,8 @@ def _updated_runtime_source(persistent_app_path: Path) -> Path:
     return repository_source(persistent_app_path, Path(RUNTIME_SOURCE_DIR))
 
 
-def _configure_persistent_runtime():
-    from pathlib import Path
+def _configure_persistent_runtime(*, startup_tts_backend="index"):
+    from pathlib import Path, PurePosixPath
 
     print("Starting IndexTTS v2 vLLM FastAPI WebUI with Modal snapshots...")
 
@@ -911,6 +944,14 @@ def _configure_persistent_runtime():
         "/persistent_cache/confucius",
         "/persistent_cache/triton",
         INDEXTTS25_PERSISTENT_DATA_DIR,
+        "/persistent_cache/drama3-serving",
+        "/persistent_cache/drama3-serving/logs",
+        "/persistent_cache/drama3-serving/media/references",
+        "/persistent_cache/drama3-serving/cache/torchinductor",
+        "/persistent_cache/drama3-serving/cache/triton",
+        "/persistent_cache/drama3-serving/cache/cuda",
+        "/persistent_cache/drama3-serving/cache/flashinfer",
+        "/persistent_cache/drama3-serving/cache/xdg",
     ]
     for cache_dir in cache_dirs:
         os.makedirs(cache_dir, exist_ok=True)
@@ -938,6 +979,13 @@ def _configure_persistent_runtime():
         raise FileNotFoundError(
             f"Application not found at {persistent_app_path}. Open the prepare_model web manager first."
         )
+
+    # Seed source directories without requiring optional model weights. A fresh
+    # Drama3 endpoint downloads only its own checkpoint during startup.
+    import sys
+    sys.path.insert(0, RUNTIME_SOURCE_DIR)
+    from indextts_web.infrastructure.model_setup import ModelSetup
+    ModelSetup(persistent_app_path, Path(RUNTIME_SOURCE_DIR)).bootstrap()
 
     checkpoints_dir = persistent_app_path / "checkpoints"
     if not checkpoints_dir.exists():
@@ -983,7 +1031,7 @@ def _configure_persistent_runtime():
         for name, path in required_confucius_paths.items()
         if not path.exists()
     ]
-    if missing_confucius_paths:
+    if startup_tts_backend == "confucius" and missing_confucius_paths:
         raise FileNotFoundError(
             "Confucius4-TTS persistent setup is incomplete. Open the prepare_model web manager first. "
             + "; ".join(missing_confucius_paths)
@@ -1015,7 +1063,7 @@ def _configure_persistent_runtime():
         for name, path in required_indextts25_paths.items()
         if not path.exists()
     ]
-    if missing_indextts25_paths:
+    if startup_tts_backend == "index25" and missing_indextts25_paths:
         raise FileNotFoundError(
             "IndexTTS 2.5 vLLM-Omni persistent setup is incomplete. Open the prepare_model web manager first. "
             + "; ".join(missing_indextts25_paths)
@@ -1122,7 +1170,7 @@ def _commit_snapshot_volumes(phase: str) -> None:
     """Persist paths referenced by the snapshot before another container restores it."""
     # Snapshot restore walks Volume paths before Python restore hooks can run.
     # Background/shutdown commits are not a persistence barrier during startup.
-    # Do not reload: model workers may still hold open files on these mounts.
+    # Reload only before workers start; later they hold files on these mounts.
     for name, volume in (("audio-studio-cache", cache_storage), ("audio-studio-app", app_storage)):
         print(f"[Snapshot] Committing {name} ({phase})...", flush=True)
         try:
@@ -1130,6 +1178,14 @@ def _commit_snapshot_volumes(phase: str) -> None:
         except Exception as exc:
             raise RuntimeError(f"Snapshot Volume commit failed for {name} ({phase})") from exc
     print(f"[Snapshot] Persistent Volumes committed ({phase}).", flush=True)
+    if phase == "before model startup":
+        # Snapshot restore resolves open Volume paths before Python hooks run.
+        # Commit alone preserves content but leaves the mount on its earlier
+        # revision; refresh it now, before workers open weights, logs or caches.
+        print("[Snapshot] Reloading committed mount revisions before starting workers...", flush=True)
+        cache_storage.reload()
+        app_storage.reload()
+
 
 
 @app.cls(
@@ -1209,7 +1265,7 @@ class IndexTTSVllmServer:
         )
         _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
 
-    @modal.web_server(port=VLLM_PORT, startup_timeout=SNAPSHOT_STARTUP_TIMEOUT)
+    @modal.web_server(port=VLLM_PORT, startup_timeout=SNAPSHOT_STARTUP_TIMEOUT, label="tts")
     def serve(self):
         pass
 
@@ -1224,3 +1280,127 @@ class IndexTTSVllmServer:
                 proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+
+def _prepare_drama3_snapshot_runtime() -> Path:
+    """Keep writable open files on the filesystem captured by Modal's snapshot."""
+    import shutil
+    local = Path(DRAMA3_SNAPSHOT_DATA_DIR)
+    persistent = Path(PERSISTENT_CACHE_DIR) / "drama3-serving"
+    # Seed reusable kernels, but never inherit live log handles or user media.
+    if (persistent / "cache").is_dir():
+        shutil.copytree(persistent / "cache", local / "cache", dirs_exist_ok=True)
+    for name in ("cache", "logs", "media"):
+        (local / name).mkdir(parents=True, exist_ok=True)
+    return local
+
+
+def _persist_drama3_snapshot_runtime() -> None:
+    """Copy diagnostics and kernels without holding live files open on a Volume."""
+    import shutil
+    local = Path(DRAMA3_SNAPSHOT_DATA_DIR)
+    persistent = Path(PERSISTENT_CACHE_DIR) / "drama3-serving"
+    for name in ("cache", "logs"):
+        if (local / name).is_dir():
+            shutil.copytree(local / name, persistent / name, dirs_exist_ok=True)
+
+
+@app.cls(
+    image=image,
+    gpu="RTX-PRO-6000",  # Manually choose "L4", "L40S", or "RTX-PRO-6000"; VRAM tuning is automatic.
+    cpu=2.0,
+    memory=8192,
+    timeout=3600,
+    scaledown_window=300,
+    volumes={
+        PERSISTENT_APP_DIR: app_storage,
+        PERSISTENT_CACHE_DIR: cache_storage,
+    },
+    min_containers=0,
+    max_containers=1,
+    secrets=[modal.Secret.from_name("custom-secret")],
+    enable_memory_snapshot=True,
+    experimental_options={"enable_gpu_snapshot": True},
+)
+@modal.concurrent(max_inputs=100)  # 100 concurrent requests
+class Drama3SglangServer:
+    """
+    Serve Drama 3 ready for inference from a separate Modal GPU snapshot.
+    """
+
+    @modal.enter(snap=True)
+    def start(self):
+        persistent_app_path = _configure_persistent_runtime(startup_tts_backend="drama3")
+        cmd = _build_webui_command(persistent_app_path, startup_tts_backend="drama3")
+        runtime_data = _prepare_drama3_snapshot_runtime()
+        cmd[cmd.index("--drama3_data_dir") + 1] = str(runtime_data)
+        _commit_snapshot_volumes("before model startup")
+
+        self.moss_server_proc = _start_moss_transcribe_server(persistent_app_path)
+        _wait_moss_ready(self.moss_server_proc)
+
+        print(f"Starting FastAPI server: {' '.join(cmd)}")
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        # Modal captures the awake GPU pipeline. Do not nest a separate NVIDIA
+        # driver checkpoint job inside the Modal snapshot being created.
+        env["DRAMA3_MODAL_SNAPSHOT_CAPTURE"] = "1"
+        env.pop("DRAMA3_MODAL_COMMIT_VOLUMES", None)
+        self.server_proc = subprocess.Popen(cmd, cwd=str(persistent_app_path), env=env)
+
+        _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
+
+        print("Running snapshot warmup inference...")
+        _call_local_json(
+            "/internal/snapshot/warmup",
+            method="POST",
+            timeout=SNAPSHOT_REQUEST_TIMEOUT,
+            internal=True,
+        )
+
+        # Capture Drama 3 with its CUDA state resident. Sleeping or stopping
+        # it here would force a model reload on every restored container.
+        # Persist compiler caches and application data before snapshot capture.
+        # Returning from snap=True permits capture, so commit synchronously here.
+        _persist_drama3_snapshot_runtime()
+        _commit_snapshot_volumes("before snapshot capture")
+
+    @modal.enter(snap=False)
+    def wake_up(self):
+        from indextts_web.gpu_profiles import runtime_gpu_profile
+        from indextts_web.infrastructure.gpu import probe_gpu
+
+        profile = runtime_gpu_profile(modal=True)
+        actual = probe_gpu()
+        if actual.capability != profile.gpu.capability or actual.total_bytes < profile.gpu.total_bytes:
+            raise RuntimeError("Snapshot GPU does not match its startup profile; redeploy to rebuild the snapshot")
+        _wait_moss_ready(self.moss_server_proc)
+        print("Verifying Drama 3 after GPU snapshot restore...")
+        _call_local_json(
+            "/internal/snapshot/wake",
+            method="POST",
+            timeout=SNAPSHOT_REQUEST_TIMEOUT,
+            internal=True,
+        )
+        _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
+
+    @modal.web_server(port=VLLM_PORT, startup_timeout=SNAPSHOT_STARTUP_TIMEOUT, label="tts-drama3")
+    def serve(self):
+        pass
+
+    @modal.exit()
+    def stop(self):
+        for proc_name in ("server_proc", "moss_server_proc"):
+            proc = getattr(self, proc_name, None)
+            if proc is None or proc.poll() is not None:
+                continue
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        try:
+            _persist_drama3_snapshot_runtime()
+            cache_storage.commit()
+        except Exception as exc:
+            print(f"Could not persist Drama3 runtime caches during shutdown: {exc}", flush=True)

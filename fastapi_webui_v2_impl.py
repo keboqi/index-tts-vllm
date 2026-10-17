@@ -127,6 +127,8 @@ from indextts_web.contracts import (
 from indextts_web.infrastructure.callables import filter_supported_keyword_arguments
 from indextts_web.services.tts.base import SynthesisRequest
 from indextts_web.services.tts.factory import build_backend_registry
+from indextts_web.services.tts.startup import initialize_backend, warmup_backend, restore_backend, startup_backend
+from indextts_web.services.tts.drama3_manager import ManagedDrama3Backend
 from indextts_web.services.tts.index25_manager import ManagedIndexTTS25Backend
 from indextts_web.services.translation.subtitles import (
     combine_bilingual as combine_bilingual_subtitles,
@@ -238,8 +240,9 @@ DEFAULT_TRANSCRIPTION_PIPELINE = "moss_transcribe"
 TTS_BACKEND_INDEX = "index"
 TTS_BACKEND_CONFUCIUS = "confucius"
 TTS_BACKEND_INDEX25 = "index25"
-ALLOWED_TTS_BACKENDS = {TTS_BACKEND_INDEX, TTS_BACKEND_INDEX25, TTS_BACKEND_CONFUCIUS}
-TTSBackendName = Literal["index", "index25", "confucius"]
+TTS_BACKEND_DRAMA3 = "drama3"
+ALLOWED_TTS_BACKENDS = {TTS_BACKEND_DRAMA3, TTS_BACKEND_INDEX, TTS_BACKEND_INDEX25, TTS_BACKEND_CONFUCIUS}
+TTSBackendName = Literal["index", "index25", "confucius", "drama3"]
 DURATION_CONTROL_ORIGINAL = "original"
 DURATION_CONTROL_FFMPEG = "ffmpeg"
 ALLOWED_DURATION_CONTROLS = {DURATION_CONTROL_ORIGINAL, DURATION_CONTROL_FFMPEG}
@@ -3653,6 +3656,7 @@ def _validate_local_service_ports() -> None:
         ("FastAPI WebUI", SETTINGS.host, int(SETTINGS.port)),
         ("Confucius4-TTS", SETTINGS.confucius_host, int(SETTINGS.confucius_port)),
         ("IndexTTS 2.5 vLLM-Omni", SETTINGS.indextts25_host, int(SETTINGS.indextts25_port)),
+        ("Drama 3 SGLang-Omni", "127.0.0.1", int(SETTINGS.drama3_port)),
     ]
     local_ports: Dict[int, str] = {}
     for name, host, port in candidates:
@@ -3780,6 +3784,11 @@ def _loaded_model_inventory() -> List[Dict[str, Any]]:
             "name": "IndexTTS 2.5 vLLM-Omni",
             "kind": "TTS Backend",
             "state": "sleeping" if indextts25_backend_manager._vllm_sleeping else "loaded",
+        })
+    if drama3_backend_manager.process_running():
+        models.append({
+            "key": "drama3_sglang", "name": "Drama 3 SGLang-Omni", "kind": "TTS Backend",
+            "state": "sleeping" if drama3_backend_manager.sleeping else "loaded",
         })
     for key in stable_audio3_manager.status().get("loaded_models", []):
         models.append({"key": f"stable_audio:{key}", "name": f"Stable Audio 3 ({key})", "kind": "Stable Audio", "state": "loaded"})
@@ -4341,6 +4350,7 @@ class ManagedConfuciusBackend:
 
     @gpu_operation("confucius")
     async def ensure_ready(self) -> Dict[str, Any]:
+        await drama3_backend_manager.sleep_vllm()
         main_manager = globals().get("tts_manager")
         if GPU_COORDINATOR.enabled and main_manager is not None and main_manager.is_ready():
             await main_manager.sleep_engine("indextts_vllm", level=1)
@@ -4669,6 +4679,7 @@ confucius_backend_manager = ManagedConfuciusBackend()
 
 async def _prepare_gpu_for_indextts25() -> None:
     """Release sibling vLLM allocations before starting the 2.5 Omni pipeline."""
+    await drama3_backend_manager.sleep_vllm()
     main_manager = globals().get("tts_manager")
     if main_manager is not None and main_manager.is_ready():
         await main_manager.sleep_engine("indextts_vllm", level=1)
@@ -4682,6 +4693,23 @@ indextts25_backend_manager = ManagedIndexTTS25Backend(
     app_dir=APP_DIR,
     output_root=ROOT_OUTPUT_DIR,
     prepare_gpu=_prepare_gpu_for_indextts25,
+)
+
+
+async def _prepare_gpu_for_drama3() -> None:
+    if tts_manager.is_ready():
+        await tts_manager.sleep_engine("indextts_vllm", level=1)
+        await tts_manager.sleep_engine("emotion_vllm", level=1)
+    if confucius_backend_manager._process_running() and not confucius_backend_manager._vllm_sleeping:
+        await confucius_backend_manager.sleep_vllm()
+    if indextts25_backend_manager.process_running():
+        await indextts25_backend_manager.sleep_vllm()
+    await _release_translation_gpu_models()
+    await _run_blocking(_release_cuda_cache)
+
+
+drama3_backend_manager = ManagedDrama3Backend(
+    SETTINGS, app_dir=APP_DIR, output_root=ROOT_OUTPUT_DIR, prepare_gpu=_prepare_gpu_for_drama3,
 )
 
 
@@ -11371,6 +11399,7 @@ class TTSManager:
         self._indextts_vllm_sleeping = False
         self._emotion_vllm_sleeping = False
         self._vllm_state_lock = asyncio.Lock()
+        self._initialization_lock = asyncio.Lock()
         self._wake_error = ""
         
     @classmethod
@@ -11460,7 +11489,13 @@ class TTSManager:
 
     @gpu_operation("index")
     async def ensure_awake(self) -> None:
-        """Wake any manually slept vLLM engines before IndexTTS inference."""
+        """Initialize on demand or wake manually slept engines before inference."""
+        if not self.is_ready():
+            async with self._initialization_lock:
+                if not self.is_ready():
+                    await self._prepare_wake_memory()
+                    if not await self.initialize():
+                        raise RuntimeError("IndexTTS initialization failed during backend switch")
         await self._wake_engines(("indextts_vllm", "emotion_vllm"))
 
     async def _wake_engines(self, engines) -> None:
@@ -11483,6 +11518,7 @@ class TTSManager:
                 raise GpuWakeError(f"IndexTTS wake failed: {exc}") from exc
 
     async def _prepare_wake_memory(self) -> None:
+        await drama3_backend_manager.sleep_vllm()
         if indextts25_backend_manager.process_running():
             await indextts25_backend_manager.sleep_vllm()
         if (GPU_COORDINATOR.enabled and confucius_backend_manager._process_running()
@@ -12593,12 +12629,12 @@ async def lifespan(app: FastAPI):
     from indextts_web.gpu_profiles import PROFILE_ENV, runtime_gpu_profile
 
     GPU_PROFILE = runtime_gpu_profile().with_settings(SETTINGS)
-    GPU_PROFILE.check_startup_memory(non_vllm_gib=float(os.getenv("INDEXTTS_NON_VLLM_RESERVE_GIB", "8")))
     SETTINGS = GPU_PROFILE.apply_settings(SETTINGS)
     GPU_COORDINATOR.enabled = GPU_PROFILE.name != "96gb"
     tts_manager.gpu_coordinator = GPU_COORDINATOR
     confucius_backend_manager.gpu_coordinator = GPU_COORDINATOR
     indextts25_backend_manager.gpu_coordinator = GPU_COORDINATOR
+    drama3_backend_manager.gpu_coordinator = GPU_COORDINATOR
     os.environ[PROFILE_ENV] = GPU_PROFILE.to_json()
     CONCURRENCY.configure_gpu_limits(GPU_PROFILE.index_concurrency, GPU_PROFILE.translation_concurrency)
     INDEXTTS_GPU_WORK_CONCURRENCY = CONCURRENCY.index_tts_requests
@@ -12611,16 +12647,7 @@ async def lifespan(app: FastAPI):
         app.state.runtime.settings = SETTINGS
     print(f"[GPU profile] {GPU_PROFILE.to_json()}")
     _ensure_runtime_directories()
-    if not await tts_manager.initialize():
-        raise RuntimeError("IndexTTS initialization failed; see the model error and resolved GPU profile above")
-    
-    # Only run warmup inference when torch_compile is enabled
-    # torch_compile benefits from warmup to compile optimized CUDA graphs
-    if SETTINGS.use_torch_compile:
-        print("🔥 Running warmup (--use_torch_compile enabled)...")
-        await warmup_model()
-    else:
-        print("⏭️ Skipping warmup (--use_torch_compile not enabled)")
+    await initialize_backend(sys.modules[__name__])
 
     confucius_backend_manager.start_keepalive()
     indextts25_backend_manager.start_keepalive()
@@ -12630,6 +12657,7 @@ async def lifespan(app: FastAPI):
     print("🔄 Shutting down IndexTTS vLLM v2...")
     await confucius_backend_manager.shutdown()
     await indextts25_backend_manager.shutdown()
+    await drama3_backend_manager.shutdown()
     # Shutdown the thread executor
     CONCURRENCY.shutdown()
 
@@ -12647,24 +12675,24 @@ def _require_internal_snapshot_token(request: Request) -> None:
 @app.post("/internal/snapshot/warmup")
 async def internal_snapshot_warmup(request: Request):
     _require_internal_snapshot_token(request)
-    if not tts_manager.is_ready():
-        raise HTTPException(status_code=503, detail="IndexTTS2 is not initialized")
-    await warmup_model(strict=True)
-    tts_manager.refresh_post_snapshot_state()
+    await warmup_backend(sys.modules[__name__])
     return JSONResponse(content={"status": "ok", "action": "warmup"})
 
 
 @app.post("/internal/snapshot/sleep")
 async def internal_snapshot_sleep(request: Request, level: int = Query(1, ge=1, le=2)):
     _require_internal_snapshot_token(request)
-    await tts_manager.sleep_for_snapshot(level=level)
+    if startup_backend(SETTINGS) == "index":
+        await tts_manager.sleep_for_snapshot(level=level)
+    elif startup_backend(SETTINGS) == "drama3":
+        raise HTTPException(status_code=409, detail="Capture Drama 3 GPU-resident with Modal; driver sleep must not precede capture")
     return JSONResponse(content={"status": "ok", "action": "sleep", "level": level})
 
 
 @app.post("/internal/snapshot/wake")
 async def internal_snapshot_wake(request: Request):
     _require_internal_snapshot_token(request)
-    await tts_manager.wake_from_snapshot()
+    await restore_backend(sys.modules[__name__])
     return JSONResponse(content={"status": "ok", "action": "wake"})
 
 # Web Interface - HTML file path for hot reload support
@@ -12700,6 +12728,7 @@ def _load_html_ui_cache_sync() -> _HtmlUiCacheEntry:
             "{{CHUNK_SPLIT_MIN_SILENCE_MS}}",
             str(CHUNK_SPLIT_MIN_SILENCE_MS),
         )
+        html_content = html_content.replace("{{DEFAULT_TTS_BACKEND}}", SETTINGS.tts_backend)
         identity = html_content.encode("utf-8")
         cached = _HtmlUiCacheEntry(
             fingerprint=fingerprint,
@@ -13072,11 +13101,14 @@ async def api_models_unload(request: Request):
         if model_key in {"all", "indextts25_omni"} and indextts25_backend_manager.process_running():
             await indextts25_backend_manager.sleep_vllm()
             removed.append("indextts25_omni")
+        if model_key in {"all", "drama3_sglang"} and drama3_backend_manager.process_running():
+            await drama3_backend_manager.sleep_vllm()
+            removed.append("drama3_sglang")
         if model_key in {"all", "moss_transcribe"} and "moss_transcribe" in valid_keys:
             await _change_moss_model(mode)
             removed.append("moss_transcribe")
         if model_key == "all" or model_key not in {
-            "indextts_vllm", "emotion_vllm", "confucius_vllm", "indextts25_omni", "moss_transcribe"
+            "indextts_vllm", "emotion_vllm", "confucius_vllm", "indextts25_omni", "drama3_sglang", "moss_transcribe"
         }:
             removed.extend(await _run_blocking(_unload_optional_model_sync, model_key))
         await _run_blocking(_release_cuda_cache)
@@ -13100,7 +13132,7 @@ async def api_models_wake(request: Request):
     except Exception:
         payload = {}
     model_key = str(payload.get("model_key") or "").strip() if isinstance(payload, dict) else ""
-    if model_key not in {"indextts_vllm", "emotion_vllm", "confucius_vllm", "indextts25_omni", "moss_transcribe"}:
+    if model_key not in {"indextts_vllm", "emotion_vllm", "confucius_vllm", "indextts25_omni", "drama3_sglang", "moss_transcribe"}:
         raise HTTPException(status_code=400, detail="Unknown or non-sleepable model")
     async with _model_manager_lock, GPU_COORDINATOR.exclusive():
         if model_key in {"indextts_vllm", "emotion_vllm"}:
@@ -13112,6 +13144,8 @@ async def api_models_wake(request: Request):
             await confucius_backend_manager.wake_vllm()
         elif model_key == "indextts25_omni":
             await indextts25_backend_manager.wake_vllm()
+        elif model_key == "drama3_sglang":
+            await drama3_backend_manager.wake_vllm()
         elif model_key == "moss_transcribe":
             await _change_moss_model("wake")
     return JSONResponse(
@@ -18585,16 +18619,19 @@ async def server_info():
             roles = list(speakers_data["speakers"].keys()) if speakers_data["status"] == "success" else []
         confucius_status = await confucius_backend_manager.status()
         indextts25_status = await indextts25_backend_manager.status()
+        drama3_status = await drama3_backend_manager.status()
         return JSONResponse(content={
             "success": True,
             "info": {
                 "model": "IndexTTS-vLLM-v2",
                 "tts_backend": SETTINGS.tts_backend,
+                "startup_tts_backend": startup_backend(SETTINGS),
                 "tts_backends": sorted(ALLOWED_TTS_BACKENDS),
                 "duration_control": DURATION_CONTROL_ORIGINAL,
                 "duration_controls": sorted(ALLOWED_DURATION_CONTROLS),
                 "confucius": confucius_status,
                 "index25": indextts25_status,
+                "drama3": drama3_status,
                 "roles": roles,
                 "sample_rate": 22050,
                 "engine": "vLLM v2",
@@ -18697,11 +18734,12 @@ async def speak_stream(req: SpeakRequest):
             and int(req.speech_length or 0) > 0
         )
 
-        if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_INDEX25} or force_file_stream:
+        if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_INDEX25, TTS_BACKEND_DRAMA3} or force_file_stream:
             result_path = os.path.join("outputs", f"speak_stream_{uuid.uuid4().hex}.wav")
             backend_label = {
                 TTS_BACKEND_CONFUCIUS: "Confucius4-TTS",
                 TTS_BACKEND_INDEX25: "IndexTTS 2.5 vLLM-Omni",
+                TTS_BACKEND_DRAMA3: "Drama 3 SGLang-Omni",
             }.get(backend, "IndexTTS")
             synthesis = _synthesize_tts_to_file(
                 tts_backend=backend,
@@ -18815,11 +18853,12 @@ async def clone_voice_stream(
             and int(req.speech_length or 0) > 0
         )
 
-        if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_INDEX25} or force_file_stream:
+        if backend in {TTS_BACKEND_CONFUCIUS, TTS_BACKEND_INDEX25, TTS_BACKEND_DRAMA3} or force_file_stream:
             result_path = os.path.join("outputs", f"clone_stream_{uuid.uuid4().hex}.wav")
             backend_label = {
                 TTS_BACKEND_CONFUCIUS: "Confucius4-TTS",
                 TTS_BACKEND_INDEX25: "IndexTTS 2.5 vLLM-Omni",
+                TTS_BACKEND_DRAMA3: "Drama 3 SGLang-Omni",
             }.get(backend, "IndexTTS")
             synthesis = _synthesize_tts_to_file(
                 tts_backend=backend,

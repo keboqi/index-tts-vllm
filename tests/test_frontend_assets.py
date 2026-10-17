@@ -46,7 +46,7 @@ class FrontendAssetTests(unittest.TestCase):
         self.assertIn("/static/favicon.svg", inventory.assets)
         self.assertEqual(inventory.meta["chunk-split-min-silence-ms"], "{{CHUNK_SPLIT_MIN_SILENCE_MS}}")
         for backend_options in inventory.backends.values():
-            self.assertEqual(backend_options, {"index", "index25", "confucius"})
+            self.assertEqual(backend_options, {"index", "index25", "confucius", "drama3"})
         self.assertEqual(set(inventory.backends), {"ttsBackend", "translateTtsBackend"})
         sources = [script["src"] for script in inventory.scripts]
         self.assertLess(sources.index("/static/js/translation-chunks.js"), sources.index("/static/js/bootstrap.js"))
@@ -86,9 +86,20 @@ for (const [metaContent, expected] of [['750', 750], ['', 1000]]) {
     backend.value = 'index';
     listeners.change();
     assert.strictEqual(language.value, 'auto');
+    backend.value = 'drama3';
+    listeners.change();
+    assert.strictEqual(elements.emotionText.disabled, false);
+    assert.strictEqual(elements.emotionWeight.disabled, true);
+    assert.deepStrictEqual(Array.from(language.options, option => option.value), ['auto']);
     backend.value = 'confucius';
     listeners.change();
     assert.strictEqual(elements.emotionText.disabled, true);
+    context.document.querySelector = selector => selector === 'meta[name="default-tts-backend"]'
+        ? {content: 'drama3'} : null;
+    vm.runInContext('init()', context);
+    assert.strictEqual(backend.value, 'drama3');
+    assert.strictEqual(elements.emotionText.disabled, false);
+    assert.strictEqual(elements.emotionWeight.disabled, true);
 }
 // Execute the translation modules in the HTML's load order, so eager calls
 // cannot access globals that are initialized only by a later script.

@@ -1,0 +1,424 @@
+"""Managed SGLang-Omni Drama 3 server, kept loaded between TTS jobs.
+
+Other engines checkpoint idle CUDA workers to RAM when supported, otherwise
+stop the server. The next TTS job restores the workers or restarts the server.
+"""
+
+from __future__ import annotations
+
+import atexit
+import os
+import re
+import signal
+import subprocess
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+import requests
+
+from . import checkpoint, environment
+from .requirements import DRAMA3_HF_REPO, DRAMA3_HF_REVISION
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+@dataclass(frozen=True)
+class ServerSettings:
+    venv: Path
+    data_dir: Path
+    model_root: Path
+    port: int = 8096
+    # The engine's share of total GPU memory: 37 GB of weights plus KV cache.
+    engine_memory: float = 0.55
+    codec_memory: float = 0.08
+    max_seqs: int = 32
+    start_timeout: float = 1800.0
+    request_timeout: float = 900.0
+    sleep_mode: str = "auto"
+
+    def __post_init__(self):
+        if self.sleep_mode not in {"auto", "off"}:
+            raise ValueError("DRAMA3_SLEEP must be auto or off")
+
+    @property
+    def model_dir(self) -> Path:
+        target = self.model_root / f"{DRAMA3_HF_REPO.replace('/', '--')}--{DRAMA3_HF_REVISION[:12]}"
+        if not target.exists():
+            # Reuse the pinned checkpoint in an earlier sibling serving directory.
+            # Removing a backend must not force another 44 GB download.
+            candidates = sorted(self.model_root.parent.glob(f"*/{target.name}"))
+            for candidate in candidates:
+                marker = candidate / ".h3-complete"
+                if marker.is_file() and marker.read_text(encoding="utf-8").strip() == DRAMA3_HF_REVISION:
+                    return candidate
+        return target
+
+    @property
+    def media_dir(self) -> Path:
+        """Reference clips the server may read from local paths."""
+        return self.data_dir / "media"
+
+    @property
+    def runtime_dir(self) -> Path:
+        """Persistent SGLang logs and kernel caches."""
+        if not (self.data_dir / "cache").is_dir():
+            # Keep the existing SGLang kernel cache after renaming serving storage.
+            candidates = sorted(path for path in self.data_dir.parent.glob("*/sglang")
+                                if (path / "cache").is_dir())
+            if len(candidates) == 1:
+                return candidates[0]
+        return self.data_dir
+
+
+def ensure_model(settings: ServerSettings, *, token=None, log=print) -> Path:
+    """Download the pinned official checkpoint once."""
+    target = settings.model_dir
+    marker = target / ".h3-complete"
+    if marker.is_file():
+        return target
+    from huggingface_hub import snapshot_download
+
+    log(f"[drama3-serving] Downloading {DRAMA3_HF_REPO}@{DRAMA3_HF_REVISION[:12]} (~44 GB, first use only).")
+    snapshot_download(DRAMA3_HF_REPO, revision=DRAMA3_HF_REVISION, local_dir=target, token=token)
+    marker.write_text(DRAMA3_HF_REVISION, encoding="utf-8")
+    persist_caches()
+    return target
+
+
+def persist_caches() -> None:
+    """Commit the Modal volume in the background so compile caches outlive the container.
+
+    Writes to a Modal volume are only kept once committed; without this, every
+    container restart or redeploy recompiled from scratch. No-op elsewhere.
+    """
+    names = os.getenv("DRAMA3_MODAL_COMMIT_VOLUMES", "")
+    if not names:
+        return
+
+    def commit():
+        try:
+            import modal
+
+            for name in names.split(","):
+                modal.Volume.from_name(name.strip()).commit()
+            print("[drama3-serving] Committed compile caches to the volume.", flush=True)
+        except Exception as exc:  # never fail a job over cache persistence
+            print(f"[drama3-serving] Could not commit compile caches: {exc}", flush=True)
+
+    threading.Thread(target=commit, name="drama3-cache-commit", daemon=True).start()
+
+
+def gpu_memory():
+    """(free MiB, total MiB, holder summary) for GPU 0 from nvidia-smi, or None."""
+    try:
+        query = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits", "-i", "0"],
+            check=True, capture_output=True, text=True, timeout=15,
+        ).stdout.strip().splitlines()[0]
+        free, total = (float(part) for part in query.split(","))
+        apps = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+        return free, total, "; ".join(line.strip() for line in apps.splitlines() if line.strip())
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
+class SglangOmniServer:
+    label = "SGLang-Omni"
+    health_path = "/health"
+
+    def __init__(self, settings: ServerSettings):
+        self.settings = settings
+        self.process: subprocess.Popen | None = None
+        self.log_path: Path | None = None
+        self._log = None
+        self._lock = threading.RLock()
+        self._checkpoint_helper: Path | None = None
+        self._checkpoint_baseline = 0
+        self._checkpoint: checkpoint.CudaCheckpoint | None = None
+        self._sleep_disabled = False
+        self._active_requests = 0
+        self._uncertain_request = False
+        self.checkpoint_launch_enabled = True
+
+    @property
+    def sleeping(self) -> bool:
+        return self._checkpoint is not None
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.settings.port}"
+
+    def running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def healthy(self, timeout: float = 2.0) -> bool:
+        try:
+            return requests.get(f"{self.base_url}{self.health_path}", timeout=timeout).ok
+        except requests.RequestException:
+            return False
+
+    def server_env(self) -> dict[str, str]:
+        # Every compile and JIT cache lives with the persistent data, so a later
+        # start reuses torch.compile output, Triton/Inductor kernels and
+        # FlashInfer's JIT modules instead of rebuilding them (minutes each).
+        cache = self.settings.runtime_dir / "cache"
+        env = environment.install_env(self.settings.venv)
+        env.update(
+            HF_HUB_OFFLINE="1",  # the checkpoint is local; never re-resolve it at startup
+            TORCHINDUCTOR_CACHE_DIR=str(cache / "torchinductor"),
+            TRITON_CACHE_DIR=str(cache / "triton"),
+            CUDA_CACHE_PATH=str(cache / "cuda"),
+            FLASHINFER_WORKSPACE_BASE=str(cache / "flashinfer"),
+            XDG_CACHE_HOME=str(cache / "xdg"),
+        )
+        return env
+
+    def log_line(self, text: str, *, to_file: bool = True) -> None:
+        print(f"[drama3-serving] {text}", flush=True)
+        if to_file and self._log is not None:
+            self._log.write((text + "\n").encode("utf-8", errors="replace"))
+
+    def check_free_vram(self, progress: Callable[[str], None]) -> None:
+        """Fail fast, naming the holders, when the GPU lacks room for the configured share."""
+        memory = gpu_memory()
+        if memory is None:
+            return
+        free, total, holders = memory
+        needed = (self.settings.engine_memory + self.settings.codec_memory) * total
+        message = f"GPU memory before {self.label}: {free / 1024:.1f} of {total / 1024:.1f} GiB free"
+        progress(message)
+        self.log_line(f"{message}; holders: {holders}")
+        if free < needed:
+            raise RuntimeError(
+                f"{message}, but {self.label} needs about {needed / 1024:.1f} GiB "
+                f"(DRAMA3_ENGINE_MEMORY + DRAMA3_CODEC_MEMORY). Still holding VRAM: {holders or 'unknown'}. "
+                "Unload models from the model manager and retry."
+            )
+
+    def _start(self) -> None:
+        settings = self.settings
+        settings.media_dir.mkdir(parents=True, exist_ok=True)
+        logs = settings.runtime_dir / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        self.log_path = logs / f"sglang-omni-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        self._log = self.log_path.open("ab", buffering=0)
+        command = self.command()
+        self._checkpoint_helper = None
+        self._checkpoint_baseline = 0
+        if settings.sleep_mode == "auto" and not self._sleep_disabled and self.checkpoint_launch_enabled:
+            try:
+                self._checkpoint_helper = checkpoint.prepare_helper(settings.runtime_dir / "cache")
+                self._checkpoint_baseline = checkpoint.device_memory()[0]
+                # A fresh driver job per launch is required for inter-worker IPC.
+                command = [str(self._checkpoint_helper), "--launch-job", *command]
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError, requests.RequestException) as exc:
+                self._sleep_disabled = True
+                self.log_line(f"Sleep unavailable; using stop/restart: {exc}")
+        self._uncertain_request = False
+        self.log_line(f"Starting {self.label}: {' '.join(command)}")
+        self.process = subprocess.Popen(command, env=self.server_env(), stdin=subprocess.DEVNULL,
+                                        stdout=self._log, stderr=subprocess.STDOUT, start_new_session=True)
+        atexit.register(self.stop)
+
+    def last_log_line(self) -> str:
+        """The latest meaningful server log line, for startup progress."""
+        try:
+            with self.log_path.open("rb") as stream:
+                stream.seek(max(0, stream.seek(0, os.SEEK_END) - 8192))
+                tail = stream.read().decode("utf-8", errors="replace")
+        except (OSError, AttributeError):
+            return ""
+        lines = [ANSI.sub("", line).strip() for line in re.split(r"[\r\n]+", tail)]
+        lines = [line for line in lines if line]
+        return lines[-1][-180:] if lines else ""
+
+    def _wait_healthy(self, progress: Callable[[str], None]) -> None:
+        started, reported = time.monotonic(), 0.0
+        while time.monotonic() - started < self.settings.start_timeout:
+            if self.healthy():
+                self.log_line(f"{self.label} ready after {time.monotonic() - started:.0f}s")
+                persist_caches()
+                return
+            if self.process is not None and self.process.poll() is not None:
+                raise RuntimeError(f"{self.label} exited during startup (code {self.process.returncode}). "
+                              f"Last log lines:\n{self.log_tail()}")
+            elapsed = time.monotonic() - started
+            message = f"Starting {self.label} ({elapsed:.0f}s): {self.last_log_line()}"
+            progress(message)
+            if elapsed - reported >= 30:  # Modal logs show startup without the UI
+                self.log_line(message, to_file=False)  # never echo back into the tailed log
+                reported = elapsed
+            time.sleep(3)
+        raise RuntimeError(f"{self.label} did not become ready in {self.settings.start_timeout:.0f}s. "
+                      f"Last log lines:\n{self.log_tail()}")
+
+    def ensure_ready(self, free_gpu: Callable[[], None], progress: Callable[[str], None] = lambda _m: None) -> None:
+        """Free sibling models' VRAM, then restore, reuse, or start the server."""
+        with self._lock:
+            free_gpu()
+            if self.sleeping and self.running():
+                # Leave it asleep on insufficient VRAM so the user can unload
+                # other models and retry without losing the checkpoint.
+                memory = gpu_memory()
+                if memory is not None and memory[0] * 2**20 < self._checkpoint.required_vram:
+                    raise RuntimeError("Not enough free GPU memory to wake SGLang; unload other models and retry.")
+                started = time.monotonic()
+                progress("Waking SGLang-Omni from host RAM")
+                try:
+                    self._checkpoint.wake()
+                    if not self.healthy(timeout=10):
+                        raise RuntimeError("Server is unhealthy after CUDA restore")
+                    self._checkpoint = None
+                    self.log_line(f"{self.label} awake after {time.monotonic() - started:.1f}s")
+                    return
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+                    self.log_line(f"Wake failed; restarting: {exc}")
+                    self._sleep_disabled = True
+                    self.stop()
+            if self.running() and self.healthy():
+                return
+            # Also clean up surviving workers when the parent has exited.
+            if self.process is not None:
+                self.stop()
+            self.check_free_vram(progress)
+            try:
+                self._launch(progress)
+            except (RuntimeError, OSError):
+                # Only a checkpoint-wrapped launch earns an ordinary retry.
+                if self._sleep_disabled or self.settings.sleep_mode != "auto":
+                    raise
+                self._sleep_disabled = True
+                self.log_line("Checkpoint-enabled launch failed; retrying ordinary startup once")
+                self.check_free_vram(progress)
+                self._launch(progress)
+
+    def _launch(self, progress: Callable[[str], None]) -> None:
+        try:
+            self._start()
+            self._wait_healthy(progress)
+        except (RuntimeError, OSError):
+            self.stop()
+            raise
+
+    def release(self) -> None:
+        """Sleep an idle pipeline; a failed transition destroys the whole group."""
+        with self._lock:
+            if self._active_requests:
+                raise RuntimeError("SGLang is still generating speech; GPU release was refused.")
+            if self.sleeping and self.running():
+                return
+            if (self.running() and self._checkpoint_helper is not None
+                    and not self._uncertain_request and not self._sleep_disabled):
+                started = time.monotonic()
+                self.log_line("Putting SGLang-Omni to sleep; preserving CUDA state in host RAM")
+                self._checkpoint = checkpoint.CudaCheckpoint(
+                    self._checkpoint_helper, self.process.pid,
+                    baseline_used=self._checkpoint_baseline, log=self.log_line,
+                )
+                try:
+                    self._checkpoint.sleep()
+                    self.log_line(f"{self.label} asleep after {time.monotonic() - started:.1f}s; GPU state kept in host RAM")
+                    return
+                except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+                    self.log_line(f"Sleep unavailable; stopping instead: {exc}")
+                    # Precondition misses (RAM headroom, topology) can pass on a
+                    # later launch; a driver transition failure is not retried.
+                    self._sleep_disabled = self._checkpoint.transition_started
+            self.stop()
+
+    def stop(self) -> None:
+        with self._lock:
+            process = self.process
+            if process is not None:
+                self.log_line(f"Stopping {self.label}")
+                # A checkpoint failure can leave CUDA APIs locked. SIGTERM may
+                # deadlock cleanup; destroy the group instead of trying to reuse it.
+                force = self._checkpoint is not None and self._checkpoint.transition_started
+                try:
+                    os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+                    process.wait(timeout=30)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass
+                # The parent may exit before its workers, including after a crash.
+                # Do not hand the GPU over until remaining group members are killed.
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    deadline = time.monotonic() + 10
+                    while checkpoint.group_processes(process.pid):
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("SGLang workers did not exit; GPU handoff was refused.")
+                        time.sleep(0.1)
+                process.wait(timeout=30)
+            self.process = None
+            self._checkpoint = None
+            self._checkpoint_helper = None
+            self._uncertain_request = False
+            if self._log is not None:
+                self._log.close()
+                self._log = None
+
+    def log_tail(self, lines: int = 25) -> str:
+        try:
+            text = ANSI.sub("", self.log_path.read_text(encoding="utf-8", errors="replace"))
+            return "\n".join(text.splitlines()[-lines:])
+        except (OSError, AttributeError):
+            return "(no log)"
+
+    def speech(self, payload: dict) -> bytes:
+        with self._lock:
+            if self.sleeping:
+                raise RuntimeError("SGLang is asleep; wake it before generating speech.")
+            self._active_requests += 1
+        try:
+            response = requests.post(f"{self.base_url}/v1/audio/speech", json=payload,
+                                     timeout=self.settings.request_timeout)
+            if not response.ok:
+                raise RuntimeError(f"{self.label} speech request failed (HTTP {response.status_code}): {response.text[:500]}")
+            return response.content
+        except requests.RequestException:
+            # A client timeout does not prove GPU work has stopped remotely.
+            with self._lock:
+                self._uncertain_request = True
+            raise
+        finally:
+            with self._lock:
+                self._active_requests -= 1
+
+    def command(self) -> list[str]:
+        settings = self.settings
+        return [
+            str(environment.executable(settings.venv, "sgl-omni")), "serve",
+            "--model-path", str(settings.model_dir), "--host", "127.0.0.1", "--port", str(settings.port),
+            "--tts_engine.gpu_memory_fraction", str(settings.engine_memory),
+            "--vocoder.gpu_memory_fraction", str(settings.codec_memory),
+            "--tts_engine.factory.max_running_requests", str(settings.max_seqs),
+            # Reduce per-process graph capture on restart; keep decode graphs.
+            "--tts_engine.engine.cuda_graph_backend_prefill", "disabled",
+            "--tts_engine.factory.first_frame_cuda_graph_max_requests", "8",
+            # This route requests complete WAVs, not streaming codec windows.
+            "--vocoder.factory.window_cuda_graphs", "false",
+            # SGLang-Omni defaults to fishaudio/s2-pro's codec.pth from the Hub; the
+            # checkpoint ships the byte-identical file (sha256 74fc41c5...), so use it
+            # and keep startup offline.
+            "--vocoder.factory.codec_path", str(settings.model_dir / "codec.pth"),
+        ]
+
+    def payload(self, *, text, reference, transcript, max_new_tokens, sampling) -> dict:
+        # FishOmni rejects per-request seeds on SGLang-Omni's speech endpoint.
+        sampling = dict(sampling)
+        # The Drama 3 request builder requires a positive top_k. SGLang uses
+        # 1 << 30 (TOP_K_ALL) to represent the whole vocabulary internally.
+        if sampling.get("top_k") == 0:
+            sampling["top_k"] = 1 << 30
+        return {"input": text, "response_format": "wav", "max_new_tokens": max_new_tokens,
+                **sampling, "references": [{"audio_path": str(Path(reference).resolve()), "text": transcript}]}
+

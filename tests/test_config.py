@@ -46,7 +46,8 @@ class ConfigTests(unittest.TestCase):
         validate = namespace["_validate_local_service_ports"]
         validate()
         for name, port in (("Confucius4-TTS", settings.confucius_port),
-                           ("IndexTTS 2.5", settings.indextts25_port)):
+                           ("IndexTTS 2.5", settings.indextts25_port),
+                           ("Drama 3", settings.drama3_port)):
             with self.subTest(backend=name):
                 namespace["SETTINGS"] = replace(settings, port=port)
                 with self.assertRaisesRegex(RuntimeError, f"Local service port conflict:.*{name}"):

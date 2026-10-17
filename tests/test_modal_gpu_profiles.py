@@ -324,7 +324,10 @@ class SnapshotVolumeTests(unittest.TestCase):
                 self.assertEqual(namespace["_call_local_json"].call_args.args[0],
                                  "/internal/snapshot/sleep?level=1")
         for volume in volumes.values():
-            volume.reload.assert_not_called()
+            if fail_commit == 1:
+                volume.reload.assert_not_called()
+            else:
+                volume.reload.assert_called_once_with()
 
     def test_first_snapshot_persists_new_paths_and_warmup_artifacts(self):
         self.run_snapshot_start()

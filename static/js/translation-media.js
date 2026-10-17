@@ -191,9 +191,9 @@ function formatTimestamp(ms) {
             const safeUrl = escapeHtml(url || '');
             const safePoster = posterUrl ? ` poster="${escapeHtml(posterUrl)}"` : '';
             return `
-                    <div data-lazy-video-wrap style="position:relative;margin-top:10px;border-radius:8px;overflow:hidden;background:#000;">
-                        <video class="lazy-video" controls preload="none" data-lazy-src="${safeUrl}"${safePoster} style="width:100%;max-height:${escapeHtml(maxHeight)};display:block;background:#000;"></video>
-                        <button type="button" class="btn lazy-video-play" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:8px 16px;">Play</button>
+                    <div data-lazy-video-wrap class="video-frame">
+                        <video class="lazy-video" controls preload="none" data-lazy-src="${safeUrl}"${safePoster} style="max-height:${escapeHtml(maxHeight)};"></video>
+                        <button type="button" class="btn lazy-video-play">Play</button>
                     </div>
                 `;
         }

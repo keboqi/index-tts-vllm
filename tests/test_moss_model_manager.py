@@ -69,6 +69,7 @@ class ModelManagerRoutingTests(unittest.IsolatedAsyncioTestCase):
                      "tts_manager": SimpleNamespace(sleep_engine=AsyncMock(), is_ready=lambda: False),
                      "confucius_backend_manager": SimpleNamespace(_process_running=lambda: False),
                      "indextts25_backend_manager": SimpleNamespace(process_running=lambda: False),
+                     "drama3_backend_manager": SimpleNamespace(process_running=lambda: False),
                      "_run_blocking": AsyncMock(return_value=[]), "_unload_optional_model_sync": Mock()}
         for name in ("_managed_model_inventory", "_change_moss_model", "api_models_status",
                      "api_models_unload", "api_models_wake"):

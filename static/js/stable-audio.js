@@ -158,19 +158,19 @@ let stableAudioModels = [];
                         throw new Error('Stable Audio generation returned no audio.');
                     }
                     resultEl.innerHTML = `
-                            <h3>Generated Audio (${items.length} clips, ${elapsed}s)</h3>
-                            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:10px;">
+                            <h3 class="mt-3">Generated Audio (${items.length} clips, ${elapsed}s)</h3>
+                            <div class="card-grid mt-1">
                                 ${items.map((item, index) => {
                         const metadata = item.metadata || {};
                         const seedLabel = metadata.seed && metadata.seed > 0 ? `Seed ${metadata.seed}` : 'Random seed';
                         const audioUrl = `data:${item.media_type || `audio/${extension}`};base64,${item.audio_base64 || ''}`;
                         const filename = item.filename || `stable-audio-3-${index + 1}.${extension}`;
                         return `
-                                        <div class="segment-card" style="padding:14px;">
-                                            <div class="segment-header" style="margin-bottom:8px;">Clip ${index + 1}</div>
-                                            <small style="color:var(--text-muted);">${escapeHtml(seedLabel)}${metadata.elapsed_seconds ? ` - ${Number(metadata.elapsed_seconds).toFixed(2)}s backend` : ''}</small>
-                                            <audio controls preload="none" style="width:100%;margin:10px 0;" src="${audioUrl}"></audio>
-                                            <a href="${audioUrl}" download="${escapeHtml(filename)}" class="btn btn-secondary" style="padding:8px 12px;font-size:0.82rem;">Download</a>
+                                        <div class="result-card">
+                                            <h4 class="mb-0">Clip ${index + 1}</h4>
+                                            <small>${escapeHtml(seedLabel)}${metadata.elapsed_seconds ? ` - ${Number(metadata.elapsed_seconds).toFixed(2)}s backend` : ''}</small>
+                                            <audio controls preload="none" class="w-full mt-1 mb-1" src="${audioUrl}"></audio>
+                                            <a href="${audioUrl}" download="${escapeHtml(filename)}" class="btn btn-secondary btn-sm">Download</a>
                                         </div>
                                     `;
                     }).join('')}
@@ -181,8 +181,8 @@ let stableAudioModels = [];
                     const blob = await response.blob();
                     const audioUrl = URL.createObjectURL(blob);
                     resultEl.innerHTML = `
-                            <h3>Generated Audio (${elapsed}s)</h3>
-                            <audio controls autoplay preload="none" style="width: 100%; margin: 10px 0;" src="${audioUrl}"></audio>
+                            <h3 class="mt-3">Generated Audio (${elapsed}s)</h3>
+                            <audio controls autoplay preload="none" class="w-full mt-1 mb-1" src="${audioUrl}"></audio>
                             <br>
                             <a href="${audioUrl}" download="stable-audio-3.${extension}" class="btn">Download</a>
                         `;

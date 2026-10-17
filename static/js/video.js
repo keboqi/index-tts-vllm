@@ -28,18 +28,18 @@ function getSelectedDownloadedVideoId() {
                 const url = video.url || `${ENDPOINTS.DOWNLOADED_VIDEOS}/${encodeURIComponent(video.id)}`;
                 const posterUrl = video.poster_url || `${url}/snapshot`;
                 return `
-                        <div class="segment-card" data-video-id="${escapeHtml(video.id)}" style="padding: 14px;">
-                            <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
-                                <div style="min-width:0;">
+                        <div class="media-card" data-video-id="${escapeHtml(video.id)}">
+                            <div class="row-between">
+                                <div class="grow">
                                     <div class="segment-header" title="${title}">${title}</div>
-                                    <small style="color:var(--text-muted);">${escapeHtml(video.extension || 'video').toUpperCase()}${size ? ` • ${size}` : ''}${duration}</small>
+                                    <small>${escapeHtml(video.extension || 'video').toUpperCase()}${size ? ` • ${size}` : ''}${duration}</small>
                                 </div>
                             </div>
                             ${lazyVideoMarkup(url, posterUrl, '220px')}
-                            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
-                                <button type="button" class="btn btn-secondary downloaded-video-use" data-video-id="${escapeHtml(video.id)}" style="padding:6px 12px;font-size:0.82rem;">Use in Translate</button>
-                                <a class="btn btn-secondary" href="${url}" download="${escapeHtml(video.filename || video.id)}" style="padding:6px 12px;font-size:0.82rem;">Download</a>
-                                <button type="button" class="btn btn-danger downloaded-video-delete" data-video-id="${escapeHtml(video.id)}" data-video-title="${title}" style="padding:6px 12px;font-size:0.82rem;">🗑️ Delete</button>
+                            <div class="btn-group mt-1">
+                                <button type="button" class="btn btn-sm btn-secondary downloaded-video-use" data-video-id="${escapeHtml(video.id)}">Use in Translate</button>
+                                <a class="btn btn-secondary btn-sm" href="${url}" download="${escapeHtml(video.filename || video.id)}">Download</a>
+                                <button type="button" class="btn btn-sm btn-danger downloaded-video-delete" data-video-id="${escapeHtml(video.id)}" data-video-title="${title}">🗑️ Delete</button>
                             </div>
                         </div>
                     `;
@@ -127,17 +127,17 @@ function getSelectedDownloadedVideoId() {
                 const createdLabel = video.mtime_label ? ` • ${escapeHtml(video.mtime_label)}` : '';
                 const encodedId = encodeURIComponent(id);
                 return `
-                        <div class="segment-card" data-translated-video-id="${encodedId}" style="padding: 14px;">
-                            <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;">
-                                <div style="min-width:0;">
+                        <div class="media-card" data-translated-video-id="${encodedId}">
+                            <div class="row-between">
+                                <div class="grow">
                                     <div class="segment-header" title="${title}">${title}</div>
-                                    <small style="color:var(--text-muted);">${extension}${size ? ` • ${size}` : ''}${duration}${createdLabel}</small>
+                                    <small>${extension}${size ? ` • ${size}` : ''}${duration}${createdLabel}</small>
                                 </div>
                             </div>
                             ${lazyVideoMarkup(url, posterUrl, '220px')}
-                            <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
-                                <a class="btn btn-secondary" href="${escapeHtml(url)}" download="${escapeHtml(video.filename || id)}" style="padding:6px 12px;font-size:0.82rem;">Download</a>
-                                <button type="button" class="btn btn-danger translated-video-delete" data-video-id="${encodedId}" style="padding:6px 12px;font-size:0.82rem;">🗑️ Delete</button>
+                            <div class="btn-group mt-1">
+                                <a class="btn btn-secondary btn-sm" href="${escapeHtml(url)}" download="${escapeHtml(video.filename || id)}">Download</a>
+                                <button type="button" class="btn btn-sm btn-danger translated-video-delete" data-video-id="${encodedId}">🗑️ Delete</button>
                             </div>
                         </div>
                     `;
@@ -246,12 +246,12 @@ function getSelectedDownloadedVideoId() {
                 if (infoDiv) {
                     const formats = Array.isArray(data.formats) ? data.formats.slice(0, 8) : [];
                     infoDiv.innerHTML = `
-                            <div class="segment-card" style="padding:14px;">
+                            <div class="result-card">
                                 <div class="segment-header">${escapeHtml(data.title || 'Video')}</div>
-                                <small style="color:var(--text-muted);">${escapeHtml(data.duration_label || '')}</small>
-                                ${data.thumbnail ? `<img src="${data.thumbnail}" alt="" style="width:100%;max-height:260px;object-fit:cover;border-radius:8px;margin-top:10px;">` : ''}
-                                ${formats.length ? `<div style="margin-top:10px;color:var(--text-muted);font-size:0.82rem;">${formats.map(fmt => escapeHtml([fmt.resolution, fmt.ext, fmt.note].filter(Boolean).join(' / '))).join('<br>')}</div>` : ''}
-                                ${data.format_warning ? `<div style="margin-top:10px;color:var(--error);font-size:0.82rem;">${escapeHtml(data.format_warning)}</div>` : ''}
+                                <small>${escapeHtml(data.duration_label || '')}</small>
+                                ${data.thumbnail ? `<img src="${data.thumbnail}" alt="" class="video-thumb">` : ''}
+                                ${formats.length ? `<div class="mt-1 muted text-sm">${formats.map(fmt => escapeHtml([fmt.resolution, fmt.ext, fmt.note].filter(Boolean).join(' / '))).join('<br>')}</div>` : ''}
+                                ${data.format_warning ? `<div class="mt-1 text-danger text-sm">${escapeHtml(data.format_warning)}</div>` : ''}
                             </div>
                         `;
                 }
@@ -385,17 +385,17 @@ function getSelectedDownloadedVideoId() {
                 const response = await fetch(ENDPOINTS.COOKIES_LIST, { cache: 'no-cache' });
                 const data = await response.json();
                 if (data.status !== 'ok' || !data.sites || Object.keys(data.sites).length === 0) {
-                    container.innerHTML = '<span style="color: var(--text-muted); font-size: 0.85rem;">No cookies saved yet.</span>';
+                    container.innerHTML = '<span class="muted text-sm">No cookies saved yet.</span>';
                     return;
                 }
                 container.innerHTML = Object.entries(data.sites).map(([domain, info]) => {
                     const downloadUrl = info.download_url || `${ENDPOINTS.COOKIES_LIST}/${encodeURIComponent(domain)}/download`;
                     return `
-                            <div style="display: flex; align-items: center; gap: 8px; padding: 4px 0;">
-                                <span style="color: #51cf66; font-size: 0.88rem;">✓ ${escapeHtml(domain)}</span>
-                                <span style="color: var(--text-muted); font-size: 0.8rem;">(${info.count} cookies)</span>
-                                <a class="btn btn-secondary" href="${escapeHtml(downloadUrl)}" download style="padding: 2px 8px; font-size: 0.75rem; margin-left: auto;">Backup</a>
-                                <button type="button" class="btn btn-danger cookie-delete-btn" data-domain="${escapeHtml(domain)}" style="padding: 2px 8px; font-size: 0.75rem;">✕</button>
+                            <div class="row cookie-row">
+                                <span class="text-success text-sm">✓ ${escapeHtml(domain)}</span>
+                                <span class="muted text-xs">(${info.count} cookies)</span>
+                                <a class="btn btn-secondary btn-sm push-right" href="${escapeHtml(downloadUrl)}" download>Backup</a>
+                                <button type="button" class="btn btn-danger btn-sm cookie-delete-btn" data-domain="${escapeHtml(domain)}" aria-label="Delete cookies">✕</button>
                             </div>
                         `;
                 }).join('');

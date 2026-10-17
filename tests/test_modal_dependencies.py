@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 from indextts_web.infrastructure.modal_dependencies import MAIN_DEPENDENCY_FILES, install_main_dependencies
@@ -134,7 +134,7 @@ class ModalImageCacheTests(unittest.TestCase):
                 return self.generic_visit(node)
 
         tree = ast.fix_missing_locations(ChangeRuntimeValues().visit(ast.Module(body=nodes, type_ignores=[])))
-        namespace = {"Path": Path, "__file__": str(source),
+        namespace = {"Path": Path, "PurePosixPath": PurePosixPath, "shlex": shlex, "__file__": str(source),
                      "modal": SimpleNamespace(is_local=lambda: True, Image=RecordingImage())}
         exec(compile(tree, str(source), "exec"), namespace)
         return namespace["image"].layers

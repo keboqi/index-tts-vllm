@@ -23,6 +23,7 @@ class BackendLifecycleTests(unittest.IsolatedAsyncioTestCase):
             ),
             confucius_backend_manager=self.confucius,
             indextts25_backend_manager=self.index25,
+            drama3_backend_manager=SimpleNamespace(status=AsyncMock(return_value={"ready": True, "backend": "drama3"}), shutdown=AsyncMock()),
         )
         self.registry = build_backend_registry(self.legacy)
 
@@ -31,7 +32,7 @@ class BackendLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await self.registry.get("index").status(),
             {"ready": True, "indextts_vllm_sleeping": False},
         )
-        for name, manager in (("confucius", self.confucius), ("index25", self.index25)):
+        for name, manager in (("confucius", self.confucius), ("index25", self.index25), ("drama3", self.legacy.drama3_backend_manager)):
             with self.subTest(backend=name):
                 self.assertEqual(
                     await self.registry.get(name).status(),
@@ -43,6 +44,7 @@ class BackendLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self.registry.shutdown()
         self.confucius.shutdown.assert_awaited_once_with()
         self.index25.shutdown.assert_awaited_once_with()
+        self.legacy.drama3_backend_manager.shutdown.assert_awaited_once_with()
 
 
 if __name__ == "__main__":
