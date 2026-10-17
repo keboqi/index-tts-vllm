@@ -151,12 +151,13 @@ class StartupBackendTests(unittest.IsolatedAsyncioTestCase):
                      "_configure_persistent_runtime": Mock(return_value=ROOT), "_build_webui_command": builder,
                      "_commit_snapshot_volumes": lambda phase: calls.append(phase),
                      "_wait_ready": Mock(), "_call_local_json": lambda path, **kwargs: calls.append(path),
+                     "_start_cache_commit_watcher": lambda: calls.append("watch"),
                      "SNAPSHOT_STARTUP_TIMEOUT": 1800}
         start = load_definition(ROOT / "deploy_vllm_indextts_v2.py", "QuickStartServer.start", namespace)
         start(SimpleNamespace())
         namespace["_configure_persistent_runtime"].assert_called_once_with(startup_tts_backend="none")
         builder.assert_called_once_with(ROOT, startup_tts_backend="none")
-        self.assertEqual(calls, [])
+        self.assertEqual(calls, ["watch"])  # no snapshot commits or warmup, only the cache watcher
 
     def test_external_reference_presets_do_not_require_index_embeddings(self):
         namespace = {"os": os, "time": time}

@@ -89,26 +89,20 @@ def ensure_model(settings: ServerSettings, *, token=None, log=print) -> Path:
 
 
 def persist_caches() -> None:
-    """Commit the Modal volume in the background so compile caches outlive the container.
+    """Ask the Modal entry process to commit its volumes so compile caches outlive the container.
 
     Writes to a Modal volume are only kept once committed; without this, every
-    container restart or redeploy recompiled from scratch. No-op elsewhere.
+    container restart or redeploy recompiled from scratch. Only the Modal entry
+    process can commit (the WebUI runs without the ``modal`` SDK), so this just
+    touches the request file it watches. No-op elsewhere.
     """
-    names = os.getenv("DRAMA3_MODAL_COMMIT_VOLUMES", "")
-    if not names:
+    request = os.getenv("DRAMA3_MODAL_COMMIT_REQUEST", "")
+    if not request:
         return
-
-    def commit():
-        try:
-            import modal
-
-            for name in names.split(","):
-                modal.Volume.from_name(name.strip()).commit()
-            print("[drama3-serving] Committed compile caches to the volume.", flush=True)
-        except Exception as exc:  # never fail a job over cache persistence
-            print(f"[drama3-serving] Could not commit compile caches: {exc}", flush=True)
-
-    threading.Thread(target=commit, name="drama3-cache-commit", daemon=True).start()
+    try:
+        Path(request).write_text(str(time.time()), encoding="utf-8")
+    except OSError as exc:  # never fail a job over cache persistence
+        print(f"[drama3-serving] Could not request a compile cache commit: {exc}", flush=True)
 
 
 def gpu_memory():

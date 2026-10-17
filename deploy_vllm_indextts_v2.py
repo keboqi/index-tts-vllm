@@ -43,6 +43,9 @@ INDEXTTS25_IMAGE_DIR = "/app/index-tts-2.5-vllm-omni-experiment"
 INDEXTTS25_APP_SUBDIR = "index-tts-2.5-vllm-omni-experiment"
 INDEXTTS25_VENV_DIR = "/opt/indextts25-venv"
 DRAMA3_VENV_DIR = "/opt/drama3-sglang-venv"
+# The WebUI touches this after Drama 3 writes compile caches; the Modal entry
+# process (the only one with the modal SDK) commits the volumes in response.
+DRAMA3_COMMIT_REQUEST_FILE = "/tmp/drama3-cache-commit.request"
 DRAMA3_SNAPSHOT_DATA_DIR = "/tmp/drama3-serving"
 INDEXTTS25_PYTHON = f"{INDEXTTS25_VENV_DIR}/bin/python"
 INDEXTTS25_VLLM = f"{INDEXTTS25_VENV_DIR}/bin/vllm"
@@ -280,7 +283,7 @@ if modal.is_local():
         "DRAMA3_VENV": DRAMA3_VENV_DIR,
         "DRAMA3_MODEL_DIR": "/persistent_app/checkpoints/drama3",
         "DRAMA3_DATA_DIR": "/persistent_cache/drama3-serving",
-        "DRAMA3_MODAL_COMMIT_VOLUMES": "audio-studio-app,audio-studio-cache",
+        "DRAMA3_MODAL_COMMIT_REQUEST": DRAMA3_COMMIT_REQUEST_FILE,
         "CLEARVOICE_PYTHON": CLEARVOICE_PYTHON,
         "QWEN_OMNIVAD_PYTHON": QWEN_ASR_PYTHON,
         "QWEN_OMNIVAD_MODEL_DIR": "/persistent_app/checkpoints/qwen_omnivad",
@@ -600,6 +603,7 @@ def legacy_serve_without_snapshot():
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
     subprocess.Popen(cmd, cwd=str(persistent_app_path), env=env)
+    _start_cache_commit_watcher()
 
 
 def _local_url(path: str) -> str:
@@ -656,6 +660,36 @@ def _wait_ready(proc: subprocess.Popen, *, timeout_seconds: int) -> None:
         f"Timed out waiting {timeout_seconds}s for FastAPI server readiness. "
         f"Last error: {last_error}"
     )
+
+
+def _start_cache_commit_watcher(poll_seconds: float = 5.0) -> None:
+    """Commit both volumes whenever the WebUI requests it via DRAMA3_COMMIT_REQUEST_FILE."""
+    import threading
+
+    request = Path(DRAMA3_COMMIT_REQUEST_FILE)
+
+    def requested_at() -> float:
+        try:
+            return request.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def watch():
+        handled = 0.0
+        while True:
+            time.sleep(poll_seconds)
+            current = requested_at()
+            if current <= handled:
+                continue
+            handled = current
+            try:
+                cache_storage.commit()
+                app_storage.commit()
+                print("[drama3-serving] Committed compile caches to the volume.", flush=True)
+            except Exception as exc:  # never take the server down over cache persistence
+                print(f"[drama3-serving] Could not commit compile caches: {exc}", flush=True)
+
+    threading.Thread(target=watch, name="drama3-cache-commit", daemon=True).start()
 
 
 def _stop_webui(proc: Optional[subprocess.Popen]) -> None:
@@ -1231,6 +1265,8 @@ class IndexTTSVllmServer:
             internal=True,
         )
         _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
+        # Started after restore so no live thread is captured in the memory snapshot.
+        _start_cache_commit_watcher()
 
     @modal.web_server(port=VLLM_PORT, startup_timeout=SNAPSHOT_STARTUP_TIMEOUT, label="tts")
     def serve(self):
@@ -1272,6 +1308,7 @@ class QuickStartServer:
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
         self.server_proc = subprocess.Popen(cmd, cwd=str(persistent_app_path), env=env)
+        _start_cache_commit_watcher()
 
         _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)
 
@@ -1344,7 +1381,7 @@ class Drama3SglangServer:
         # Modal captures the awake GPU pipeline. Do not nest a separate NVIDIA
         # driver checkpoint job inside the Modal snapshot being created.
         env["DRAMA3_MODAL_SNAPSHOT_CAPTURE"] = "1"
-        env.pop("DRAMA3_MODAL_COMMIT_VOLUMES", None)
+        env.pop("DRAMA3_MODAL_COMMIT_REQUEST", None)
         self.server_proc = subprocess.Popen(cmd, cwd=str(persistent_app_path), env=env)
 
         _wait_ready(self.server_proc, timeout_seconds=SNAPSHOT_STARTUP_TIMEOUT)

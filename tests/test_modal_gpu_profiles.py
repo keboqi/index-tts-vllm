@@ -200,6 +200,7 @@ class SnapshotWarmupTests(unittest.IsolatedAsyncioTestCase):
         namespace = {"print": Mock(),
                      "_call_local_json": lambda path, **kwargs: events.append(path),
                      "_wait_ready": lambda proc, **kwargs: events.append("ready"),
+                     "_start_cache_commit_watcher": lambda: events.append("watch"),
                      "SNAPSHOT_REQUEST_TIMEOUT": 900, "SNAPSHOT_STARTUP_TIMEOUT": 1800}
         restore = load_definition(ROOT / "deploy_vllm_indextts_v2.py", "IndexTTSVllmServer.wake_up", namespace)
         server = SimpleNamespace(server_proc=Mock())
@@ -210,7 +211,7 @@ class SnapshotWarmupTests(unittest.IsolatedAsyncioTestCase):
                           return_value=resolve_gpu_profile(gpu(size), {}, modal=True)), \
                     patch("indextts_web.infrastructure.gpu.probe_gpu", return_value=gpu(size)):
                 restore(server)
-                self.assertEqual(events, ["/internal/snapshot/wake", "ready"])
+                self.assertEqual(events, ["/internal/snapshot/wake", "ready", "watch"])
         events.clear()
         with patch("indextts_web.gpu_profiles.runtime_gpu_profile",
                    return_value=resolve_gpu_profile(gpu(96), {}, modal=True)), \

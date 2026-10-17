@@ -14,6 +14,7 @@ from indextts_web.services.tts.base import SynthesisRequest
 from indextts_web.services.tts.drama3 import Drama3Backend
 from indextts_web.services.tts.drama3_manager import ManagedDrama3Backend, emotion_prefix
 from indextts_web.services.tts.drama3_serving.requirements import drama3_sglang_install_commands
+from indextts_web.services.tts.drama3_serving.server import persist_caches
 from tests.support import ROOT, load_definition
 
 
@@ -71,6 +72,25 @@ class Drama3Tests(unittest.IsolatedAsyncioTestCase):
         legacy._postprocess_ffmpeg_duration.reset_mock()
         await backend.synthesize(SynthesisRequest(text="Hello.", output_path=Path("out.wav")))
         legacy._postprocess_ffmpeg_duration.assert_not_awaited()
+
+    def test_cache_persistence_requests_commit_from_modal_entry_process(self):
+        request = self.root / "commit.request"
+        with patch.dict("os.environ", {"DRAMA3_MODAL_COMMIT_REQUEST": str(request)}):
+            persist_caches()  # the WebUI has no modal SDK; it only signals
+        self.assertTrue(request.is_file())
+        committed = threading.Event()
+        volumes = [Mock(), Mock(commit=Mock(side_effect=committed.set))]
+        polls = []
+        def sleep(_seconds):  # one poll, then park the daemon thread idle
+            polls.append(1)
+            if len(polls) > 1:
+                threading.Event().wait()
+        namespace = {"Path": Path, "time": SimpleNamespace(sleep=sleep), "DRAMA3_COMMIT_REQUEST_FILE": str(request),
+                     "cache_storage": volumes[0], "app_storage": volumes[1]}
+        watch = load_definition(ROOT / "deploy_vllm_indextts_v2.py", "_start_cache_commit_watcher", namespace)
+        watch()
+        self.assertTrue(committed.wait(5))
+        volumes[0].commit.assert_called_once()
 
     def test_config_and_modal_launch_cover_persistent_isolated_runtime(self):
         settings = load_settings(["--tts_backend", "drama3"], environ={"DRAMA3_PORT": "8097"})
