@@ -26,11 +26,11 @@ from typing import Any
 from indextts_web.config import AppSettings
 from indextts_web.infrastructure.gpu_work import gpu_operation
 
+from .chunking import allocate_durations, join_wav, render_segments, split_text, text_token_units  # noqa: F401
+
 INDEXTTS25_BACKEND = "index25"
 INDEXTTS25_LANGUAGES = ("zh", "en", "ja", "es", "ar")
 INDEXTTS25_MODEL_HOP_LENGTH = 256
-_TEXT_BOUNDARY = re.compile(r"(?<=[.!?。！？；;])\s*")
-_TEXT_TOKEN_UNIT = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9]+|[^\s]")
 _LANGUAGE_ALIASES = {
     "arabic": "ar",
     "ar": "ar",
@@ -68,96 +68,6 @@ def audio_reference(value: str, *, use_cache: bool = True) -> str:
     mime = mimetypes.guess_type(path.name)[0] or "audio/wav"
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{encoded}"
-
-
-def text_token_units(text: str) -> int:
-    """Estimate token weight without loading the backend tokenizer."""
-    units = 0
-    for match in _TEXT_TOKEN_UNIT.finditer(text):
-        token = match.group(0)
-        if token.isascii() and token.isalnum():
-            units += max(1, (len(token) + 3) // 4)
-        else:
-            units += 1
-    return max(1, units) if text.strip() else 0
-
-
-def _join_text_pieces(left: str, right: str) -> str:
-    separator = " " if left[-1:].isascii() and right[:1].isascii() else ""
-    return f"{left}{separator}{right}"
-
-
-def split_text(text: str, max_tokens: int) -> list[str]:
-    value = text.strip()
-    if not value:
-        return []
-    pieces = [piece.strip() for piece in _TEXT_BOUNDARY.split(value) if piece.strip()]
-    result: list[str] = []
-    for piece in pieces:
-        words = piece.split()
-        if len(words) == 1 and len(piece) > max_tokens:
-            result.extend(piece[index : index + max_tokens] for index in range(0, len(piece), max_tokens))
-        elif len(words) <= max_tokens:
-            result.append(piece)
-        else:
-            result.extend(
-                " ".join(words[index : index + max_tokens])
-                for index in range(0, len(words), max_tokens)
-            )
-    # Match IndexTTS 2.0: merge adjacent short sentences so clause startup
-    # cadence and punctuation pauses do not consume separate hard budgets.
-    merged: list[str] = []
-    for piece in result:
-        if merged:
-            candidate = _join_text_pieces(merged[-1], piece)
-            if text_token_units(candidate) <= max_tokens:
-                merged[-1] = candidate
-                continue
-        merged.append(piece)
-    return merged
-
-
-def allocate_durations(texts: list[str], total_ms: int, silence_ms: int) -> list[int]:
-    if not texts:
-        return []
-    if total_ms <= 0:
-        return [0] * len(texts)
-    available = total_ms - max(0, len(texts) - 1) * silence_ms
-    if available < len(texts):
-        raise ValueError("target duration is shorter than requested inter-sentence silence")
-    # IndexTTS 2.0 distributes duration by tokenizer length. This lightweight
-    # estimate avoids character-count bias before the remote 2.5 tokenizer
-    # performs the authoritative tokenization.
-    weights = [text_token_units(text) for text in texts]
-    weight_sum = sum(weights)
-    durations = [max(1, round(available * weight / weight_sum)) for weight in weights]
-    durations[-1] += available - sum(durations)
-    return durations
-
-
-def join_wav(chunks: list[bytes], silence_ms: int = 0) -> bytes:
-    if not chunks:
-        raise ValueError("IndexTTS 2.5 returned no WAV chunks")
-    output = io.BytesIO()
-    params = None
-    frames: list[bytes] = []
-    for index, chunk in enumerate(chunks):
-        with wave.open(io.BytesIO(chunk), "rb") as source:
-            current = source.getparams()
-            signature = (current.nchannels, current.sampwidth, current.framerate, current.comptype)
-            if params is None:
-                params = current
-            elif signature != (params.nchannels, params.sampwidth, params.framerate, params.comptype):
-                raise ValueError("IndexTTS 2.5 WAV chunks use incompatible audio formats")
-            frames.append(source.readframes(source.getnframes()))
-            if index + 1 < len(chunks) and silence_ms:
-                silence_frames = round(current.framerate * silence_ms / 1000)
-                frames.append(b"\x00" * silence_frames * current.nchannels * current.sampwidth)
-    assert params is not None
-    with wave.open(output, "wb") as target:
-        target.setparams(params)
-        target.writeframes(b"".join(frames))
-    return output.getvalue()
 
 
 def fit_wav_duration(
@@ -631,9 +541,8 @@ class ManagedIndexTTS25Backend:
             raise RuntimeError(f"IndexTTS 2.5 vLLM-Omni HTTP {exc.code}: {detail}") from exc
 
     async def _synthesize_segment(self, payload: dict[str, Any]) -> bytes:
-        async with self._segment_slots:
-            timeout = max(1.0, float(self.settings.indextts25_request_timeout))
-            return await asyncio.to_thread(self._post_audio_sync, payload, timeout)
+        timeout = max(1.0, float(self.settings.indextts25_request_timeout))
+        return await asyncio.to_thread(self._post_audio_sync, payload, timeout)
 
     @gpu_operation("index25")
     async def synthesize_to_file(
@@ -682,7 +591,7 @@ class ManagedIndexTTS25Backend:
                 )
                 for index, (segment, duration) in enumerate(zip(texts, durations, strict=True))
             ]
-            chunks = await asyncio.gather(*(self._synthesize_segment(payload) for payload in payloads))
+            chunks = await render_segments(payloads, self._synthesize_segment, slots=self._segment_slots)
         finally:
             self._active_requests = max(0, self._active_requests - 1)
         audio = join_wav(chunks, max(0, int(interval_silence)))

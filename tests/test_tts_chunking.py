@@ -1,0 +1,74 @@
+import asyncio
+import unittest
+
+from indextts_web.services.tts.chunking import render_segments, split_text
+from indextts_web.services.tts.drama3_manager import DRAMA3_MARKUP, emotion_prefix
+
+
+class SplitTextTests(unittest.TestCase):
+    def test_plain_text_merges_short_sentences_up_to_budget(self):
+        self.assertEqual(split_text("One. Two words! Three.", 120), ["One. Two words! Three."])
+        self.assertEqual(split_text("One. Two. Three.", 4), ["One. Two.", "Three."])
+
+    def test_cut_long_word_never_gains_inner_spaces(self):
+        chunks = split_text("abcdefghij", 3)
+        self.assertEqual("".join(chunks), "abcdefghij")
+
+    def test_point_tag_with_punctuation_and_spaces_stays_whole(self):
+        text = "[horrified, staring at the plate. really] No. Absolutely not. [sighs] Fine."
+        self.assertEqual(split_text(text, 3, markup=DRAMA3_MARKUP), [
+            "[horrified, staring at the plate. really] No.", "Absolutely not.", "[sighs] Fine.",
+        ])
+
+    def test_speaker_tag_carries_into_later_chunks(self):
+        text = "<|speaker:0|> Hi there. How are you? <|speaker:1|> Fine. Bye now."
+        self.assertEqual(split_text(text, 3, markup=DRAMA3_MARKUP), [
+            "<|speaker:0|> Hi there.", "<|speaker:0|> How are you?",
+            "<|speaker:1|> Fine.", "<|speaker:1|> Bye now.",
+        ])
+
+    def test_paired_tag_cut_by_boundary_is_closed_and_reopened(self):
+        text = "<whisper>Go on without me. Please, just go.</whisper> Okay."
+        self.assertEqual(split_text(text, 4, markup=DRAMA3_MARKUP), [
+            "<whisper>Go on without me.</whisper>", "<whisper>Please, just go.</whisper>", "Okay.",
+        ])
+
+    def test_tag_only_tail_joins_previous_chunk(self):
+        self.assertEqual(split_text("Hello there. Bye now. [laughs]", 2, markup=DRAMA3_MARKUP),
+                         ["Hello there.", "Bye now. [laughs]"])
+
+    def test_cjk_slicing_never_cuts_inside_a_tag(self):
+        text = "你好世界[开心地笑]今天天气很好我们出去玩吧"
+        chunks = split_text(text, 6, markup=DRAMA3_MARKUP)
+        self.assertEqual("".join(chunks), text)
+        self.assertTrue(any("[开心地笑]" in chunk for chunk in chunks))
+        for chunk in chunks:
+            self.assertEqual(chunk.count("["), chunk.count("]"))
+
+    def test_unclosed_bracket_is_plain_text(self):
+        self.assertEqual(split_text("a [b. c.", 4, markup=DRAMA3_MARKUP), ["a [b.", "c."])
+
+    def test_emotion_prefix_keeps_speaker_tag_first(self):
+        self.assertEqual(emotion_prefix("<|speaker:1|> Fine.", "sad"), "<|speaker:1|> [sad] Fine.")
+        self.assertEqual(emotion_prefix("Fine.", "[sad]"), "[sad] Fine.")
+
+
+class RenderSegmentsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_under_cap_and_ordered(self):
+        running = peak = 0
+
+        async def render(value):
+            nonlocal running, peak
+            running += 1
+            peak = max(peak, running)
+            await asyncio.sleep(0.01 * (5 - value))
+            running -= 1
+            return bytes([value])
+
+        result = await render_segments(range(5), render, slots=asyncio.Semaphore(3))
+        self.assertEqual(result, [bytes([i]) for i in range(5)])
+        self.assertEqual(peak, 3)
+
+
+if __name__ == "__main__":
+    unittest.main()

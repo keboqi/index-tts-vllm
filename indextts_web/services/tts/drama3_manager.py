@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import shutil
-import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -15,15 +15,35 @@ from indextts_web.infrastructure.gpu_work import await_gpu_job, gpu_operation
 
 from .drama3_serving import environment
 from .drama3_serving.server import ServerSettings, SglangOmniServer, ensure_model, persist_caches
-from .index25_manager import join_wav, split_text
+from .chunking import TextMarkup, join_wav, render_segments, split_text
 
 # SGLang-Omni rejects Drama 3 requests above this; shared callers may ask for more.
 MAX_NEW_TOKENS = 2048
 
 
+# Drama 3 inline control tags (fishaudio/drama-3 model card, fish.audio/drama-3):
+# point directions or sounds in square brackets ("[sighs]", "[horrified, staring
+# at the plate]"), paired tags scoping words ("<whisper>Go on.</whisper>"), and
+# speaker tags "<|speaker:0|>".."<|speaker:15|>". Text without a leading speaker
+# tag is spoken by speaker 0.
+_SPEAKER_TAG = re.compile(r"<\|speaker:\d+\|>")
+DRAMA3_MARKUP = TextMarkup(
+    atomic=re.compile(r"<\|speaker:\d+\|>|</?[A-Za-z][\w-]*>|\[[^\[\]\n]*\]"),
+    speaker=_SPEAKER_TAG,
+    paired_open=re.compile(r"<([A-Za-z][\w-]*)>"),
+    paired_close=re.compile(r"</([A-Za-z][\w-]*)>"),
+)
+
+
 def emotion_prefix(text: str, emotion: str | None) -> str:
     description = (emotion or "").strip().strip("[]").strip()
-    return f"[{description}] {text}" if description else text
+    if not description:
+        return text
+    # Keep a leading speaker tag first so the chunk is not reassigned to speaker 0.
+    lead = _SPEAKER_TAG.match(text)
+    if lead:
+        return f"{lead.group(0)} [{description}] {text[lead.end():].lstrip()}"
+    return f"[{description}] {text}"
 
 
 class ManagedDrama3Backend:
@@ -45,9 +65,10 @@ class ManagedDrama3Backend:
             request_timeout=settings.drama3_request_timeout,
             sleep_mode=settings.drama3_sleep,
         ))
-        self._slots = asyncio.Semaphore(settings.drama3_max_parallel_segments)
-        # Chunks of every request share the server's running-request budget.
-        self._chunk_slots = threading.BoundedSemaphore(settings.drama3_max_parallel_segments)
+        # Chunks of every request share the server's running-request budget,
+        # on threads of their own so the default executor never caps them.
+        self._segment_slots = asyncio.Semaphore(settings.drama3_max_parallel_segments)
+        self._speech_pool = ThreadPoolExecutor(settings.drama3_max_parallel_segments, thread_name_prefix="drama3-chunk")
         self._server.checkpoint_launch_enabled = os.getenv("DRAMA3_MODAL_SNAPSHOT_CAPTURE") != "1"
 
     def process_running(self) -> bool:
@@ -98,43 +119,26 @@ class ManagedDrama3Backend:
         return payload
 
     def _speak_chunk(self, payload: dict) -> bytes:
-        with self._chunk_slots:
-            content = self._server.speech(payload)
+        content = self._server.speech(payload)
         if not content.startswith(b"RIFF") or content[8:12] != b"WAVE":
             raise RuntimeError("Drama 3 returned an invalid WAV response")
         return content
 
-    def _synthesize_sync(self, *, text, output_path, prompt_wav=None, max_text_tokens=120,
-                         interval_silence_ms=0, **kwargs):
-        if prompt_wav:
-            source = Path(prompt_wav)
-            digest = hashlib.sha256(source.read_bytes()).hexdigest()
-            staged = self._server.settings.media_dir / "references" / f"{digest}{source.suffix.lower()}"
-            staged.parent.mkdir(parents=True, exist_ok=True)
-            if not staged.is_file():
-                temporary = staged.with_name(f".{staged.name}.{uuid.uuid4().hex}.tmp")
-                try:
-                    shutil.copyfile(source, temporary)
-                    temporary.replace(staged)
-                finally:
-                    temporary.unlink(missing_ok=True)
-            prompt_wav = str(staged)
-        chunks = split_text(text, max(1, int(max_text_tokens)))
-        if not chunks:
-            raise ValueError("Drama 3 speech text is required")
-        payloads = [self.build_payload(text=chunk, prompt_wav=prompt_wav, **kwargs) for chunk in chunks]
-        if len(payloads) == 1:
-            clips = [self._speak_chunk(payloads[0])]
-        else:
-            workers = min(len(payloads), self.settings.drama3_max_parallel_segments)
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="drama3-chunk") as pool:
-                futures = [pool.submit(self._speak_chunk, payload) for payload in payloads]
-                try:
-                    clips = [future.result() for future in futures]
-                except BaseException:
-                    for future in futures:
-                        future.cancel()
-                    raise
+    def _stage_reference(self, prompt_wav: str) -> str:
+        source = Path(prompt_wav)
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        staged = self._server.settings.media_dir / "references" / f"{digest}{source.suffix.lower()}"
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        if not staged.is_file():
+            temporary = staged.with_name(f".{staged.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                shutil.copyfile(source, temporary)
+                temporary.replace(staged)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return str(staged)
+
+    def _write_output(self, clips: list[bytes], output_path, interval_silence_ms: int) -> str:
         content = clips[0] if len(clips) == 1 else join_wav(clips, max(0, int(interval_silence_ms)))
         target = Path(output_path)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -142,17 +146,31 @@ class ManagedDrama3Backend:
         persist_caches()
         return str(target)
 
+    async def _render(self, *, text, output_path, prompt_wav=None, max_text_tokens=120,
+                      interval_silence_ms=0, **kwargs) -> str:
+        chunks = split_text(text, max(1, int(max_text_tokens)), markup=DRAMA3_MARKUP)
+        if not chunks:
+            raise ValueError("Drama 3 speech text is required")
+        if prompt_wav:
+            prompt_wav = await asyncio.to_thread(self._stage_reference, prompt_wav)
+        payloads = [self.build_payload(text=chunk, prompt_wav=prompt_wav, **kwargs) for chunk in chunks]
+        loop = asyncio.get_running_loop()
+        clips = await render_segments(
+            payloads, lambda payload: loop.run_in_executor(self._speech_pool, self._speak_chunk, payload),
+            slots=self._segment_slots,
+        )
+        return await asyncio.to_thread(self._write_output, clips, output_path, interval_silence_ms)
+
     @gpu_operation("drama3")
     async def synthesize_to_file(self, **kwargs) -> str:
-        async with self._slots:
+        async with self._lock:
+            await self._ensure_ready_locked()
+            self._active_jobs += 1
+        try:
+            return await await_gpu_job(self._render(**kwargs))
+        finally:
             async with self._lock:
-                await self._ensure_ready_locked()
-                self._active_jobs += 1
-            try:
-                return await await_gpu_job(asyncio.to_thread(self._synthesize_sync, **kwargs))
-            finally:
-                async with self._lock:
-                    self._active_jobs -= 1
+                self._active_jobs -= 1
 
     async def status(self) -> dict:
         return {

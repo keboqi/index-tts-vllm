@@ -17,6 +17,16 @@ from indextts_web.services.tts.drama3_serving.requirements import drama3_sglang_
 from tests.support import ROOT, load_definition
 
 
+def wav_bytes(sample: int = 0) -> bytes:
+    stream = io.BytesIO()
+    with wave.open(stream, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(24000)
+        audio.writeframes(sample.to_bytes(2, "little") * 10)
+    return stream.getvalue()
+
+
 class Drama3Tests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -100,12 +110,12 @@ class Drama3Tests(unittest.IsolatedAsyncioTestCase):
         self.manager.gpu_coordinator = GpuWorkCoordinator(enabled=True)
         self.manager._ensure_ready_locked = AsyncMock()
         entered, finish = threading.Event(), threading.Event()
-        def synthesize(**kwargs):
+        def speak(payload):
             entered.set()
             finish.wait(5)
-            return "out.wav"
-        self.manager._synthesize_sync = synthesize
-        task = asyncio.create_task(self.manager.synthesize_to_file(text="Hello.", output_path="out.wav"))
+            return wav_bytes()
+        self.manager._speak_chunk = speak
+        task = asyncio.create_task(self.manager.synthesize_to_file(text="Hello.", output_path=self.root / "out.wav"))
         try:
             self.assertTrue(await asyncio.to_thread(entered.wait, 3))
             with self.assertRaisesRegex(RuntimeError, "active requests"):
@@ -120,44 +130,47 @@ class Drama3Tests(unittest.IsolatedAsyncioTestCase):
                 await task
         self.assertEqual(self.manager._active_jobs, 0)
 
-    def test_stages_reference_and_saves_real_wav(self):
-        stream = io.BytesIO()
-        with wave.open(stream, "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(24000)
-            wav.writeframes(b"\0\0" * 240)
+    async def test_stages_reference_and_saves_real_wav(self):
+        self.manager._ensure_ready_locked = AsyncMock()
         reference = self.root / "voice.wav"
-        reference.write_bytes(stream.getvalue())
+        reference.write_bytes(wav_bytes())
         output = self.root / "output.wav"
-        with patch.object(self.manager._server, "speech", return_value=stream.getvalue()) as speech:
-            self.manager._synthesize_sync(text="Hello.", output_path=output, prompt_wav=reference)
+        with patch.object(self.manager._server, "speech", return_value=wav_bytes()) as speech:
+            await self.manager.synthesize_to_file(text="Hello.", output_path=output, prompt_wav=str(reference))
         staged = Path(speech.call_args.args[0]["references"][0]["audio_path"])
         self.assertTrue(staged.is_file())
         self.assertNotEqual(staged, reference)
-        self.assertEqual(output.read_bytes(), stream.getvalue())
+        self.assertEqual(output.read_bytes(), wav_bytes())
 
-    def test_chunks_generate_concurrently_and_join_in_order(self):
-        def wav(sample: int) -> bytes:
-            stream = io.BytesIO()
-            with wave.open(stream, "wb") as audio:
-                audio.setnchannels(1)
-                audio.setsampwidth(2)
-                audio.setframerate(24000)
-                audio.writeframes(sample.to_bytes(2, "little") * 10)
-            return stream.getvalue()
+    async def test_chunks_generate_concurrently_and_join_in_order(self):
+        self.manager._ensure_ready_locked = AsyncMock()
         texts = ["First", "Second", "Third"]
         barrier = threading.Barrier(len(texts), timeout=5)
         def speech(payload):
             barrier.wait()  # Raises unless every chunk is in flight at once.
-            return wav(texts.index(payload["input"]) + 1)
+            return wav_bytes(texts.index(payload["input"]) + 1)
         output = self.root / "long.wav"
         with patch.object(self.manager._server, "speech", side_effect=speech):
-            self.manager._synthesize_sync(text=" ".join(texts), output_path=output, max_text_tokens=1)
+            await self.manager.synthesize_to_file(text=" ".join(texts), output_path=output, max_text_tokens=1)
         with wave.open(str(output), "rb") as audio:
             frames = audio.readframes(audio.getnframes())
-        self.assertEqual(frames, b"".join(i.to_bytes(2, "little") * 10 for i in (1, 2, 3)))
+        self.assertEqual(frames, b"".join(wav_bytes(i)[44:] for i in (1, 2, 3)))
 
+    async def test_chunks_keep_speaker_and_emotion_tags_valid(self):
+        self.manager._ensure_ready_locked = AsyncMock()
+        inputs = []
+        def speech(payload):
+            inputs.append(payload["input"])
+            return wav_bytes()
+        text = "<|speaker:1|> Fine. <whisper>Go on. Without me.</whisper>"
+        with patch.object(self.manager._server, "speech", side_effect=speech):
+            await self.manager.synthesize_to_file(text=text, output_path=self.root / "tags.wav",
+                                                  max_text_tokens=2, emotion_text="sad")
+        self.assertEqual(sorted(inputs), sorted([
+            "<|speaker:1|> [sad] Fine.",
+            "<|speaker:1|> [sad] <whisper>Go on.</whisper>",
+            "<|speaker:1|> [sad] <whisper>Without me.</whisper>",
+        ]))
 
 if __name__ == "__main__":
     unittest.main()
