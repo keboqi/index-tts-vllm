@@ -28,7 +28,7 @@ def load_definition(path, name, namespace):
     tree = source_tree(path)
     for part in name.split("."):
         tree = next(node for node in tree.body
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == part)
+                    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) and node.name == part)
     definition = copy.deepcopy(tree)
     definition.decorator_list = []
     exec(compile(ast.Module(body=[definition], type_ignores=[]), str(path), "exec"), namespace)

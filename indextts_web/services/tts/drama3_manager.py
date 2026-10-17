@@ -13,9 +13,9 @@ from pathlib import Path
 
 from indextts_web.infrastructure.gpu_work import await_gpu_job, gpu_operation
 
+from .chunking import TextMarkup, join_wav, render_segments, split_text
 from .drama3_serving import environment
 from .drama3_serving.server import ServerSettings, SglangOmniServer, ensure_model, persist_caches
-from .chunking import TextMarkup, join_wav, render_segments, split_text
 
 # SGLang-Omni rejects Drama 3 requests above this; shared callers may ask for more.
 MAX_NEW_TOKENS = 2048

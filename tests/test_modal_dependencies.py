@@ -123,7 +123,7 @@ class ModalImageCacheTests(unittest.TestCase):
             if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "app"
                                                    for target in node.targets):
                 break
-            if isinstance(node, (ast.Assign, ast.If, ast.FunctionDef)):
+            if isinstance(node, ast.Assign | ast.If | ast.FunctionDef):
                 nodes.append(node)
 
         class ChangeRuntimeValues(ast.NodeTransformer):

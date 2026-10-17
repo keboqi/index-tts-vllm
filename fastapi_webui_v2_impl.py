@@ -66,7 +66,6 @@ import hashlib
 import gzip
 import threading
 import zipfile
-import unicodedata
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import copy
 import gc
@@ -131,12 +130,63 @@ from indextts_web.services.tts.startup import initialize_backend, warmup_backend
 from indextts_web.services.tts.drama3_manager import ManagedDrama3Backend
 from indextts_web.services.tts.index25_manager import ManagedIndexTTS25Backend
 from indextts_web.services.translation.subtitles import (
-    combine_bilingual as combine_bilingual_subtitles,
-    combine_original_only as combine_original_subtitles,
-    combine_translated_only as combine_translated_subtitles,
-    parse_subtitle_entries,
-    parse_subtitle_input,
-    parse_timestamp as parse_subtitle_timestamp,
+    format_timestamp as _format_ms_to_timestamp,
+    parse_subtitle_input as _parse_srt_input_to_segments,
+)
+from indextts_web.api.responses import (
+    json_event_bytes as _json_event_bytes,
+    json_stream_response as _json_stream_response,
+    read_optional_json_payload as _read_optional_json_payload,
+    request_has_json_body as _request_has_json_body,
+    status_error as _status_error,
+    success_error as _success_error,
+)
+from indextts_web.services.translation.gemini_response import (
+    canonicalize_speaker_id as _canonicalize_speaker_id,
+    extract_response_text as _extract_text_from_gemini_response,
+    normalize_speaker_profiles as _normalize_speaker_profiles,
+    parse_gemini_json as _parse_gemini_json,
+)
+from indextts_web.services.translation.timestamps import (
+    coerce_segment_ms as _coerce_segment_ms,
+    format_srt_timestamp as _format_ms_to_srt_timestamp,
+    parse_timestamp_ms as _parse_timestamp_to_ms,
+)
+from indextts_web.infrastructure.filenames import (
+    sanitize_base_filename as _sanitize_base_filename,
+)
+from indextts_web.services.video.cookies import CookieStore
+from indextts_web.services.video.library import VideoLibrary
+from indextts_web.services.video.subtitle_style import SubtitleStyle
+from indextts_web.infrastructure.ffmpeg import (
+    codec_args_for_format as ffmpeg_codec_args_for_format,
+    filter_thread_args as ffmpeg_filter_thread_args,
+    thread_args as ffmpeg_thread_args,
+    video_thread_args as ffmpeg_video_thread_args,
+    ffmpeg_available as _ffmpeg_available,
+    ffmpeg_seconds_from_ms as _ffmpeg_seconds_from_ms,
+    ffprobe_duration_seconds as _ffprobe_duration_seconds,
+    run_ffmpeg_command as _run_ffmpeg_command,
+)
+from indextts_web.services.video.ytdlp import (
+    VIDEO_DOWNLOAD_EXTENSIONS,
+    VIDEO_DOWNLOAD_FORMATS,
+    auth_hint as _ytdlp_auth_hint,
+    clean_ytdl_error as _clean_ytdl_error,
+    common_opts as _yt_dlp_common_opts,
+    download_direct_format as _download_direct_format,
+    download_format_fallbacks as _video_download_format_fallbacks,
+    format_video_duration as _format_video_duration,
+    is_format_unavailable_error as _is_ytdl_format_unavailable_error,
+    raw_format_is_direct as _raw_format_is_direct,
+    select_raw_video_formats as _select_raw_video_formats,
+    setup_hint as _ytdlp_setup_hint,
+)
+from indextts_web.services.video.cookies import (
+    cookie_filename_for_domain as _cookie_filename_for_domain,
+    extract_domain_from_curl as _extract_domain_from_curl,
+    normalize_cookie_domain as _normalize_cookie_domain,
+    parse_curl_cookies as _parse_curl_cookies,
 )
 
 # IndexTTS v2 and speaker management
@@ -527,11 +577,6 @@ GEMINI_API_KEY_ENV_VAR = "GEMINI_API_KEY"
 GOOGLE_API_KEY_ENV_VAR = "GOOGLE_API_KEY"
 GEMINI_MODEL_ENV_VAR = "GEMINI_MODEL_NAME"
 DEFAULT_GEMINI_MODEL_NAME = "gemini-flash-latest"
-JSON_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
-COERCE_SPEAKER_SEGMENTS_PATTERN = re.compile(
-    r'^\s*(\[[\s\S]*?\])\s*,\s*"segments"\s*:\s*(\[[\s\S]*\])\s*$',
-    re.DOTALL,
-)
 TRANSLATION_PROMPT_TEMPLATE = (
     "You are a professional interpreter and diarization analyst. "
     "Transcribe the speech from the provided audio and translate it into {dest_language} using natural, conversational wording. "
@@ -4736,91 +4781,6 @@ qwen_omnivad_worker = QwenOmniVadWorker(
 )
 
 
-
-
-def _clean_ytdl_error(exc: Exception) -> str:
-    msg = str(exc)
-    msg = re.sub(r'\x1b\[[0-9;]*m', '', msg)  # Remove ANSI codes
-    msg = msg.replace('ERROR:', '').strip()
-    return msg
-
-
-def _is_ytdl_format_unavailable_error(exc: Exception) -> bool:
-    return "requested format is not available" in _clean_ytdl_error(exc).lower()
-
-
-def _status_error(message: str, status_code: int = 400, **extra: Any) -> JSONResponse:
-    payload = {"status": "error", "message": message}
-    payload.update(extra)
-    return JSONResponse(status_code=status_code, content=payload)
-
-
-def _success_error(message: str, status_code: int = 500, **extra: Any) -> JSONResponse:
-    payload = {"success": False, "error": message}
-    payload.update(extra)
-    return JSONResponse(status_code=status_code, content=payload)
-
-
-def _request_has_json_body(request: Request) -> bool:
-    return "application/json" in request.headers.get("content-type", "").lower()
-
-
-JSON_STREAM_MIN_CHUNK_BYTES = 4096
-
-
-def _json_event_bytes(event: Dict[str, Any]) -> bytes:
-    event_payload = event
-    encoded = json.dumps(event_payload, ensure_ascii=False)
-    if len(encoded.encode("utf-8")) < JSON_STREAM_MIN_CHUNK_BYTES:
-        event_payload = dict(event)
-        event_payload["_flush_padding"] = "0" * (
-            JSON_STREAM_MIN_CHUNK_BYTES - len(encoded.encode("utf-8"))
-        )
-        encoded = json.dumps(event_payload, ensure_ascii=False)
-    return (f"data: {encoded}\n\n").encode("utf-8")
-
-
-JSON_STREAM_RESPONSE_HEADERS = {
-    "Cache-Control": "no-store, no-cache, no-transform",
-    "Connection": "keep-alive",
-    "X-Accel-Buffering": "no",
-    "X-Content-Type-Options": "nosniff",
-}
-
-
-async def _json_stream_with_prelude(iterator: Any):
-    yield _json_event_bytes(
-        {
-            "event": "stream_open",
-            "timestamp": time.time(),
-        }
-    )
-    async for chunk in iterator:
-        yield chunk
-
-
-def _json_stream_response(iterator: Any) -> StreamingResponse:
-    return StreamingResponse(
-        _json_stream_with_prelude(iterator),
-        media_type="text/event-stream",
-        headers=JSON_STREAM_RESPONSE_HEADERS,
-    )
-
-
-async def _read_optional_json_payload(
-    request: Request,
-    should_read: bool,
-) -> Tuple[Optional[Dict[str, Any]], Optional[JSONResponse]]:
-    if not should_read:
-        return None, None
-    try:
-        payload = await request.json()
-    except Exception as exc:
-        return None, _status_error(f"Invalid JSON payload: {str(exc)}")
-    if not isinstance(payload, dict):
-        return None, _status_error("Invalid JSON payload: expected a JSON object.")
-    return payload, None
-
 # Async wrapper functions for blocking operations
 async def async_write_file(file_path: str, data: bytes) -> None:
     """Async wrapper for writing file data"""
@@ -5238,7 +5198,6 @@ def _smart_cut_audio_at_silence(input_path: str, max_duration: float = 10.0):
         print(f"❌ Error cutting audio: {e}")
         # Return original path if cutting fails
         return input_path
-
 
 
 _AUDIO_SUBTYPE_SAMPLE_WIDTHS = {
@@ -5855,7 +5814,6 @@ async def _normalize_uploaded_audio(source_path: str) -> str:
     return normalized_path
 
 
-MAX_SAFE_BASE_FILENAME_LENGTH = 180
 SUPPORTED_TRANSLATE_DESTINATION_LANGUAGES: Tuple[Tuple[str, str], ...] = (
     ("zh", "Chinese"),
     ("en", "English"),
@@ -5983,44 +5941,6 @@ def _normalize_translate_dest_language(label: Optional[str]) -> str:
     if " - " in normalized:
         normalized = normalized.split(" - ", 1)[0].strip()
     return TRANSLATE_DEST_LANGUAGE_ALIASES.get(normalized, raw)
-
-
-def _sanitize_base_filename(raw_name: Optional[str]) -> Optional[str]:
-    if not raw_name:
-        return None
-    base_name = os.path.splitext(os.path.basename(str(raw_name)))[0].strip().strip(".")
-    if not base_name:
-        return None
-    readable_replacements = str.maketrans(
-        {
-            "\u2010": "-",
-            "\u2011": "-",
-            "\u2012": "-",
-            "\u2013": "-",
-            "\u2014": "-",
-            "\u2015": "-",
-            "\u2212": "-",
-            "\uff0d": "-",
-            "\u3000": " ",
-            "&": " and ",
-            "\uff06": " and ",
-            "\u2018": "'",
-            "\u2019": "'",
-            "\u201c": '"',
-            "\u201d": '"',
-        }
-    )
-    normalized = unicodedata.normalize("NFKD", base_name.translate(readable_replacements))
-    ascii_name = normalized.encode("ascii", "ignore").decode("ascii")
-    sanitized = re.sub(r"[^0-9A-Za-z._-]+", "_", ascii_name)
-    sanitized = re.sub(r"_+", "_", sanitized)
-    sanitized = sanitized.strip(" ._-")
-    if len(sanitized) > MAX_SAFE_BASE_FILENAME_LENGTH:
-        tail_length = 40
-        head_length = MAX_SAFE_BASE_FILENAME_LENGTH - tail_length - 1
-        sanitized = f"{sanitized[:head_length].rstrip('._-')}_{sanitized[-tail_length:].lstrip('._-')}"
-        sanitized = sanitized.strip(" ._-")
-    return sanitized or None
 
 
 def _normalize_base_filename(
@@ -7176,91 +7096,6 @@ def _get_gemini_model_name() -> str:
     return os.getenv(GEMINI_MODEL_ENV_VAR, DEFAULT_GEMINI_MODEL_NAME)
 
 
-def _strip_code_fences(text: str) -> str:
-    if not text:
-        return ""
-    match = JSON_FENCE_PATTERN.search(text)
-    if match:
-        return match.group(1).strip()
-    text = text.strip()
-    if text.startswith("```") and text.endswith("```"):
-        return text[3:-3].strip()
-    # Fallback: extract JSON array if present
-    start = text.find("[")
-    end = text.rfind("]")
-    if start != -1 and end != -1 and end > start:
-        return text[start:end + 1].strip()
-    return text
-
-
-def _coerce_gemini_json_payload(raw: str) -> Optional[str]:
-    trimmed = (raw or "").strip()
-    if not trimmed:
-        return None
-    match = COERCE_SPEAKER_SEGMENTS_PATTERN.match(trimmed)
-    if match:
-        speakers_part, segments_part = match.groups()
-        return f'{{"speakers": {speakers_part}, "segments": {segments_part}}}'
-    return None
-
-
-SPEAKER_ID_PATTERN = re.compile(r"^speaker\s*(\d+)$", re.IGNORECASE)
-
-
-def _canonicalize_speaker_id(raw_value: Any, fallback_index: int) -> str:
-    fallback_index = max(1, int(fallback_index))
-    if isinstance(raw_value, (int, float)) and raw_value >= 1:
-        return f"speaker{int(raw_value)}"
-    if isinstance(raw_value, str):
-        candidate = raw_value.strip()
-        if not candidate:
-            return f"speaker{fallback_index}"
-        match = SPEAKER_ID_PATTERN.match(candidate)
-        if match:
-            return f"speaker{int(match.group(1))}"
-        digits = re.findall(r"\d+", candidate)
-        if digits:
-            return f"speaker{int(digits[0])}"
-    return f"speaker{fallback_index}"
-
-
-def _normalize_speaker_profiles(raw_profiles: Any) -> List[Dict[str, Any]]:
-    if not isinstance(raw_profiles, list):
-        return []
-    normalized: List[Dict[str, Any]] = []
-    used_ids: Set[str] = set()
-    for idx, entry in enumerate(raw_profiles, start=1):
-        entry_dict: Dict[str, Any]
-        if isinstance(entry, dict):
-            entry_dict = entry
-        else:
-            entry_dict = {"description": str(entry)}
-        candidate_id = entry_dict.get("id") or entry_dict.get("speaker") or entry_dict.get("label") or entry_dict.get("name")
-        speaker_id = _canonicalize_speaker_id(candidate_id, idx)
-        while speaker_id in used_ids:
-            idx += 1
-            speaker_id = _canonicalize_speaker_id(None, idx)
-        used_ids.add(speaker_id)
-        description = str(
-            entry_dict.get("description")
-            or entry_dict.get("summary")
-            or entry_dict.get("traits")
-            or entry_dict.get("role")
-            or ""
-        ).strip()
-        if not description:
-            description = f"{speaker_id.title()} voice"
-        display_name = str(entry_dict.get("label") or entry_dict.get("name") or speaker_id.title()).strip()
-        normalized.append(
-            {
-                "id": speaker_id,
-                "label": display_name or speaker_id.title(),
-                "description": description,
-            }
-        )
-    return normalized
-
-
 def _normalize_speaker_overrides(
     raw_overrides: Optional[Dict[str, Any]],
     speaker_profiles: Optional[List[Dict[str, Any]]] = None,
@@ -7297,205 +7132,6 @@ def _normalize_speaker_overrides(
             )
         normalized[speaker_id] = entry
     return normalized
-
-
-def _parse_gemini_json(text: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    cleaned = _strip_code_fences(text)
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        coerced_payload = _coerce_gemini_json_payload(cleaned)
-        if coerced_payload:
-            try:
-                data = json.loads(coerced_payload)
-            except json.JSONDecodeError as coerced_exc:
-                preview = cleaned if len(cleaned) <= 4000 else f"{cleaned[:4000]}...<truncated>"
-                print("❌ Gemini JSON parse error (after coercion). Raw response preview:\n", preview)
-                raise ValueError(f"Gemini returned invalid JSON: {coerced_exc}") from coerced_exc
-        else:
-            preview = cleaned if len(cleaned) <= 4000 else f"{cleaned[:4000]}...<truncated>"
-            print("❌ Gemini JSON parse error. Raw response preview:\n", preview)
-            raise ValueError(f"Gemini returned invalid JSON: {exc}") from exc
-    if isinstance(data, list):
-        return data, []
-    if isinstance(data, dict):
-        segments = data.get("segments")
-        if not isinstance(segments, list):
-            raise ValueError("Gemini response must include a 'segments' array.")
-        speaker_profiles = _normalize_speaker_profiles(data.get("speakers"))
-        return segments, speaker_profiles
-    raise ValueError("Gemini response must be a JSON object or array.")
-
-
-def _extract_text_from_gemini_response(response: Any) -> str:
-    if response is None:
-        return ""
-
-    for attr in ("text", "output_text", "output_texts"):
-        value = getattr(response, attr, None)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-        if isinstance(value, list) and value:
-            concatenated = "\n".join(str(item) for item in value if item)
-            if concatenated.strip():
-                return concatenated.strip()
-
-    parts_text: List[str] = []
-
-    candidates = getattr(response, "candidates", None)
-    if candidates:
-        for candidate in candidates:
-            content = getattr(candidate, "content", None)
-            if content is not None:
-                parts = getattr(content, "parts", None)
-                if parts:
-                    for part in parts:
-                        part_text = getattr(part, "text", None)
-                        if isinstance(part_text, str) and part_text.strip():
-                            parts_text.append(part_text.strip())
-            if isinstance(candidate, dict):
-                for part in candidate.get("content", {}).get("parts", []):
-                    part_text = part.get("text")
-                    if isinstance(part_text, str) and part_text.strip():
-                        parts_text.append(part_text.strip())
-
-    if not parts_text:
-        contents = getattr(response, "contents", None)
-        if contents:
-            for content in contents:
-                parts = getattr(content, "parts", None)
-                if parts:
-                    for part in parts:
-                        part_text = getattr(part, "text", None)
-                        if isinstance(part_text, str) and part_text.strip():
-                            parts_text.append(part_text.strip())
-                elif isinstance(content, dict):
-                    for part in content.get("parts", []):
-                        part_text = part.get("text")
-                        if isinstance(part_text, str) and part_text.strip():
-                            parts_text.append(part_text.strip())
-
-    return "\n".join(parts_text).strip()
-
-
-def _parse_timestamp_to_ms(timestamp_value: Any) -> Optional[int]:
-    if timestamp_value is None:
-        return None
-    if isinstance(timestamp_value, (int, float)):
-        # Treat integer millisecond values separately
-        if isinstance(timestamp_value, int) and timestamp_value >= 1000:
-            return max(0, int(timestamp_value))
-        seconds = float(timestamp_value)
-        return max(0, int(round(seconds * 1000)))
-    value = str(timestamp_value).strip()
-    if not value:
-        return None
-    value = value.replace(",", ".")
-    # Try simple numeric parse
-    if re.fullmatch(r"\d+(?:\.\d+)?", value):
-        seconds = float(value)
-        return max(0, int(seconds * 1000))
-    # Handle colon-delimited formats (e.g., hh:mm:ss.xxx or mm:ss)
-    parts = value.split(":")
-    try:
-        parts = [p.strip() for p in parts if p.strip()]
-        if not parts:
-            return None
-        total_seconds = 0.0
-        multiplier = 1.0
-        for part in reversed(parts):
-            if "." in part:
-                seconds = float(part)
-            else:
-                seconds = float(int(part))
-            total_seconds += seconds * multiplier
-            multiplier *= 60.0
-        return max(0, int(round(total_seconds * 1000)))
-    except ValueError:
-        return None
-
-
-def _format_ms_to_timestamp(milliseconds: int) -> str:
-    ms = max(0, int(milliseconds))
-    total_seconds = ms / 1000.0
-    hours = int(total_seconds // 3600)
-    minutes = int((total_seconds % 3600) // 60)
-    seconds = total_seconds % 60
-    if abs(seconds - round(seconds)) < 1e-3:
-        seconds_str = f"{int(round(seconds)):02d}"
-    else:
-        seconds_str = f"{seconds:06.3f}".rstrip("0").rstrip(".")
-        if seconds < 10 and not seconds_str.startswith("0"):
-            seconds_str = "0" + seconds_str
-    if hours > 0:
-        return f"{hours:02d}:{minutes:02d}:{seconds_str}"
-    return f"{minutes:02d}:{seconds_str}"
-
-
-def _coerce_segment_ms(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return max(0, int(value))
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return None
-        parsed = _parse_timestamp_to_ms(stripped)
-        if parsed is not None:
-            return parsed
-        try:
-            numeric = float(stripped)
-            return max(0, int(numeric))
-        except ValueError:
-            return None
-    try:
-        return max(0, int(float(value)))
-    except (TypeError, ValueError):
-        return None
-
-
-def _format_ms_to_srt_timestamp(milliseconds: int) -> str:
-    ms = max(0, int(milliseconds))
-    hours = ms // 3_600_000
-    minutes = (ms % 3_600_000) // 60_000
-    seconds = (ms % 60_000) // 1000
-    millis = ms % 1000
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
-
-
-def _parse_srt_timestamp_to_ms(timestamp: str) -> int:
-    return parse_subtitle_timestamp(timestamp)
-
-
-def _parse_srt_file_with_timestamps(srt_content: str) -> List[Dict[str, Any]]:
-    return parse_subtitle_entries(srt_content)
-
-
-def _combine_srt_subtitles_to_segments(
-    original_srt_entries: List[Dict[str, Any]],
-    translated_srt_entries: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    return combine_bilingual_subtitles(original_srt_entries, translated_srt_entries)
-
-
-def _combine_srt_translated_only_to_segments(
-    translated_srt_entries: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    return combine_translated_subtitles(translated_srt_entries)
-
-
-def _combine_srt_original_only_to_segments(
-    original_srt_entries: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    return combine_original_subtitles(original_srt_entries)
-
-
-def _parse_srt_input_to_segments(
-    original_srt_content: Optional[str],
-    translated_srt_content: Optional[str],
-) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
-    return parse_subtitle_input(original_srt_content, translated_srt_content)
 
 
 async def _read_srt_upload_text(
@@ -9078,523 +8714,39 @@ def _apply_volume_with_ffmpeg(segment: AudioSegment, volume_percent: float) -> A
                     pass
 
 
-@functools.lru_cache(maxsize=1)
-def _ffmpeg_available() -> bool:
-    """Check once if ffmpeg is on PATH."""
-    return shutil.which("ffmpeg") is not None
-
-
-def _ffmpeg_seconds_from_ms(ms: int) -> str:
-    return f"{max(0, int(ms)) / 1000:.3f}"
-
-
-def _ffmpeg_thread_args() -> List[str]:
-    return ["-threads", str(FFMPEG_THREADS)]
-
-
-def _ffmpeg_video_thread_args() -> List[str]:
-    return ["-threads:v", str(FFMPEG_THREADS)]
-
-
-def _ffmpeg_filter_thread_args() -> List[str]:
-    thread_count = FFMPEG_THREADS if FFMPEG_THREADS > 0 else max(1, os.cpu_count() or 1)
-    return ["-filter_threads", str(thread_count), "-filter_complex_threads", str(thread_count)]
-
-
-def _existing_path_or_none(path: Optional[str]) -> Optional[str]:
-    if not path:
-        return None
-    normalized = os.path.abspath(os.path.expandvars(os.path.expanduser(path)))
-    return normalized if os.path.exists(normalized) else None
-
-
-def _infer_subtitle_font_name_from_path(path: Optional[str]) -> Optional[str]:
-    if not path:
-        return None
-    lower_name = os.path.basename(path).lower()
-    if "msyh" in lower_name or "yahei" in lower_name:
-        return "Microsoft YaHei"
-    if "simhei" in lower_name:
-        return "SimHei"
-    if "simsun" in lower_name:
-        return "SimSun"
-    if "notosanscjk" in lower_name or "noto sans cjk" in lower_name:
-        return "Noto Sans CJK SC"
-    if "notosanssc" in lower_name or "noto sans sc" in lower_name:
-        return "Noto Sans SC"
-    if "wqy" in lower_name or "wenquanyi" in lower_name:
-        return "WenQuanYi Micro Hei"
-    if "sourcehansans" in lower_name or "source han sans" in lower_name:
-        return "Source Han Sans SC"
-    return None
-
-
-def _subtitle_font_candidates() -> List[Tuple[str, List[str]]]:
-    local_fonts = os.path.join(current_dir, "fonts")
-    bundled_noto_fonts = os.path.join(local_fonts, "noto-cjk")
-    return [
-        (
-            "Noto Sans CJK SC",
-            [
-                os.path.join(bundled_noto_fonts, "NotoSansCJKsc-Regular.otf"),
-                os.path.join(local_fonts, "NotoSansCJK-Regular.ttc"),
-                os.path.join(local_fonts, "NotoSansCJKsc-Regular.otf"),
-                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-                "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
-                "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-                "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-                "/usr/local/share/fonts/NotoSansCJK-Regular.ttc",
-            ],
-        ),
-        (
-            "Noto Sans SC",
-            [
-                os.path.join(local_fonts, "NotoSansSC-Regular.otf"),
-                "/usr/share/fonts/opentype/noto/NotoSansSC-Regular.otf",
-                "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.otf",
-                "/usr/local/share/fonts/NotoSansSC-Regular.otf",
-            ],
-        ),
-        (
-            "Source Han Sans SC",
-            [
-                os.path.join(local_fonts, "SourceHanSansSC-Regular.otf"),
-                "/usr/share/fonts/opentype/adobe-source-han-sans/SourceHanSansSC-Regular.otf",
-                "/usr/local/share/fonts/SourceHanSansSC-Regular.otf",
-            ],
-        ),
-        (
-            "WenQuanYi Micro Hei",
-            [
-                "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-                "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
-            ],
-        ),
-        (
-            "Microsoft YaHei",
-            [
-                r"C:\Windows\Fonts\msyh.ttc",
-                r"C:\Windows\Fonts\msyh.ttf",
-                r"C:\Windows\Fonts\msyhbd.ttc",
-            ],
-        ),
-        ("SimHei", [r"C:\Windows\Fonts\simhei.ttf"]),
-        ("SimSun", [r"C:\Windows\Fonts\simsun.ttc"]),
-        (
-            "PingFang SC",
-            [
-                "/System/Library/Fonts/PingFang.ttc",
-                "/System/Library/Fonts/STHeiti Light.ttc",
-            ],
-        ),
-    ]
-
-
-@functools.lru_cache(maxsize=1)
-def _resolve_video_subtitle_font() -> Tuple[Optional[str], Optional[str]]:
-    configured_font_name = VIDEO_SUBTITLE_FONT or None
-    configured_fonts_dir = _existing_path_or_none(VIDEO_SUBTITLE_FONTS_DIR)
-    configured_font_file = _existing_path_or_none(VIDEO_SUBTITLE_FONT_FILE)
-
-    if configured_font_file:
-        return (
-            configured_font_name or _infer_subtitle_font_name_from_path(configured_font_file),
-            os.path.dirname(configured_font_file),
-        )
-    if VIDEO_SUBTITLE_FONT_FILE:
-        print(f"⚠️ VIDEO_SUBTITLE_FONT_FILE does not exist: {VIDEO_SUBTITLE_FONT_FILE}")
-
-    if configured_font_name:
-        return configured_font_name, configured_fonts_dir
-
-    for font_name, candidate_paths in _subtitle_font_candidates():
-        for candidate_path in candidate_paths:
-            font_path = _existing_path_or_none(candidate_path)
-            if font_path:
-                return font_name, os.path.dirname(font_path)
-
-    print(
-        "⚠️ No CJK subtitle font found for FFmpeg rendering. "
-        "Install a CJK font such as Noto Sans CJK, or set VIDEO_SUBTITLE_FONT_FILE "
-        "and optionally VIDEO_SUBTITLE_FONT."
-    )
-    return None, configured_fonts_dir
-
-
-def _ffmpeg_escape_filter_path(path: str) -> str:
-    normalized = os.path.abspath(path).replace("\\", "/")
-    return (
-        normalized
-        .replace("\\", "\\\\")
-        .replace(":", "\\:")
-        .replace("'", "\\'")
-        .replace("[", "\\[")
-        .replace("]", "\\]")
-        .replace(",", "\\,")
-        .replace(";", "\\;")
-    )
-
-
-def _ffmpeg_escape_filter_quoted_value(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("'", "\\'")
-
-
-def _subtitle_style_for_video(video_path: Optional[str]) -> Tuple[int, float, float, int]:
-    dimensions = _ffprobe_video_dimensions(video_path) if video_path else None
-    if not dimensions:
-        return VIDEO_SUBTITLE_FONT_SIZE, 1.5, 0.7, 36
-    width, height = dimensions
-    short_side = max(1, min(width, height))
-    scale = short_side / 1080.0
-    font_size = int(round(VIDEO_SUBTITLE_FONT_SIZE * scale))
-    font_size = max(12, min(VIDEO_SUBTITLE_FONT_SIZE, font_size))
-    outline = round(max(0.8, min(1.5, 1.5 * scale)), 2)
-    shadow = round(max(0.35, min(0.7, 0.7 * scale)), 2)
-    margin_v = int(round(36 * scale))
-    margin_v = max(14, min(36, margin_v))
-    return font_size, outline, shadow, margin_v
-
-
-def _ffmpeg_subtitle_force_style(font_name: Optional[str], video_path: Optional[str] = None) -> str:
-    font_size, outline, shadow, margin_v = _subtitle_style_for_video(video_path)
-    style_parts = [
-        f"FontSize={font_size}",
-        "PrimaryColour=&H00FFFFFF",
-        "OutlineColour=&H00000000",
-        "BorderStyle=1",
-        f"Outline={outline}",
-        f"Shadow={shadow}",
-        f"MarginV={margin_v}",
-    ]
-    if font_name:
-        style_parts.insert(0, f"FontName={font_name}")
-    return ",".join(style_parts)
-
-
-def _ffmpeg_subtitles_filter_arg(subtitle_path: str, video_path: Optional[str] = None) -> str:
-    font_name, fonts_dir = _resolve_video_subtitle_font()
-    options = [f"filename='{_ffmpeg_escape_filter_path(subtitle_path)}'"]
-    ext = os.path.splitext(subtitle_path)[1].lstrip(".").lower()
-    if ext in {"srt", "vtt"}:
-        options.append("charenc=UTF-8")
-    if fonts_dir:
-        options.append(f"fontsdir='{_ffmpeg_escape_filter_path(fonts_dir)}'")
-    force_style = _ffmpeg_subtitle_force_style(font_name, video_path)
-    if force_style:
-        options.append(f"force_style='{_ffmpeg_escape_filter_quoted_value(force_style)}'")
-    return "subtitles=" + ":".join(options)
-
-
-def _ffmpeg_codec_args_for_format(fmt: Optional[str], bitrate: Optional[str]) -> List[str]:
-    fmt_normalized = (fmt or "").lower()
-    codec_map = {
-        "mp3": ["-c:a", "libmp3lame"],
-        "ogg": ["-c:a", "libvorbis"],
-        "opus": ["-c:a", "libopus"],
-        "aac": ["-c:a", "aac"],
-        "webm": ["-c:a", "libopus"],
-        "wav": ["-c:a", "pcm_s16le"],
-        "flac": ["-c:a", "flac"],
-    }
-    codec_args = codec_map.get(fmt_normalized, ["-c:a", "libmp3lame"])
-    if bitrate and fmt_normalized in {"mp3", "ogg", "opus", "aac", "webm"}:
-        codec_args = codec_args + ["-b:a", bitrate]
-    return codec_args + _ffmpeg_thread_args()
-
-
-def _run_ffmpeg_command(cmd: List[str]) -> None:
-    process = subprocess.run(cmd, capture_output=True, text=True)
-    if process.returncode != 0:
-        stderr = process.stderr.strip()
-        stdout = process.stdout.strip()
-        cmd_str = " ".join(cmd)
-        raise RuntimeError(
-            f"ffmpeg failed (code {process.returncode})\ncmd: {cmd_str}\n"
-            f"stderr: {stderr or '<empty>'}\nstdout: {stdout or '<empty>'}"
-        )
-
-
-VIDEO_DOWNLOAD_EXTENSIONS = {"mp4", "mkv", "webm", "mov", "m4v"}
-VIDEO_DOWNLOAD_FORMATS = {
-    "best": "bestvideo*+bestaudio/bestvideo+bestaudio/best",
-    "2160p": "bestvideo*[height<=2160]+bestaudio/bestvideo[height<=2160]+bestaudio/best[height<=2160]/best",
-    "1440p": "bestvideo*[height<=1440]+bestaudio/bestvideo[height<=1440]+bestaudio/best[height<=1440]/best",
-    "1080p": "bestvideo*[height<=1080]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-    "720p": "bestvideo*[height<=720]+bestaudio/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-    "480p": "bestvideo*[height<=480]+bestaudio/bestvideo[height<=480]+bestaudio/best[height<=480]/best",
-    "360p": "bestvideo*[height<=360]+bestaudio/bestvideo[height<=360]+bestaudio/best[height<=360]/best",
-    "worst": "worstvideo*+worstaudio/worst",
-}
-
-
-def _dedupe_preserving_order(values: List[Optional[str]]) -> List[Optional[str]]:
-    seen: Set[Optional[str]] = set()
-    result: List[Optional[str]] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        result.append(value)
-    return result
-
-
-def _video_download_format_fallbacks(format_selector: str, quality_key: str) -> List[Optional[str]]:
-    """Return format selectors from most-specific to safest."""
-    candidates: List[Optional[str]] = [format_selector]
-    if quality_key in VIDEO_DOWNLOAD_FORMATS:
-        height_match = re.fullmatch(r"(\d+)p", quality_key)
-        if height_match:
-            height = height_match.group(1)
-            candidates.extend(
-                [
-                    f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best",
-                    f"bestvideo*[height<={height}]/best[height<={height}]/best",
-                ]
-            )
-        elif quality_key == "best":
-            candidates.extend(["bestvideo+bestaudio/best", "bestvideo*/best"])
-        elif quality_key == "worst":
-            candidates.extend(["worstvideo+worstaudio/worst", "worstvideo*/worst"])
-    else:
-        candidates.append("bestvideo+bestaudio/best")
-    candidates.extend(["best", None])
-    return _dedupe_preserving_order(candidates)
-
-
-def _ytdlp_setup_hint() -> str:
-    return (
-        "YouTube currently requires yt-dlp's external JavaScript challenge solver setup. "
-        "Upgrade with `pip install -U \"yt-dlp[default]\"`, install a supported JS runtime "
-        "such as Deno or Node, enable that runtime for the yt-dlp Python API, and use a "
-        "running PO Token provider for affected YouTube videos."
-    )
-
-
-def _ytdlp_auth_hint() -> str:
-    return (
-        "YouTube is asking this server to sign in. Import fresh youtube.com cookies exported from "
-        "a private/incognito YouTube session, then retry. For CLI verification, pass the same file "
-        "with `--cookies /path/to/youtube_com_cookies.txt`."
-    )
-
-
-def _yt_dlp_common_opts() -> Dict[str, Any]:
-    opts: Dict[str, Any] = {}
-    js_runtimes: Dict[str, Dict[str, str]] = {}
-    configured_runtimes = (os.environ.get("YTDLP_JS_RUNTIMES") or "").strip()
-    configured_node = (os.environ.get("YTDLP_NODE_PATH") or os.environ.get("NODE_BINARY") or "").strip()
-
-    def find_executable(name: str) -> Optional[str]:
-        found = shutil.which(name)
-        if found:
-            return found
-        # Uvicorn services often have a thinner PATH than an interactive shell.
-        # Ask a login shell as a last resort so it can see nvm/homebrew setup.
-        try:
-            process = subprocess.run(
-                ["bash", "-lc", f"command -v {name}"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-            )
-            candidate = (process.stdout or "").strip().splitlines()[0] if process.stdout.strip() else ""
-            if candidate and os.path.exists(candidate):
-                return candidate
-        except Exception:
-            pass
-        if name == "node":
-            try:
-                process = subprocess.run(
-                    ["bash", "-lc", "node -p 'process.execPath'"],
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                )
-                candidate = (process.stdout or "").strip().splitlines()[0] if process.stdout.strip() else ""
-                if candidate and os.path.exists(candidate):
-                    return candidate
-            except Exception:
-                pass
-        if name == "node":
-            node_candidates: List[str] = []
-            home = Path.home()
-            node_candidates.extend(str(path) for path in (home / ".nvm" / "versions" / "node").glob("*/bin/node"))
-            node_candidates.extend(str(path) for path in Path("/home").glob("*/.nvm/versions/node/*/bin/node"))
-            node_candidates.extend(
-                [
-                    "/usr/local/bin/node",
-                    "/usr/bin/node",
-                    "/snap/bin/node",
-                    "/opt/node/bin/node",
-                    "/home/linuxbrew/.linuxbrew/bin/node",
-                ]
-            )
-            existing = [path for path in node_candidates if os.path.exists(path)]
-            if existing:
-                existing.sort(reverse=True)
-                return existing[0]
-        return None
-
-    runtime_paths = {
-        "node": configured_node if configured_node and os.path.exists(configured_node) else find_executable("node"),
-        "deno": find_executable("deno"),
-        "bun": find_executable("bun"),
-        "quickjs": find_executable("qjs") or find_executable("quickjs"),
-    }
-    if configured_runtimes:
-        runtime_items: List[Tuple[str, Optional[str]]] = []
-        for item in configured_runtimes.split(","):
-            runtime_spec = item.strip()
-            if not runtime_spec:
-                continue
-            name, _, explicit_path = runtime_spec.partition(":")
-            runtime_items.append((name.strip(), explicit_path.strip() or runtime_paths.get(name.strip())))
-    elif runtime_paths.get("node"):
-        # Mirror the known-good CLI path: --js-runtimes node.
-        runtime_items = [("node", runtime_paths["node"])]
-    else:
-        runtime_items = [(name, path) for name, path in runtime_paths.items()]
-
-    for runtime, executable in runtime_items:
-        if runtime and executable:
-            js_runtimes[runtime] = {"path": executable}
-    if js_runtimes:
-        opts["js_runtimes"] = js_runtimes
-
-    remote_components = [
-        item.strip()
-        for item in (os.environ.get("YTDLP_REMOTE_COMPONENTS") or "").split(",")
-        if item.strip()
-    ]
-    if remote_components:
-        opts["remote_components"] = set(remote_components)
-    return opts
-
-
-def _raw_format_is_direct(fmt: Dict[str, Any]) -> bool:
-    protocol = str(fmt.get("protocol") or "").lower()
-    ext = str(fmt.get("ext") or "").lower()
-    if not fmt.get("url") or fmt.get("has_drm"):
-        return False
-    if protocol in {"mhtml", "storyboard"} or ext in {"mhtml", "json"}:
-        return False
-    return True
-
-
-def _raw_format_score(fmt: Dict[str, Any]) -> Tuple[int, float, float, int]:
-    height = int(fmt.get("height") or 0)
-    tbr = float(fmt.get("tbr") or 0)
-    fps = float(fmt.get("fps") or 0)
-    size = int(fmt.get("filesize") or fmt.get("filesize_approx") or 0)
-    return (height, tbr, fps, size)
-
-
-def _extract_format_ids_from_selector(selector: str) -> List[str]:
-    tokens = re.split(r"[+/]", selector or "")
-    ids: List[str] = []
-    for token in tokens:
-        token = token.strip()
-        if not token or token.startswith("best") or token.startswith("worst"):
-            continue
-        token = re.sub(r"\[.*$", "", token).strip()
-        if token:
-            ids.append(token)
-    return ids
-
-
-def _select_raw_video_formats(
-    raw_info: Dict[str, Any],
-    quality_key: str,
-    format_selector: str,
-) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    raw_formats = [fmt for fmt in (raw_info.get("formats") or []) if isinstance(fmt, dict) and _raw_format_is_direct(fmt)]
-    by_id = {str(fmt.get("format_id")): fmt for fmt in raw_formats if fmt.get("format_id") is not None}
-    audio_formats = [
-        fmt for fmt in raw_formats
-        if (fmt.get("acodec") or "none") != "none" and (fmt.get("vcodec") or "none") == "none"
-    ]
-    audio_formats.sort(key=_raw_format_score, reverse=True)
-
-    for format_id in _extract_format_ids_from_selector(format_selector):
-        fmt = by_id.get(format_id)
-        if not fmt or (fmt.get("vcodec") or "none") == "none":
-            continue
-        if (fmt.get("acodec") or "none") != "none":
-            return fmt, None
-        return fmt, audio_formats[0] if audio_formats else None
-
-    height_limit: Optional[int] = None
-    height_match = re.fullmatch(r"(\d+)p", quality_key)
-    if height_match:
-        height_limit = int(height_match.group(1))
-
-    video_formats = [fmt for fmt in raw_formats if (fmt.get("vcodec") or "none") != "none"]
-    if height_limit:
-        limited = [fmt for fmt in video_formats if int(fmt.get("height") or 0) <= height_limit]
-        if limited:
-            video_formats = limited
-    reverse = quality_key != "worst"
-    combined_formats = [fmt for fmt in video_formats if (fmt.get("acodec") or "none") != "none"]
-    video_only_formats = [fmt for fmt in video_formats if (fmt.get("acodec") or "none") == "none"]
-    combined_formats.sort(key=_raw_format_score, reverse=reverse)
-    video_only_formats.sort(key=_raw_format_score, reverse=reverse)
-
-    if video_only_formats and audio_formats and _ffmpeg_available():
-        return video_only_formats[0], audio_formats[0]
-    if combined_formats:
-        return combined_formats[0], None
-    if video_only_formats:
-        return video_only_formats[0], None
-    return None, None
-
-
-def _safe_video_output_path(raw_info: Dict[str, Any], ext: str) -> str:
-    title = _sanitize_base_filename(str(raw_info.get("title") or raw_info.get("id") or "downloaded_video"))
-    video_id = _sanitize_base_filename(str(raw_info.get("id") or "")) or uuid.uuid4().hex[:8]
-    base = (title or "downloaded_video")[:160].strip()
-    safe_ext = re.sub(r"[^A-Za-z0-9]", "", ext or "").lower() or "mp4"
-    if safe_ext not in VIDEO_DOWNLOAD_EXTENSIONS:
-        safe_ext = "mp4"
-    filename = f"{base} [{video_id}].{safe_ext}"
-    path = os.path.join(VIDEO_DOWNLOAD_DIR, filename)
-    if not os.path.exists(path):
-        return path
-    for index in range(2, 1000):
-        candidate = os.path.join(VIDEO_DOWNLOAD_DIR, f"{base} [{video_id}] ({index}).{safe_ext}")
-        if not os.path.exists(candidate):
-            return candidate
-    return os.path.join(VIDEO_DOWNLOAD_DIR, f"{base} [{video_id}] {uuid.uuid4().hex[:6]}.{safe_ext}")
-
-
-def _download_direct_format(
-    fmt: Dict[str, Any],
-    output_path: str,
-    emit: Callable[..., None],
-    message: str,
-) -> None:
-    headers = dict(fmt.get("http_headers") or {})
-    headers.setdefault("User-Agent", "Mozilla/5.0")
-    request = urllib.request.Request(str(fmt["url"]), headers=headers)
-    downloaded = 0
-    with urllib.request.urlopen(request, timeout=60) as response, open(output_path, "wb") as fh:
-        total_header = response.headers.get("Content-Length")
-        total = int(total_header) if total_header and total_header.isdigit() else 0
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            fh.write(chunk)
-            downloaded += len(chunk)
-            percent = round((downloaded / total) * 100, 2) if total else None
-            emit(
-                "progress",
-                message=message,
-                percent=percent,
-                downloaded_bytes=downloaded,
-                total_bytes=total,
-                speed=None,
-                eta=None,
-            )
+_ffmpeg_thread_args = functools.partial(ffmpeg_thread_args, FFMPEG_THREADS)
+_ffmpeg_video_thread_args = functools.partial(ffmpeg_video_thread_args, FFMPEG_THREADS)
+_ffmpeg_filter_thread_args = functools.partial(ffmpeg_filter_thread_args, FFMPEG_THREADS)
+_ffmpeg_codec_args_for_format = functools.partial(ffmpeg_codec_args_for_format, threads=FFMPEG_THREADS)
+
+
+SUBTITLE_STYLE = SubtitleStyle(
+    font_name=VIDEO_SUBTITLE_FONT,
+    font_file=VIDEO_SUBTITLE_FONT_FILE,
+    fonts_dir=VIDEO_SUBTITLE_FONTS_DIR,
+    font_size=VIDEO_SUBTITLE_FONT_SIZE,
+    local_fonts_dir=os.path.join(current_dir, "fonts"),
+)
+
+_ffmpeg_subtitles_filter_arg = SUBTITLE_STYLE.filter_arg
+
+
+VIDEO_LIBRARY = VideoLibrary(
+    download_dir=VIDEO_DOWNLOAD_DIR,
+    translated_dir=TRANSLATE_OUTPUT_DIR,
+    audio_cache_dir=VIDEO_AUDIO_CACHE_DIR,
+    snapshot_cache_dir=VIDEO_SNAPSHOT_CACHE_DIR,
+)
+
+_safe_video_output_path = VIDEO_LIBRARY.output_path_for
+_downloaded_video_path = VIDEO_LIBRARY.downloaded_path
+_translated_video_path = VIDEO_LIBRARY.translated_path
+_downloaded_video_entry = VIDEO_LIBRARY.downloaded_entry
+_list_downloaded_video_entries = VIDEO_LIBRARY.list_downloaded
+_list_translated_video_entries = VIDEO_LIBRARY.list_translated
+_find_recent_downloaded_video = VIDEO_LIBRARY.find_recent_download
+_downloaded_video_audio_cache_path = VIDEO_LIBRARY.audio_cache_path
+_video_snapshot_cache_path = VIDEO_LIBRARY.snapshot_cache_path
 
 
 def _manual_video_download_from_raw_info(
@@ -9668,401 +8820,21 @@ def _manual_video_download_from_raw_info(
 # Cookie helpers (ported from downloader.py CookieSettings)
 # ---------------------------------------------------------------------------
 
-def _extract_domain_from_url(url: str) -> str:
-    """Extract the main domain from a video URL."""
-    match = re.search(r"https?://(?:www\.)?([^/]+)", url)
-    if match:
-        domain = match.group(1)
-        parts = domain.split(".")
-        if len(parts) > 2:
-            domain = ".".join(parts[-2:])
-        if domain == "youtu.be":
-            domain = "youtube.com"
-        return domain
-    return "unknown"
 
-
-def _extract_domain_from_curl(curl_text: str) -> str:
-    """Extract the main domain from a cURL command."""
-    url_match = re.search(r"curl\s+['\"]?(https?://[^'\"\s]+)", curl_text)
-    if not url_match:
-        url_match = re.search(r"https?://([^\s/'\"]+)", curl_text)
-    if url_match:
-        url = url_match.group(1) if "://" in url_match.group(1) else url_match.group(0)
-        domain_match = re.search(r"https?://(?:www\.)?([^/]+)", url)
-        if domain_match:
-            domain = domain_match.group(1)
-            parts = domain.split(".")
-            if len(parts) > 2:
-                domain = ".".join(parts[-2:])
-            if domain == "youtu.be":
-                domain = "youtube.com"
-            return domain
-    return "unknown"
-
-
-def _parse_curl_cookies(curl_text: str) -> Dict[str, str]:
-    """Parse cookies from a cURL command string."""
-    cookies: Dict[str, str] = {}
-    patterns = [
-        r"-H\s+['\"]Cookie:\s*([^'\"]+)['\"]",
-        r"--header\s+['\"]Cookie:\s*([^'\"]+)['\"]",
-        r"-b\s+['\"]([^'\"]+)['\"]",
-        r"--cookie\s+['\"]([^'\"]+)['\"]",
-    ]
-    for pattern in patterns:
-        matches = re.findall(pattern, curl_text, re.IGNORECASE)
-        for match in matches:
-            pairs = match.split(";")
-            for pair in pairs:
-                pair = pair.strip()
-                if "=" in pair:
-                    name, value = pair.split("=", 1)
-                    cookies[name.strip()] = value.strip()
-    return cookies
-
-
-def _get_saved_cookie_sites() -> Dict[str, int]:
-    """Get list of saved cookie sites with cookie counts."""
-    sites: Dict[str, int] = {}
-    for cookies_dir in _candidate_cookie_dirs():
-        if not os.path.exists(cookies_dir):
-            continue
-        for f in os.listdir(cookies_dir):
-            if f.endswith("_cookies.txt"):
-                domain = f.replace("_cookies.txt", "").replace("_", ".")
-                filepath = os.path.join(cookies_dir, f)
-                try:
-                    with open(filepath, "r", encoding="utf-8") as fh:
-                        lines = [line for line in fh.readlines() if line.strip() and not line.startswith("#")]
-                        sites[domain] = max(sites.get(domain, 0), len(lines))
-                except Exception:
-                    sites.setdefault(domain, 0)
-    return sites
-
-
-def _candidate_cookie_dirs() -> List[str]:
-    """Cookie directories from both possible output roots, deduped."""
-    candidates = [
-        COOKIES_DIR,
+COOKIE_STORE = CookieStore(
+    COOKIES_DIR,
+    fallback_dirs=(
         str((APP_DIR / "outputs" / "cookies").resolve()),
         str((APP_DIR.parent / "outputs" / "cookies").resolve()),
-    ]
-    result: List[str] = []
-    seen: Set[str] = set()
-    for candidate in candidates:
-        normalized = os.path.abspath(candidate)
-        if normalized not in seen:
-            result.append(normalized)
-            seen.add(normalized)
-    return result
+    ),
+)
 
-
-def _normalize_cookie_domain(domain: str) -> str:
-    normalized = (domain or "").strip().lower()
-    if normalized.startswith("www."):
-        normalized = normalized[4:]
-    normalized = normalized.strip(".")
-    if not normalized:
-        raise ValueError("Domain is required.")
-    if not re.fullmatch(r"[a-z0-9.-]+", normalized):
-        raise ValueError("Invalid domain.")
-    return normalized
-
-
-def _cookie_filename_for_domain(domain: str) -> str:
-    normalized = _normalize_cookie_domain(domain)
-    return normalized.replace(".", "_") + "_cookies.txt"
-
-
-def _cookie_path_for_domain(domain: str, cookies_dir: str = COOKIES_DIR) -> str:
-    filename = _cookie_filename_for_domain(domain)
-    root = os.path.abspath(cookies_dir)
-    path = os.path.abspath(os.path.join(root, filename))
-    if os.path.commonpath([root, path]) != root:
-        raise ValueError("Invalid cookie path.")
-    return path
-
-
-def _find_saved_cookie_file_for_domain(domain: str) -> Tuple[str, str]:
-    filename = _cookie_filename_for_domain(domain)
-    for cookies_dir in _candidate_cookie_dirs():
-        root = os.path.abspath(cookies_dir)
-        path = os.path.abspath(os.path.join(root, filename))
-        if os.path.commonpath([root, path]) == root and os.path.exists(path):
-            return path, _normalize_cookie_domain(domain)
-    raise FileNotFoundError("No cookies found for this domain.")
-
-
-def _get_cookie_file_for_url(url: str) -> Optional[str]:
-    """Get the appropriate cookie file for a given video URL."""
-    domain = _extract_domain_from_url(url)
-    # Try exact match first
-    filename = domain.replace(".", "_") + "_cookies.txt"
-    for cookies_dir in _candidate_cookie_dirs():
-        filepath = os.path.join(cookies_dir, filename)
-        if os.path.exists(filepath):
-            return filepath
-    # Try partial matches (e.g., for subdomains)
-    for cookies_dir in _candidate_cookie_dirs():
-        if not os.path.exists(cookies_dir):
-            continue
-        for f in os.listdir(cookies_dir):
-            if f.endswith("_cookies.txt"):
-                saved_domain = f.replace("_cookies.txt", "").replace("_", ".")
-                if saved_domain in domain or domain in saved_domain:
-                    return os.path.join(cookies_dir, f)
-    return None
-
-
-def _get_cookie_opts_for_url(url: str) -> Dict[str, Any]:
-    """Return yt-dlp cookie options dict for a URL, or empty dict."""
-    cookie_file = _get_cookie_file_for_url(url)
-    if cookie_file:
-        return {"cookiefile": cookie_file}
-    return {}
-
-
-def _get_cookie_path_for_url(url: str) -> Optional[str]:
-    """Return the saved cookie file path for diagnostics."""
-    return _get_cookie_file_for_url(url)
-
-
-def _safe_video_download_filename(filename: str) -> str:
-    safe_name = os.path.basename(filename or "")
-    if not safe_name or safe_name != filename:
-        raise ValueError("Invalid video filename.")
-    return safe_name
-
-
-DOWNLOADED_VIDEO_ID_PREFIX = "v_"
-
-
-def _encode_downloaded_video_id(filename: str) -> str:
-    safe_name = _safe_video_download_filename(filename)
-    encoded = base64.urlsafe_b64encode(safe_name.encode("utf-8")).decode("ascii")
-    return DOWNLOADED_VIDEO_ID_PREFIX + encoded.rstrip("=")
-
-
-def _decode_downloaded_video_id(video_id_or_filename: str) -> str:
-    value = (video_id_or_filename or "").strip()
-    if value.startswith(DOWNLOADED_VIDEO_ID_PREFIX):
-        payload = value[len(DOWNLOADED_VIDEO_ID_PREFIX):]
-        padding = "=" * (-len(payload) % 4)
-        try:
-            return base64.urlsafe_b64decode((payload + padding).encode("ascii")).decode("utf-8")
-        except Exception as exc:
-            raise ValueError("Invalid downloaded video id.") from exc
-    return value
-
-
-def _downloaded_video_path(video_id_or_filename: str) -> str:
-    safe_name = _safe_video_download_filename(_decode_downloaded_video_id(video_id_or_filename))
-    path = os.path.abspath(os.path.join(VIDEO_DOWNLOAD_DIR, safe_name))
-    root = os.path.abspath(VIDEO_DOWNLOAD_DIR)
-    if os.path.commonpath([root, path]) != root:
-        raise ValueError("Invalid video path.")
-    return path
-
-
-def _translated_video_path(filename: str) -> str:
-    safe_name = os.path.basename(filename or "")
-    if not safe_name or safe_name != filename:
-        raise ValueError("Invalid translated video filename.")
-    ext = os.path.splitext(safe_name)[1].lstrip(".").lower()
-    if ext not in VIDEO_DOWNLOAD_EXTENSIONS:
-        raise ValueError("Only translated video outputs can be deleted.")
-    path = os.path.abspath(os.path.join(TRANSLATE_OUTPUT_DIR, safe_name))
-    root = os.path.abspath(TRANSLATE_OUTPUT_DIR)
-    if os.path.commonpath([root, path]) != root:
-        raise ValueError("Invalid translated video path.")
-    return path
-
-
-def _ffprobe_duration_seconds(path: str) -> Optional[float]:
-    if shutil.which("ffprobe") is None or not os.path.exists(path):
-        return None
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        path,
-    ]
-    try:
-        process = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if process.returncode != 0:
-            return None
-        value = (process.stdout or "").strip()
-        return float(value) if value else None
-    except Exception:
-        return None
-
-
-def _ffprobe_video_dimensions(path: str) -> Optional[Tuple[int, int]]:
-    if shutil.which("ffprobe") is None or not os.path.exists(path):
-        return None
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=width,height",
-        "-of",
-        "csv=s=x:p=0",
-        path,
-    ]
-    try:
-        process = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if process.returncode != 0:
-            return None
-        value = (process.stdout or "").strip().splitlines()[0]
-        width_text, height_text = value.split("x", 1)
-        width = int(width_text)
-        height = int(height_text)
-        if width <= 0 or height <= 0:
-            return None
-        return width, height
-    except Exception:
-        return None
-
-
-def _format_video_duration(seconds: Optional[float]) -> str:
-    if not seconds or seconds <= 0:
-        return ""
-    whole = int(round(seconds))
-    minutes, secs = divmod(whole, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes}:{secs:02d}"
-
-
-def _format_size_mb(size_bytes: int) -> float:
-    return round(max(0, int(size_bytes or 0)) / (1024 * 1024), 2)
-
-
-def _downloaded_video_entry(path: str) -> Dict[str, Any]:
-    safe_name = os.path.basename(path)
-    video_id = _encode_downloaded_video_id(safe_name)
-    stat = os.stat(path)
-    duration_seconds = _ffprobe_duration_seconds(path)
-    return {
-        "id": video_id,
-        "filename": safe_name,
-        "title": os.path.splitext(safe_name)[0],
-        "extension": os.path.splitext(safe_name)[1].lstrip(".").lower(),
-        "size_bytes": int(stat.st_size),
-        "size_mb": _format_size_mb(stat.st_size),
-        "mtime": stat.st_mtime,
-        "duration_seconds": duration_seconds,
-        "duration_label": _format_video_duration(duration_seconds),
-        "url": f"/api/downloaded_videos/{video_id}",
-        "poster_url": f"/api/downloaded_videos/{video_id}/snapshot",
-    }
-
-
-def _list_downloaded_video_entries() -> List[Dict[str, Any]]:
-    entries: List[Dict[str, Any]] = []
-    if not os.path.exists(VIDEO_DOWNLOAD_DIR):
-        return entries
-    for entry in os.scandir(VIDEO_DOWNLOAD_DIR):
-        if not entry.is_file():
-            continue
-        ext = os.path.splitext(entry.name)[1].lstrip(".").lower()
-        if ext not in VIDEO_DOWNLOAD_EXTENSIONS:
-            continue
-        try:
-            entries.append(_downloaded_video_entry(entry.path))
-        except Exception as exc:
-            print(f"⚠️ Failed to inspect downloaded video '{entry.name}': {exc}")
-    entries.sort(key=lambda item: item.get("mtime") or 0, reverse=True)
-    return entries
-
-
-def _translated_video_entry(path: str) -> Dict[str, Any]:
-    safe_name = os.path.basename(path)
-    stat = os.stat(path)
-    duration_seconds = _ffprobe_duration_seconds(path)
-    encoded_name = quote(safe_name, safe="")
-    return {
-        "id": safe_name,
-        "filename": safe_name,
-        "title": os.path.splitext(safe_name)[0],
-        "extension": os.path.splitext(safe_name)[1].lstrip(".").lower(),
-        "size_bytes": int(stat.st_size),
-        "size_mb": _format_size_mb(stat.st_size),
-        "mtime": stat.st_mtime,
-        "mtime_label": time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime)),
-        "duration_seconds": duration_seconds,
-        "duration_label": _format_video_duration(duration_seconds),
-        "url": f"/api/translate_outputs/{encoded_name}",
-        "poster_url": f"/api/translate_outputs/{encoded_name}/snapshot",
-    }
-
-
-def _list_translated_video_entries() -> List[Dict[str, Any]]:
-    entries: List[Dict[str, Any]] = []
-    if not os.path.exists(TRANSLATE_OUTPUT_DIR):
-        return entries
-    for entry in os.scandir(TRANSLATE_OUTPUT_DIR):
-        if not entry.is_file():
-            continue
-        ext = os.path.splitext(entry.name)[1].lstrip(".").lower()
-        if ext not in VIDEO_DOWNLOAD_EXTENSIONS:
-            continue
-        try:
-            entries.append(_translated_video_entry(entry.path))
-        except Exception as exc:
-            print(f"⚠️ Failed to inspect translated video '{entry.name}': {exc}")
-    entries.sort(key=lambda item: item.get("mtime") or 0, reverse=True)
-    return entries
-
-
-def _find_recent_downloaded_video(start_time: float, info: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    candidates: List[str] = []
-    video_id = str((info or {}).get("id") or "").strip()
-    for entry in os.scandir(VIDEO_DOWNLOAD_DIR):
-        if not entry.is_file():
-            continue
-        ext = os.path.splitext(entry.name)[1].lstrip(".").lower()
-        if ext not in VIDEO_DOWNLOAD_EXTENSIONS:
-            continue
-        try:
-            stat = entry.stat()
-        except OSError:
-            continue
-        if video_id and video_id not in entry.name:
-            continue
-        if stat.st_mtime >= start_time - 5:
-            candidates.append(entry.path)
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: os.path.getmtime(item), reverse=True)
-    return candidates[0]
-
-
-def _downloaded_video_audio_cache_path(video_path: str) -> str:
-    stat = os.stat(video_path)
-    cache_key = hashlib.md5(
-        f"{os.path.abspath(video_path)}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")
-    ).hexdigest()[:16]
-    stem = _sanitize_base_filename(os.path.basename(video_path)) or "downloaded_video"
-    return os.path.join(VIDEO_AUDIO_CACHE_DIR, f"{stem}_{cache_key}.mp3")
-
-
-def _video_snapshot_cache_path(video_path: str) -> str:
-    stat = os.stat(video_path)
-    cache_key = hashlib.md5(
-        f"{os.path.abspath(video_path)}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")
-    ).hexdigest()[:16]
-    stem = _sanitize_base_filename(os.path.basename(video_path)) or "video"
-    return os.path.join(VIDEO_SNAPSHOT_CACHE_DIR, f"{stem}_{cache_key}.jpg")
+_get_saved_cookie_sites = COOKIE_STORE.saved_sites
+_candidate_cookie_dirs = COOKIE_STORE.candidate_dirs
+_cookie_path_for_domain = COOKIE_STORE.path_for_domain
+_find_saved_cookie_file_for_domain = COOKIE_STORE.find_saved_file_for_domain
+_get_cookie_opts_for_url = COOKIE_STORE.ytdlp_opts_for_url
+_get_cookie_path_for_url = COOKIE_STORE.file_for_url
 
 
 def _generate_video_snapshot_sync(video_path: str) -> str:
@@ -12889,8 +11661,6 @@ async def api_clear_outputs():
             "status": "error",
             "message": f"Failed to clear outputs: {str(e)}"
         }
-
-
 
 
 @app.get("/api/prompt_templates")
@@ -18723,8 +17493,6 @@ async def _external_tts_single_audio_stream(
         for path in cleanup_items:
             if path:
                 await async_remove_file(path)
-
-
 
 
 @app.post("/speak_stream")

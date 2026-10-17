@@ -90,7 +90,7 @@ def split_text(text: str, max_tokens: int, *, markup: TextMarkup | None = None) 
 
     cuts = [0, *(after_closers(m.start()) for m in _TEXT_BOUNDARY.finditer(value)
                  if 0 < m.start() < len(value) and tag_at(m.start()) is None), len(value)]
-    pieces = [_strip_span(value, start, end) for start, end in zip(cuts, cuts[1:])]
+    pieces = [_strip_span(value, start, end) for start, end in zip(cuts, cuts[1:], strict=False)]
     spans: list[tuple[int, int]] = []
     for start, end in (piece for piece in pieces if piece[0] < piece[1]):
         words: list[list[int]] = []

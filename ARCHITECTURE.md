@@ -15,12 +15,23 @@ server assembly, configuration, backend adapters, and shared infrastructure.
 | `indextts_web/config.py` / `gpu_profiles.py` | Typed CLI settings and hardware-aware runtime configuration |
 | `indextts_web/runtime.py` | Runtime settings, backend registry, concurrency, production-module reference |
 | `indextts_web/services/tts/` | IndexTTS 2.0, IndexTTS 2.5, and Confucius request/lifecycle adapters |
-| `indextts_web/services/translation/` | Subtitle parsing, isolated Qwen ASR worker, MOSS client/runtime |
-| `indextts_web/infrastructure/` | GPU coordination/memory, Modal runtime, atomic JSON persistence, concurrency, callable compatibility |
+| `indextts_web/api/responses.py` | JSON error payloads and padded server-sent-event streams |
+| `indextts_web/services/translation/` | Subtitle parsing, timestamps, Gemini response parsing, isolated Qwen ASR worker, MOSS client/runtime |
+| `indextts_web/services/video/` | yt-dlp options/format selection, saved cookies (`CookieStore`), downloaded/translated video files (`VideoLibrary`), burned-in subtitle fonts (`SubtitleStyle`) |
+| `indextts_web/infrastructure/` | GPU coordination/memory, FFmpeg/ffprobe helpers, safe filenames, Modal runtime, atomic JSON persistence, concurrency, callable compatibility |
 | `fastapi_webui_v2_impl.py` | Production endpoint inventory, inference orchestration, translation sessions/artifacts |
 | `indextts/` | Model inference implementations and upstream model components |
 | `index_new.html` / `static/` | Modern WebUI markup, CSS, JavaScript |
 | `tests/` | CPU behavior, deployment, route, streaming, and frontend contracts |
+
+Pure helpers move out of `fastapi_webui_v2_impl.py` into the package with
+public names; the production module imports them under their original
+underscore aliases so endpoint bodies and AST-based tests stay unchanged.
+Helpers that need output directories or environment settings become small
+classes; the production module builds one instance from its settings
+(`COOKIE_STORE`, `VIDEO_LIBRARY`, `SUBTITLE_STYLE`) and binds the old names
+to its methods. Definitions that tests load from the production file by name
+stay there.
 
 Importing configuration and service contracts does not initialize CUDA or
 start services. App assembly loads the production module; model initialization
