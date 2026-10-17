@@ -72,6 +72,29 @@ class SpeakerPresetManager:
             content = f.read()
         return hashlib.md5(content).hexdigest()
     
+    def resolve_audio_path(self, preset_name: str) -> Optional[str]:
+        """Return the preset's reference audio path, repairing stale absolute paths.
+
+        Presets saved by an earlier process may point at an application
+        directory that no longer exists (e.g. a per-container runtime copy),
+        while the file itself survives under this cache directory.
+        """
+        preset = self.presets.get(preset_name)
+        stored = (preset or {}).get('audio_path') or ''
+        if not stored:
+            return None
+        if os.path.exists(stored):
+            return stored
+        parts = Path(stored.replace('\\', '/')).parts
+        if self.cache_dir.name in parts:
+            index = len(parts) - 1 - parts[::-1].index(self.cache_dir.name)
+            candidate = self.cache_dir.joinpath(*parts[index + 1:]).resolve()
+            if candidate.is_file():
+                preset['audio_path'] = str(candidate)
+                self._save_presets()
+                return str(candidate)
+        return None
+
     def _get_cache_path(self, preset_name: str) -> Path:
         """Get cache file path for a preset"""
         safe_name = "".join(c for c in preset_name if c.isalnum() or c in (' ', '-', '_')).strip()
@@ -272,7 +295,8 @@ class SpeakerPresetManager:
             if self.tts_model is None:
                 return None
             preset = self.presets[preset_name]
-            if not self.add_speaker_preset(preset_name, preset['audio_path'], preset.get('description', '')):
+            audio_path = self.resolve_audio_path(preset_name) or preset['audio_path']
+            if not self.add_speaker_preset(preset_name, audio_path, preset.get('description', '')):
                 return None
 
         # Check memory cache first (fast path)

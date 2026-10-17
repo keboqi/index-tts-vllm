@@ -11622,8 +11622,10 @@ class SpeakerAPIWrapper:
             if speaker_name in existing_presets:
                 preset_info = existing_presets[speaker_name]
                 if not _speaker_preview_exists(speaker_name):
-                    audio_path = preset_info.get("audio_path")
-                    if audio_path and os.path.exists(audio_path):
+                    audio_path = await loop.run_in_executor(
+                        executor, self.preset_manager.resolve_audio_path, speaker_name
+                    )
+                    if audio_path:
                         await _create_speaker_preview_mp3(audio_path, speaker_name)
                 preview_available = _speaker_preview_exists(speaker_name)
                 return {
@@ -11846,15 +11848,15 @@ class SpeakerAPIWrapper:
         try:
             # Run in thread pool to avoid blocking
             loop = asyncio.get_event_loop()
-            presets = await loop.run_in_executor(executor, self.preset_manager.list_presets)
-            
-            if speaker_name in presets:
-                audio_path = presets[speaker_name].get('audio_path', '')
-                if audio_path:
-                    # Check file existence in thread pool
-                    exists = await loop.run_in_executor(executor, os.path.exists, audio_path)
-                    if exists:
-                        return [audio_path]
+            audio_path = await loop.run_in_executor(
+                executor, self.preset_manager.resolve_audio_path, speaker_name
+            )
+            if audio_path:
+                return [audio_path]
+            # Legacy presets may have lost their reference file; the preview MP3
+            # is derived from that same reference audio.
+            if self.preset_manager.presets.get(speaker_name) and _speaker_preview_exists(speaker_name):
+                return [str(_get_speaker_preview_path(speaker_name).resolve())]
             return None
         except Exception as e:
             print(f"Error getting speaker audio paths: {e}")
