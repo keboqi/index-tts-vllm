@@ -1,7 +1,11 @@
 import asyncio
+import io
 import unittest
+import wave
 
-from indextts_web.services.tts.chunking import render_segments, split_text
+import numpy as np
+
+from indextts_web.services.tts.chunking import join_wav, render_segments, split_text
 from indextts_web.services.tts.drama3_manager import DRAMA3_MARKUP, emotion_prefix
 
 
@@ -72,3 +76,39 @@ class RenderSegmentsTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+RATE = 24000
+
+
+def pcm_wav(*parts: tuple[float, float]) -> bytes:
+    """(seconds, amplitude) runs of a 220 Hz tone; amplitude 0 is silence."""
+    samples = np.concatenate([
+        amplitude * np.sin(2 * np.pi * 220 * np.arange(int(RATE * seconds)) / RATE) for seconds, amplitude in parts
+    ])
+    stream = io.BytesIO()
+    with wave.open(stream, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(RATE)
+        audio.writeframes((samples * 32767).astype("<i2").tobytes())
+    return stream.getvalue()
+
+
+def seconds(content: bytes) -> float:
+    with wave.open(io.BytesIO(content), "rb") as audio:
+        return audio.getnframes() / audio.getframerate()
+
+
+class JoinWavTests(unittest.TestCase):
+    def test_trim_silence_tidies_edges_and_long_internal_gaps(self):
+        padded = pcm_wav((1.5, 0), (0.5, 0.3), (3.0, 0), (0.5, 0.3), (2.0, 0))
+        self.assertAlmostEqual(seconds(join_wav([padded, padded], 100)), 15.1, places=2)
+        # Each segment: 0.08 pad + 0.5 voice + 0.5 kept gap + 0.5 voice + 0.08 pad.
+        self.assertAlmostEqual(seconds(join_wav([padded, padded], 100, trim_silence=True)), 3.42, places=2)
+
+    def test_trim_silence_keeps_quiet_speech_and_silent_segments(self):
+        whisper = pcm_wav((0.5, 0), (1.0, 0.003), (0.5, 0))
+        silent = pcm_wav((0.4, 0))
+        joined = join_wav([whisper, silent], trim_silence=True)
+        self.assertAlmostEqual(seconds(joined), 1.16 + 0.4, places=2)

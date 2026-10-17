@@ -139,7 +139,9 @@ class ManagedDrama3Backend:
         return str(staged)
 
     def _write_output(self, clips: list[bytes], output_path, interval_silence_ms: int) -> str:
-        content = clips[0] if len(clips) == 1 else join_wav(clips, max(0, int(interval_silence_ms)))
+        content = clips[0] if len(clips) == 1 else join_wav(
+            clips, max(0, int(interval_silence_ms)), trim_silence=True,
+        )
         target = Path(output_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)

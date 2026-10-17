@@ -20,12 +20,23 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TypeVar
 
+import numpy as np
+
 _TEXT_BOUNDARY = re.compile(r"(?<=[.!?。！？；;])\s*")
 _TEXT_TOKEN_UNIT = re.compile(r"[一-鿿]|[A-Za-z0-9]+|[^\s]")
 _WORD = re.compile(r"\S+")
 _EMPTY_PAIR = re.compile(r"<([A-Za-z][\w-]*)>\s*</\1>")
 
 T = TypeVar("T")
+
+# Silence tidying for joined segments, ported from minimax_h3's Drama 3 joiner:
+# an RMS activity detector over short frames, adaptive for quiet takes.
+SILENCE_DBFS = -45.0
+FRAME_SECONDS = 0.02
+EDGE_PAD_SECONDS = 0.08
+MAX_INTERNAL_GAP_SECONDS = 1.0  # longer silences inside a segment are shortened ...
+KEPT_GAP_SECONDS = 0.5  # ... to this
+_PCM_DTYPES = {2: "<i2", 4: "<i4"}
 
 
 @dataclass(frozen=True)
@@ -191,7 +202,62 @@ async def render_segments(
     return list(await asyncio.gather(*(run(segment) for segment in segments)))
 
 
-def join_wav(chunks: list[bytes], silence_ms: int = 0) -> bytes:
+def _silent_frames(samples: np.ndarray, frame: int) -> np.ndarray:
+    frames = samples[: len(samples) // frame * frame].reshape(-1, frame)
+    if not len(frames):
+        return np.zeros(0, dtype=bool)
+    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+    # Quiet or whispered segments need a lower threshold than the fixed floor.
+    threshold = max(10 ** (-75 / 20), min(10 ** (SILENCE_DBFS / 20), float(rms.max()) * 10 ** (-30 / 20)))
+    return rms < threshold
+
+
+def _silent_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """[start, end) frame ranges where ``mask`` holds."""
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], mask.astype(np.int8), [0]))))
+    return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
+
+
+def tidy_frames(frames: bytes, params) -> bytes:
+    """Trim edge silence and shorten long internal silences of PCM frames.
+
+    Formats the detector cannot read, and segments with no detectable
+    activity, are returned unchanged so a join never drops audio outright.
+    """
+    dtype = _PCM_DTYPES.get(params.sampwidth)
+    if dtype is None or params.comptype != "NONE" or params.framerate <= 0:
+        return frames
+    channels = params.nchannels
+    pcm = np.frombuffer(frames, dtype=dtype)
+    pcm = pcm[: len(pcm) // channels * channels].reshape(-1, channels)
+    mono = pcm.astype(np.float64).mean(axis=1) / float(2 ** (8 * params.sampwidth - 1))
+    size = max(1, int(params.framerate * FRAME_SECONDS))
+    silent = _silent_frames(mono, size)
+    voiced = np.flatnonzero(~silent)
+    if not len(voiced):
+        return frames
+    pad = int(EDGE_PAD_SECONDS / FRAME_SECONDS)
+    first = max(0, int(voiced[0]) - pad)
+    last = min(len(silent), int(voiced[-1]) + 1 + pad)
+    keep = int(KEPT_GAP_SECONDS / FRAME_SECONDS)
+    pieces, cursor = [], first
+    for start, end in _silent_runs(silent[first:last]):
+        start, end = start + first, end + first
+        if (end - start) * FRAME_SECONDS > MAX_INTERNAL_GAP_SECONDS:
+            pieces.append(pcm[cursor * size:(start + keep // 2) * size])
+            cursor = end - (keep - keep // 2)
+    # The final partial frame is never assessed; keep it only when speech runs to the end.
+    tail = len(pcm) if last == len(silent) else last * size
+    pieces.append(pcm[cursor * size:tail])
+    return np.concatenate(pieces).astype(dtype).tobytes()
+
+
+def join_wav(chunks: list[bytes], silence_ms: int = 0, *, trim_silence: bool = False) -> bytes:
+    """Join WAV segments in order with ``silence_ms`` between them.
+
+    ``trim_silence`` first tidies each segment (see ``tidy_frames``) so silence
+    a backend leaves around chunks does not stack up into long gaps.
+    """
     if not chunks:
         raise ValueError("TTS backend returned no WAV chunks")
     output = io.BytesIO()
@@ -205,7 +271,8 @@ def join_wav(chunks: list[bytes], silence_ms: int = 0) -> bytes:
                 params = current
             elif signature != (params.nchannels, params.sampwidth, params.framerate, params.comptype):
                 raise ValueError("TTS WAV chunks use incompatible audio formats")
-            frames.append(source.readframes(source.getnframes()))
+            content = source.readframes(source.getnframes())
+            frames.append(tidy_frames(content, current) if trim_silence else content)
             if index + 1 < len(chunks) and silence_ms:
                 silence_frames = round(current.framerate * silence_ms / 1000)
                 frames.append(b"\x00" * silence_frames * current.nchannels * current.sampwidth)
