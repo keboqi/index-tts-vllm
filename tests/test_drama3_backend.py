@@ -137,6 +137,27 @@ class Drama3Tests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(staged, reference)
         self.assertEqual(output.read_bytes(), stream.getvalue())
 
+    def test_chunks_generate_concurrently_and_join_in_order(self):
+        def wav(sample: int) -> bytes:
+            stream = io.BytesIO()
+            with wave.open(stream, "wb") as audio:
+                audio.setnchannels(1)
+                audio.setsampwidth(2)
+                audio.setframerate(24000)
+                audio.writeframes(sample.to_bytes(2, "little") * 10)
+            return stream.getvalue()
+        texts = ["First", "Second", "Third"]
+        barrier = threading.Barrier(len(texts), timeout=5)
+        def speech(payload):
+            barrier.wait()  # Raises unless every chunk is in flight at once.
+            return wav(texts.index(payload["input"]) + 1)
+        output = self.root / "long.wav"
+        with patch.object(self.manager._server, "speech", side_effect=speech):
+            self.manager._synthesize_sync(text=" ".join(texts), output_path=output, max_text_tokens=1)
+        with wave.open(str(output), "rb") as audio:
+            frames = audio.readframes(audio.getnframes())
+        self.assertEqual(frames, b"".join(i.to_bytes(2, "little") * 10 for i in (1, 2, 3)))
+
 
 if __name__ == "__main__":
     unittest.main()

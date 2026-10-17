@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import os
 import shutil
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from indextts_web.infrastructure.gpu_work import await_gpu_job, gpu_operation
@@ -44,6 +46,8 @@ class ManagedDrama3Backend:
             sleep_mode=settings.drama3_sleep,
         ))
         self._slots = asyncio.Semaphore(settings.drama3_max_parallel_segments)
+        # Chunks of every request share the server's running-request budget.
+        self._chunk_slots = threading.BoundedSemaphore(settings.drama3_max_parallel_segments)
         self._server.checkpoint_launch_enabled = os.getenv("DRAMA3_MODAL_SNAPSHOT_CAPTURE") != "1"
 
     def process_running(self) -> bool:
@@ -93,6 +97,13 @@ class ManagedDrama3Backend:
             payload["references"] = []
         return payload
 
+    def _speak_chunk(self, payload: dict) -> bytes:
+        with self._chunk_slots:
+            content = self._server.speech(payload)
+        if not content.startswith(b"RIFF") or content[8:12] != b"WAVE":
+            raise RuntimeError("Drama 3 returned an invalid WAV response")
+        return content
+
     def _synthesize_sync(self, *, text, output_path, prompt_wav=None, max_text_tokens=120,
                          interval_silence_ms=0, **kwargs):
         if prompt_wav:
@@ -111,13 +122,19 @@ class ManagedDrama3Backend:
         chunks = split_text(text, max(1, int(max_text_tokens)))
         if not chunks:
             raise ValueError("Drama 3 speech text is required")
-        clips = []
-        for chunk in chunks:
-            payload = self.build_payload(text=chunk, prompt_wav=prompt_wav, **kwargs)
-            content = self._server.speech(payload)
-            if not content.startswith(b"RIFF") or content[8:12] != b"WAVE":
-                raise RuntimeError("Drama 3 returned an invalid WAV response")
-            clips.append(content)
+        payloads = [self.build_payload(text=chunk, prompt_wav=prompt_wav, **kwargs) for chunk in chunks]
+        if len(payloads) == 1:
+            clips = [self._speak_chunk(payloads[0])]
+        else:
+            workers = min(len(payloads), self.settings.drama3_max_parallel_segments)
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="drama3-chunk") as pool:
+                futures = [pool.submit(self._speak_chunk, payload) for payload in payloads]
+                try:
+                    clips = [future.result() for future in futures]
+                except BaseException:
+                    for future in futures:
+                        future.cancel()
+                    raise
         content = clips[0] if len(clips) == 1 else join_wav(clips, max(0, int(interval_silence_ms)))
         target = Path(output_path)
         target.parent.mkdir(parents=True, exist_ok=True)
