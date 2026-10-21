@@ -225,7 +225,7 @@ def _silent_frames(samples: np.ndarray, frame: int) -> np.ndarray:
 def _silent_runs(mask: np.ndarray) -> list[tuple[int, int]]:
     """[start, end) frame ranges where ``mask`` holds."""
     edges = np.flatnonzero(np.diff(np.concatenate(([0], mask.astype(np.int8), [0]))))
-    return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
+    return list(zip(edges[::2].tolist(), edges[1::2].tolist(), strict=True))
 
 
 def tidy_frames(frames: bytes, params) -> bytes:
