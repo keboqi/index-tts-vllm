@@ -22,6 +22,8 @@ from typing import TypeVar
 
 import numpy as np
 
+from indextts_web.infrastructure.gpu_work import await_gpu_job
+
 _TEXT_BOUNDARY = re.compile(r"(?<=[.!?。！？；;])\s*")
 _TEXT_TOKEN_UNIT = re.compile(r"[一-鿿]|[A-Za-z0-9]+|[^\s]")
 _WORD = re.compile(r"\S+")
@@ -199,7 +201,15 @@ async def render_segments(
         async with slots:
             return await render(segment)
 
-    return list(await asyncio.gather(*(run(segment) for segment in segments)))
+    # Drain every worker before returning or raising: executor cancellation
+    # cannot stop inference threads, and callers release their GPU lease here.
+    results = await await_gpu_job(asyncio.gather(
+        *(run(segment) for segment in segments), return_exceptions=True,
+    ))
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return list(results)
 
 
 def _silent_frames(samples: np.ndarray, frame: int) -> np.ndarray:

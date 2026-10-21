@@ -73,6 +73,59 @@ class RenderSegmentsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, [bytes([i]) for i in range(5)])
         self.assertEqual(peak, 3)
 
+    async def test_failure_waits_for_running_and_queued_segments(self):
+        running = asyncio.Event()
+        queued_started = asyncio.Event()
+        release = asyncio.Event()
+        finished = []
+        failure = RuntimeError("first chunk failed")
+
+        async def render(value):
+            if value == 0:
+                await running.wait()
+                raise failure
+            (running if value == 1 else queued_started).set()
+            await release.wait()
+            finished.append(value)
+            if value == 2:
+                raise RuntimeError("later chunk failed")
+            return b"ok"
+
+        task = asyncio.create_task(render_segments(range(3), render, slots=asyncio.Semaphore(2)))
+        try:
+            await asyncio.wait_for(queued_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+        finally:
+            release.set()
+            with self.assertRaises(RuntimeError) as caught:
+                await task
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(sorted(finished), [1, 2])
+
+    async def test_cancellation_waits_for_workers(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        finished = []
+
+        async def render(value):
+            started.set()
+            await release.wait()
+            finished.append(value)
+            return b"ok"
+
+        task = asyncio.create_task(render_segments(range(2), render, slots=asyncio.Semaphore(1)))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+        finally:
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(finished, [0, 1])
+
 
 if __name__ == "__main__":
     unittest.main()
