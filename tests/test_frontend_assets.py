@@ -118,3 +118,48 @@ for (const match of fs.readFileSync('index_new.html', 'utf8').matchAll(/<script[
 """
         result = subprocess.run([shutil.which("node"), "-e", script], cwd=ROOT, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node required for frontend behavior tests")
+    def test_segment_edits_track_baseline_and_preview_freshness(self):
+        script = r"""
+const assert = require('assert');
+const fs = require('fs');
+const vm = require('vm');
+const context = {
+    document: {querySelector: () => null, querySelectorAll: () => [], getElementById: () => null,
+               readyState: 'loading', addEventListener() {}, createElement: () => ({})},
+    window: {localStorage: {getItem: () => null, setItem() {}}, addEventListener() {}},
+    bindRangeOutputs() {}, fetch: async () => ({ok: false}),
+};
+vm.createContext(context);
+for (const name of ['core.js', 'translation-state.js', 'translation-chunks.js', 'translation-media.js', 'translation-segments.js']) {
+    vm.runInContext(fs.readFileSync(`static/js/${name}`, 'utf8'), context);
+    if (name === 'core.js') context.hideStatus = () => {};
+}
+const result = vm.runInContext(`
+    currentTranslateSegments = [{index: 1, type: 'speech', start_ms: 0, end_ms: 1000,
+                                 source_text: 'Hi', translated_text: 'Hola'}];
+    markTranslateSegmentsBaseline(false);
+    const segment = findTranslateSegment(1);
+    const checks = {initial: isSegmentEdited(segment)};
+    segment.preview_url = '/preview';
+    segment.preview_signature = segmentAudioSignature(segment);
+    checks.fresh = isSegmentPreviewFresh(segment);
+    segment.source_text = 'Hi there';
+    checks.sourceEdited = isSegmentEdited(segment);
+    checks.sourceKeepsPreview = isSegmentPreviewFresh(segment);
+    segment.translated_text = 'Hola ';
+    checks.trimmedKeepsPreview = isSegmentPreviewFresh(segment);
+    segment.end_ms = 1200;
+    checks.timingStalesPreview = isSegmentPreviewFresh(segment);
+    markTranslateSegmentsBaseline(true);
+    checks.generatedResets = isSegmentEdited(segment);
+    checks;
+`, context);
+assert.deepStrictEqual({...result}, {
+    initial: false, fresh: true, sourceEdited: true, sourceKeepsPreview: true,
+    trimmedKeepsPreview: true, timingStalesPreview: false, generatedResets: false,
+});
+"""
+        result = subprocess.run([shutil.which("node"), "-e", script], cwd=ROOT, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)

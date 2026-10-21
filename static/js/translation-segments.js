@@ -100,52 +100,27 @@ function toggleSegmentExpand(card) {
         }
 
         async function playCompactGeneratedAudio(card, btn) {
-            // Check if generated audio already exists in the expanded view
-            const previewAudio = card.querySelector('.segment-preview-audio');
-            let audioUrl = previewAudio && previewAudio.src && previewAudio.style.display !== 'none' ? previewAudio.src : null;
-
-            // If this button is already playing, stop it
-            if (currentPlayingBtn === btn && audioUrl) {
+            if (currentPlayingBtn === btn) {
                 stopCompactAudio();
                 return;
             }
 
             stopCompactAudio();
 
-            // If no generated audio yet, trigger generation
-            if (!audioUrl || audioUrl === '' || audioUrl === window.location.href) {
+            // Play the stored preview only while it still matches the card;
+            // otherwise synthesize a fresh one first.
+            const segment = findTranslateSegment(parseInt(card.dataset.index, 10));
+            let audioUrl = segment && isSegmentPreviewFresh(segment) ? segment.preview_url : null;
+            if (!audioUrl) {
                 btn.textContent = '⏳';
                 btn.classList.add('loading');
-
-                try {
-                    // Trigger the preview generation
-                    const previewBtn = card.querySelector('.segment-preview-btn');
-                    if (previewBtn) {
-                        // Call handleSegmentPreview and wait for it to complete
-                        await handleSegmentPreview(card, previewBtn);
-
-                        // Wait a bit for audio to be set
-                        await new Promise(resolve => setTimeout(resolve, 500));
-
-                        // Check again for audio
-                        audioUrl = previewAudio && previewAudio.src && previewAudio.style.display !== 'none' ? previewAudio.src : null;
-                    }
-                } catch (err) {
-                    console.error('Error generating preview:', err);
-                    btn.classList.remove('loading');
-                    btn.textContent = '▶';
-                    return;
-                }
-
+                const previewBtn = card.querySelector('.segment-preview-btn');
+                audioUrl = await handleSegmentPreview(card, previewBtn);
                 btn.classList.remove('loading');
-
-                if (!audioUrl || audioUrl === '' || audioUrl === window.location.href) {
+                if (!audioUrl) {
                     btn.textContent = '▶';
                     return;
                 }
-
-                // Mark as having audio
-                btn.classList.add('has-audio');
             }
 
             // Play the audio
@@ -547,6 +522,9 @@ function toggleSegmentExpand(card) {
                 currentTranslateSessionId = null;
             }
             currentTranslateSegments = [];
+            translateSegmentBaselines = new Map();
+            translateSegmentsDirty = false;
+            translateSegmentsGenerated = false;
             translateSpeakerProfiles = [];
             translateSpeakerProfileMap = {};
             translateSpeakerOverrides = {};
@@ -576,6 +554,125 @@ function toggleSegmentExpand(card) {
             syncTranslateMergeBackState();
         }
 
+        // Card edits are written back to currentTranslateSegments, so a
+        // re-render (e.g. after a full generation) keeps text, timing and
+        // inline previews. Baselines record each segment as last analyzed or
+        // generated, which is what "edited" is measured against.
+        let translateSegmentBaselines = new Map();
+        let translateSegmentsDirty = false;
+        let translateSegmentsGenerated = false;
+
+        function findTranslateSegment(index) {
+            return currentTranslateSegments.find(seg => seg.index === index) || null;
+        }
+
+        function segmentAudioSignature(segment) {
+            return JSON.stringify([
+                segment.start_ms,
+                segment.end_ms,
+                (segment.translated_text || '').trim(),
+                segment.volume_percent ?? null,
+                segment.emotion_weight ?? null,
+            ]);
+        }
+
+        function segmentEditSignature(segment) {
+            return JSON.stringify([segmentAudioSignature(segment), (segment.source_text || '').trim()]);
+        }
+
+        function markTranslateSegmentsBaseline(generated) {
+            translateSegmentsGenerated = generated;
+            translateSegmentBaselines = new Map(
+                currentTranslateSegments.map(seg => [seg.index, segmentEditSignature(seg)])
+            );
+        }
+
+        function isSegmentEdited(segment) {
+            const baseline = translateSegmentBaselines.get(segment.index);
+            return baseline !== undefined && baseline !== segmentEditSignature(segment);
+        }
+
+        function isSegmentPreviewFresh(segment) {
+            return Boolean(segment.preview_url) && segment.preview_signature === segmentAudioSignature(segment);
+        }
+
+        function parseOptionalNumber(input) {
+            const raw = input ? (input.value || '').trim() : '';
+            const value = raw ? parseFloat(raw) : NaN;
+            return Number.isNaN(value) ? undefined : value;
+        }
+
+        // Copy a card's inputs into its segment, then refresh the compact row,
+        // edited/missing-translation markers and preview freshness.
+        function syncSegmentCard(card) {
+            const segment = findTranslateSegment(parseInt(card.dataset.index, 10));
+            if (!segment) {
+                return;
+            }
+            const startMs = parseInt(card.querySelector('.segment-start').value || '0', 10);
+            const endMs = parseInt(card.querySelector('.segment-end').value || '0', 10);
+            const validTiming = Number.isFinite(startMs) && Number.isFinite(endMs) && endMs > startMs;
+            if (validTiming) {
+                Object.assign(segment, {
+                    start_ms: startMs,
+                    end_ms: endMs,
+                    duration_ms: endMs - startMs,
+                    start: formatTimestamp(startMs),
+                    end: formatTimestamp(endMs),
+                });
+            }
+            card.classList.toggle('invalid-timing', !validTiming);
+            card.querySelector('.segment-duration-label').textContent = validTiming
+                ? `${endMs - startMs} ms`
+                : 'End must be after start';
+            card.querySelector('.compact-time').textContent =
+                `${formatTimestampHHMMSS(segment.start_ms)} → ${formatTimestampHHMMSS(segment.end_ms)}`;
+            card.querySelector('.segment-timing-summary').textContent =
+                `${segment.start} → ${segment.end} (${segment.duration_ms} ms)`;
+
+            if (segment.type === 'speech') {
+                segment.source_text = card.querySelector('.segment-source').value;
+                segment.translated_text = card.querySelector('.segment-translation').value;
+                segment.generate = card.querySelector('input.segment-generate').checked;
+                const volume = parseOptionalNumber(card.querySelector('.segment-volume'));
+                const emotion = parseOptionalNumber(card.querySelector('.segment-emotion'));
+                if (volume === undefined) delete segment.volume_percent; else segment.volume_percent = volume;
+                if (emotion === undefined) delete segment.emotion_weight; else segment.emotion_weight = emotion;
+
+                setCompactText(card.querySelector('.compact-source'), segment.source_text, '—');
+                setCompactText(card.querySelector('.compact-translation'), segment.translated_text, 'No translation');
+                card.classList.toggle(
+                    'missing-translation',
+                    segment.generate && !segment.translated_text.trim()
+                );
+
+                const fresh = isSegmentPreviewFresh(segment);
+                const stale = Boolean(segment.preview_url) && !fresh;
+                const genBtn = card.querySelector('.gen-btn');
+                genBtn.classList.toggle('has-audio', fresh);
+                genBtn.classList.toggle('stale', stale);
+                genBtn.title = stale
+                    ? 'Edited since preview: click to regenerate'
+                    : fresh ? 'Play generated preview' : 'Generate and play preview';
+                const statusEl = card.querySelector('.segment-preview-status');
+                if (stale) {
+                    statusEl.textContent = 'Edited since this preview';
+                    statusEl.style.color = 'var(--warning)';
+                } else if (fresh) {
+                    statusEl.textContent = '✓ Preview up to date';
+                    statusEl.style.color = 'var(--brand-emerald)';
+                }
+            }
+            card.classList.toggle('edited', isSegmentEdited(segment));
+        }
+
+        function setCompactText(element, text, placeholder) {
+            const value = (text || '').trim();
+            element.textContent = value ? truncateText(value, 40) : placeholder;
+            element.title = value;
+            element.classList.toggle('empty', !value);
+        }
+
         function updateTranslateSegmentsSummary() {
             if (!translateSegmentsStatus) {
                 return;
@@ -585,6 +682,7 @@ function toggleSegmentExpand(card) {
                 return;
             }
             const speechCards = translateSegmentsList.querySelectorAll('.segment-card.speech');
+            translateSegmentsDirty = translateSegmentsList.querySelector('.segment-card.edited') !== null;
             if (!speechCards.length) {
                 hideStatus('translateSegmentsStatus');
                 return;
@@ -597,20 +695,89 @@ function toggleSegmentExpand(card) {
                 }
             });
             const preserved = speechCards.length - selected;
-            showStatus(
-                `Selected ${selected}/${speechCards.length} speech segments • Preserving ${preserved}`,
-                'success',
-                'translateSegmentsStatus'
-            );
+            const parts = [`Selected ${selected}/${speechCards.length} speech segments`, `Preserving ${preserved}`];
+            const edited = translateSegmentsList.querySelectorAll('.segment-card.edited').length;
+            if (edited) {
+                parts.push(`${edited} edited since last ${translateSegmentsGenerated ? 'generation' : 'analysis'}`);
+            }
+            const missing = translateSegmentsList.querySelectorAll('.segment-card.missing-translation').length;
+            if (missing) {
+                parts.push(`${missing} selected without translation (will be silent)`);
+            }
+            showStatus(parts.join(' • '), missing ? 'warning' : 'success', 'translateSegmentsStatus');
             if (translateSegmentsSelectAll) {
                 translateSegmentsSelectAll.checked = selected === speechCards.length;
             }
         }
 
+        function getNavigableSegmentCards() {
+            const hideSilence = translateSegmentsList.classList.contains('hide-silence');
+            return Array.from(translateSegmentsList.querySelectorAll('.segment-card'))
+                .filter(card => !(hideSilence && card.dataset.type === 'silence'));
+        }
+
+        function focusSegmentCard(card) {
+            if (!card) {
+                return;
+            }
+            if (card.classList.contains('compact')) {
+                toggleSegmentExpand(card);
+            }
+            const field = card.querySelector('.segment-translation') || card.querySelector('.segment-start');
+            if (field) {
+                field.focus({ preventScroll: true });
+            }
+            card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+
+        function focusFirstMissingTranslation() {
+            focusSegmentCard(translateSegmentsList.querySelector('.segment-card.missing-translation'));
+        }
+
+        if (translateSegmentsList) {
+            translateSegmentsList.addEventListener('input', (event) => {
+                const card = event.target.closest('.segment-card');
+                if (card && event.target.matches('input, textarea')) {
+                    syncSegmentCard(card);
+                    updateTranslateSegmentsSummary();
+                }
+            });
+            // Alt+Up/Down moves between segments; Ctrl/Cmd+Enter previews the current one.
+            translateSegmentsList.addEventListener('keydown', (event) => {
+                const card = event.target.closest('.segment-card');
+                if (!card) {
+                    return;
+                }
+                if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+                    const previewBtn = card.querySelector('.segment-preview-btn');
+                    if (previewBtn && !previewBtn.disabled) {
+                        event.preventDefault();
+                        handleSegmentPreview(card, previewBtn);
+                    }
+                } else if (event.altKey && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+                    const cards = getNavigableSegmentCards();
+                    const next = cards[cards.indexOf(card) + (event.key === 'ArrowDown' ? 1 : -1)];
+                    if (next) {
+                        event.preventDefault();
+                        focusSegmentCard(next);
+                    }
+                }
+            });
+        }
+
+        window.addEventListener('beforeunload', (event) => {
+            if (translateSegmentsDirty) {
+                event.preventDefault();
+                event.returnValue = '';
+            }
+        });
+
         function renderTranslateSegments(segments = []) {
             if (!translateSegmentsList) {
                 return;
             }
+            const expandedCard = translateSegmentsList.querySelector('.segment-card.expanded');
+            const expandedIndex = expandedCard ? expandedCard.dataset.index : null;
             translateSegmentsList.innerHTML = '';
             const hasSpeech = segments.some(seg => seg.type === 'speech');
             if (!segments.length) {
@@ -650,27 +817,29 @@ function toggleSegmentExpand(card) {
                 // Compact row - shown when card is in compact mode
                 const compactRow = document.createElement('div');
                 compactRow.className = 'segment-compact-row';
-                const sourcePreview = segment.source_text ? truncateText(segment.source_text, 40) : (segment.type === 'silence' ? 'Silence' : '—');
-                const translationPreview = segment.translated_text ? truncateText(segment.translated_text, 40) : (segment.type === 'silence' ? '' : '—');
-                const startTimeFormatted = formatTimestampHHMMSS(startMsVal);
-                const endTimeFormatted = formatTimestampHHMMSS(endMsVal);
 
+                // Segment text is user/model content: insert it only through
+                // textContent/value, never through markup.
                 const hasOriginalAudio = !!segment.audio_preview_url;
                 compactRow.innerHTML = `
                         <span class="compact-index">#${segment.index}</span>
-                        <span class="compact-time">${startTimeFormatted} → ${endTimeFormatted}</span>
-                        <span class="compact-speaker ${speakerColorClass}" ${speakerColorIdx >= 0 ? `data-speaker-color="${speakerColorIdx}"` : ''}>${speakerLabel}</span>
-                        <span class="compact-source" title="${escapeHtml(segment.source_text || '')}">${escapeHtml(sourcePreview)}</span>
+                        <span class="compact-time"></span>
+                        <span class="compact-speaker ${speakerColorClass}" ${speakerColorIdx >= 0 ? `data-speaker-color="${speakerColorIdx}"` : ''}></span>
+                        <span class="compact-source"></span>
                         ${segment.type === 'speech' ? `<button type="button" class="compact-play-btn orig-btn" title="Play original" ${!hasOriginalAudio ? 'disabled style="opacity:0.4;cursor:not-allowed;"' : ''}>▶</button>` : ''}
-                        <span class="compact-translation" title="${escapeHtml(segment.translated_text || '')}">${escapeHtml(translationPreview)}</span>
+                        <span class="compact-translation"></span>
                         ${segment.type === 'speech' ? `
-                            <button type="button" class="compact-play-btn gen-btn" title="Play generated (will generate if needed)">▶</button>
+                            <button type="button" class="compact-play-btn gen-btn">▶</button>
                             <span class="compact-checkbox">
                                 <input type="checkbox" class="segment-generate-compact" ${segment.generate !== false ? 'checked' : ''}>
                             </span>
                         ` : ''}
                         <span class="compact-expand-icon">▼</span>
                     `;
+                compactRow.querySelector('.compact-speaker').textContent = speakerLabel;
+                if (segment.type === 'silence') {
+                    compactRow.querySelector('.compact-source').textContent = 'Silence';
+                }
                 card.appendChild(compactRow);
 
                 // Store original audio URL in dataset for compact play
@@ -715,6 +884,7 @@ function toggleSegmentExpand(card) {
                         if (mainCheckbox) {
                             mainCheckbox.checked = compactCheckbox.checked;
                         }
+                        syncSegmentCard(card);
                         updateTranslateSegmentsSummary();
                     });
                 }
@@ -747,6 +917,7 @@ function toggleSegmentExpand(card) {
                         if (compactCheckbox) {
                             compactCheckbox.checked = checkbox.checked;
                         }
+                        syncSegmentCard(card);
                         updateTranslateSegmentsSummary();
                     });
                     checkboxLabel.appendChild(checkbox);
@@ -775,7 +946,7 @@ function toggleSegmentExpand(card) {
                 card.appendChild(header);
 
                 const metaInfo = document.createElement('div');
-                metaInfo.className = 'segment-meta';
+                metaInfo.className = 'segment-meta segment-timing-summary';
                 metaInfo.textContent = `${segment.start || formatTimestamp(startMsVal)} → ${segment.end || formatTimestamp(endMsVal)} (${durationVal} ms)`;
                 card.appendChild(metaInfo);
 
@@ -791,25 +962,15 @@ function toggleSegmentExpand(card) {
                     `;
                 body.appendChild(timing);
 
-                const startInput = timing.querySelector('.segment-start');
-                const endInput = timing.querySelector('.segment-end');
-                const durationLabel = timing.querySelector('.segment-duration');
-                const updateDuration = () => {
-                    const startVal = parseInt(startInput.value || '0', 10);
-                    const endVal = parseInt(endInput.value || '0', 10);
-                    const diff = Math.max(0, endVal - startVal);
-                    durationLabel.textContent = diff;
-                };
-                startInput.addEventListener('input', updateDuration);
-                endInput.addEventListener('input', updateDuration);
-
                 if (segment.type === 'speech') {
                     const textGrid = document.createElement('div');
-                    textGrid.style.cssText = 'display: grid; grid-template-columns: 1fr 1fr; gap: 10px;';
+                    textGrid.className = 'segment-text-grid';
                     textGrid.innerHTML = `
-                            <div><label style="font-size:0.8rem;">Source</label><textarea class="segment-source" style="min-height:50px;">${segment.source_text || ''}</textarea></div>
-                            <div><label style="font-size:0.8rem;">Translation</label><textarea class="segment-translation" style="min-height:50px;">${segment.translated_text || ''}</textarea></div>
+                            <div><label style="font-size:0.8rem;">Source</label><textarea class="segment-source" style="min-height:50px;"></textarea></div>
+                            <div><label style="font-size:0.8rem;">Translation</label><textarea class="segment-translation" style="min-height:50px;" placeholder="Empty translations are rendered as silence"></textarea></div>
                         `;
+                    textGrid.querySelector('.segment-source').value = segment.source_text || '';
+                    textGrid.querySelector('.segment-translation').value = segment.translated_text || '';
                     body.appendChild(textGrid);
 
                     // Controls row: Preview button + Volume + Emotion
@@ -843,16 +1004,32 @@ function toggleSegmentExpand(card) {
 
                     const previewControls = controlsRow;
                     const previewButton = previewControls.querySelector('.segment-preview-btn');
+                    previewButton.title = 'Preview this segment (Ctrl+Enter)';
                     previewButton.addEventListener('click', () => handleSegmentPreview(card, previewButton));
                 }
 
                 card.appendChild(body);
                 translateSegmentsList.appendChild(card);
+                if (segment.preview_url) {
+                    showSegmentPreviewAudio(card, segment.preview_url);
+                }
+                syncSegmentCard(card);
+                if (String(segment.index) === expandedIndex) {
+                    toggleSegmentExpand(card);
+                }
             });
             if (!hasSpeech) {
                 translateSegmentsList.insertAdjacentHTML('beforeend', '<div class="segment-empty">No speech segments detected.</div>');
             }
             updateTranslateSegmentsSummary();
+        }
+
+        function showSegmentPreviewAudio(card, url) {
+            const audioEl = card.querySelector('.segment-preview-audio');
+            audioEl.src = url;
+            audioEl.style.display = 'block';
+            const placeholder = card.querySelector('.segment-preview-placeholder');
+            if (placeholder) placeholder.style.display = 'none';
         }
 
         function readSegmentCardValues(card, options = {}) {
@@ -928,16 +1105,16 @@ function toggleSegmentExpand(card) {
             return payload;
         }
 
+        // Resolves to the preview URL, or null when the preview failed.
         async function handleSegmentPreview(card, triggerButton) {
             if (!currentTranslateSessionId) {
                 showStatus('Analyze audio first to enable previews.', 'error', 'translateSegmentsStatus');
-                return;
+                return null;
             }
             if (!card) {
-                return;
+                return null;
             }
             const statusEl = card.querySelector('.segment-preview-status');
-            const audioEl = card.querySelector('.segment-preview-audio');
             try {
                 const segmentPayload = readSegmentCardValues(card, { forceGenerate: true });
                 if (segmentPayload.type !== 'speech') {
@@ -945,8 +1122,14 @@ function toggleSegmentExpand(card) {
                         statusEl.textContent = 'Only speech segments can be previewed.';
                         statusEl.style.color = 'var(--danger)';
                     }
-                    return;
+                    return null;
                 }
+                if (!segmentPayload.translated_text.trim()) {
+                    statusEl.textContent = 'Enter a translation to preview this segment.';
+                    statusEl.style.color = 'var(--danger)';
+                    return null;
+                }
+                const requestSignature = segmentAudioSignature(segmentPayload);
                 const requestPayload = {
                     session_id: currentTranslateSessionId,
                     segment: segmentPayload,
@@ -994,7 +1177,7 @@ function toggleSegmentExpand(card) {
                         statusEl.style.color = 'var(--danger)';
                     }
                     showStatus(errorMessage, 'error', 'translateSegmentsStatus');
-                    return;
+                    return null;
                 }
                 const data = await response.json();
                 if (!data || !data.audio_preview) {
@@ -1004,26 +1187,21 @@ function toggleSegmentExpand(card) {
                         statusEl.style.color = 'var(--danger)';
                     }
                     showStatus(message, 'error', 'translateSegmentsStatus');
-                    return;
+                    return null;
                 }
-                if (audioEl) {
-                    audioEl.src = data.audio_preview;
-                    audioEl.style.display = 'block';
-                    audioEl.load();
-                    // Hide placeholder if exists
-                    const placeholder = card.querySelector('.segment-preview-placeholder');
-                    if (placeholder) placeholder.style.display = 'none';
+                // The card may have been edited (or re-rendered) while the
+                // preview was synthesizing; the signature records what it covers.
+                const segment = findTranslateSegment(segmentPayload.index);
+                if (segment) {
+                    segment.preview_url = data.audio_preview;
+                    segment.preview_signature = requestSignature;
                 }
-                if (statusEl) {
-                    const label = data.media_type || 'audio';
-                    statusEl.textContent = `✓ ${label}`;
-                    statusEl.style.color = 'var(--brand-emerald)';
-                }
-                // Mark compact gen button as having audio
-                const compactGenBtn = card.querySelector('.gen-btn');
-                if (compactGenBtn) {
-                    compactGenBtn.classList.add('has-audio');
-                }
+                const liveCard = translateSegmentsList.querySelector(
+                    `.segment-card[data-index="${segmentPayload.index}"]`
+                ) || card;
+                showSegmentPreviewAudio(liveCard, data.audio_preview);
+                syncSegmentCard(liveCard);
+                return data.audio_preview;
             } catch (error) {
                 const message = error && error.message ? error.message : 'Preview failed.';
                 if (statusEl) {
@@ -1031,6 +1209,7 @@ function toggleSegmentExpand(card) {
                     statusEl.style.color = 'var(--danger)';
                 }
                 showStatus(message, 'error', 'translateSegmentsStatus');
+                return null;
             } finally {
                 if (triggerButton) {
                     triggerButton.disabled = false;

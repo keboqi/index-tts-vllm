@@ -2014,6 +2014,60 @@ pre.code-block {
     border-left-color: var(--speaker-color) !important;
 }
 
+/* Segment edit state */
+.segment-text-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+@media (max-width: 640px) {
+    .segment-text-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.segment-shortcuts {
+    display: block;
+    margin: -6px 0 10px;
+    color: var(--text-muted);
+    font-size: 0.75rem;
+}
+
+.segment-card.edited .compact-index::after {
+    content: '•';
+    margin-left: 3px;
+    color: var(--warning);
+}
+
+.segment-compact-row .compact-translation.empty {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.segment-card.missing-translation .compact-translation.empty,
+.segment-card.missing-translation .segment-translation::placeholder {
+    color: var(--warning);
+}
+
+.segment-card.missing-translation .segment-translation {
+    border-color: var(--warning);
+}
+
+.segment-card.invalid-timing .segment-timing input {
+    border-color: var(--danger);
+}
+
+.segment-card.invalid-timing .segment-duration-label {
+    color: var(--danger);
+}
+
+.compact-play-btn.gen-btn.stale {
+    background: var(--warning-soft);
+    border-color: color-mix(in srgb, var(--warning) 45%, transparent);
+    color: var(--warning);
+}
+
 /* ========== Synced audio player ========== */
 .synced-audio-player {
     margin-top: 20px;

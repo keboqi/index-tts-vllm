@@ -44,6 +44,7 @@ function syncSegmentRulesFromMetadata(rules) {
                 compactCheckboxes.forEach(cb => {
                     cb.checked = translateSegmentsSelectAll.checked;
                 });
+                translateSegmentsList.querySelectorAll('.segment-card.speech').forEach(syncSegmentCard);
                 updateTranslateSegmentsSummary();
             });
         } else {
@@ -323,6 +324,24 @@ function syncSegmentRulesFromMetadata(rules) {
 
                 if (hasError || !segmentsPayload.length) {
                     return;
+                }
+
+                // The server renders selected segments without a translation
+                // as silence; confirm that instead of letting it pass silently.
+                const missingTranslation = segmentsPayload.filter(
+                    seg => seg.generate && !seg.translated_text.trim()
+                );
+                if (missingTranslation.length) {
+                    const listed = missingTranslation.slice(0, 8).map(seg => `#${seg.index}`).join(', ');
+                    const more = missingTranslation.length > 8 ? ', …' : '';
+                    const proceed = window.confirm(
+                        `${missingTranslation.length} selected segment(s) have no translation (${listed}${more}) ` +
+                        'and will be rendered as silence.\n\nGenerate anyway? Cancel to review them.'
+                    );
+                    if (!proceed) {
+                        focusFirstMissingTranslation();
+                        return;
+                    }
                 }
 
                 const formatSelect = document.getElementById('translateOutputFormat');
@@ -610,6 +629,7 @@ function syncSegmentRulesFromMetadata(rules) {
                         generate: translateEnabledNow ? seg.generate !== false : false,
                     }))
                     : [];
+                markTranslateSegmentsBaseline(false);
                 renderTranslateSegments(currentTranslateSegments);
                 if (translateAdvancedPanel) {
                     translateAdvancedPanel.style.display = 'block';
@@ -792,33 +812,9 @@ function syncSegmentRulesFromMetadata(rules) {
                 showStatus(statusMessage, 'success', statusId);
                 applyChunkGenerationMetadata(metadata, audioUrl);
 
-                const segmentMap = new Map(segmentsPayload.map(seg => [seg.index, seg]));
-                currentTranslateSegments = currentTranslateSegments.map(seg => {
-                    const updated = segmentMap.get(seg.index);
-                    if (!updated) {
-                        return seg;
-                    }
-                    const duration = Math.max(0, updated.end_ms - updated.start_ms);
-                    return {
-                        ...seg,
-                        start_ms: updated.start_ms,
-                        end_ms: updated.end_ms,
-                        duration_ms: duration,
-                        start: formatTimestamp(updated.start_ms),
-                        end: formatTimestamp(updated.end_ms),
-                        source_text: updated.source_text || '',
-                        translated_text: updated.translated_text || '',
-                        generate: updated.generate,
-                        volume_percent:
-                            Object.prototype.hasOwnProperty.call(updated, 'volume_percent')
-                                ? updated.volume_percent
-                                : seg.volume_percent,
-                        emotion_weight:
-                            Object.prototype.hasOwnProperty.call(updated, 'emotion_weight')
-                                ? updated.emotion_weight
-                                : seg.emotion_weight,
-                    };
-                });
+                // Card edits are already in currentTranslateSegments; the
+                // generated output becomes the new baseline for "edited".
+                markTranslateSegmentsBaseline(true);
                 renderTranslateSegments(currentTranslateSegments);
 
                 completed = true;
