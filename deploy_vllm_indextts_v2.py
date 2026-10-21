@@ -681,10 +681,10 @@ def _start_cache_commit_watcher(poll_seconds: float = 5.0) -> None:
             current = requested_at()
             if current <= handled:
                 continue
-            handled = current
             try:
                 cache_storage.commit()
                 app_storage.commit()
+                handled = current
                 print("[drama3-serving] Committed compile caches to the volume.", flush=True)
             except Exception as exc:  # never take the server down over cache persistence
                 print(f"[drama3-serving] Could not commit compile caches: {exc}", flush=True)
