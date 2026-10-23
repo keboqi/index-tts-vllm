@@ -23,6 +23,10 @@ from . import checkpoint, environment
 from .requirements import DRAMA3_HF_REPO, DRAMA3_HF_REVISION
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# Drivers that cannot checkpoint CUDA IPC need Omni's stages to exchange
+# tensors through host SHM; this platform, a module for the Omni venv, does so.
+SHM_PLATFORM_DIR = Path(__file__).with_name("omni_platform")
+SHM_PLATFORM_SPEC = "drama3_omni_shm:ShmCudaPlatform"
 
 
 @dataclass(frozen=True)
@@ -203,20 +207,27 @@ class SglangOmniServer:
         self.log_path = logs / f"sglang-omni-{time.strftime('%Y%m%d-%H%M%S')}.log"
         self._log = self.log_path.open("ab", buffering=0)
         command = self.command()
+        env = self.server_env()
         self._checkpoint_helper = None
         self._checkpoint_baseline = 0
         if settings.sleep_mode == "auto" and not self._sleep_disabled and self.checkpoint_launch_enabled:
             try:
-                self._checkpoint_helper = checkpoint.prepare_helper(settings.runtime_dir / "cache")
+                helper, ipc = checkpoint.prepare_helper(settings.runtime_dir / "cache")
                 self._checkpoint_baseline = checkpoint.device_memory()[0]
-                # A fresh driver job per launch is required for inter-worker IPC.
-                command = [str(self._checkpoint_helper), "--launch-job", *command]
+                self._checkpoint_helper = helper
+                if ipc:
+                    # A fresh driver job per launch is required for inter-worker IPC.
+                    command = [str(helper), "--launch-job", *command]
+                else:
+                    # Stage workers inherit both; install_env already dropped any PYTHONPATH.
+                    env.update(PYTHONPATH=str(SHM_PLATFORM_DIR), SGLANG_OMNI_PLATFORM_SPEC=SHM_PLATFORM_SPEC)
+                    self.log_line("Driver cannot checkpoint CUDA IPC; Omni stages exchange tensors through host SHM")
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError, requests.RequestException) as exc:
                 self._sleep_disabled = True
                 self.log_line(f"Sleep unavailable; using stop/restart: {exc}")
         self._uncertain_request = False
         self.log_line(f"Starting {self.label}: {' '.join(command)}")
-        self.process = subprocess.Popen(command, env=self.server_env(), stdin=subprocess.DEVNULL,
+        self.process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
                                         stdout=self._log, stderr=subprocess.STDOUT, start_new_session=True)
         atexit.register(self.stop)
 
@@ -284,7 +295,8 @@ class SglangOmniServer:
             try:
                 self._launch(progress)
             except (RuntimeError, OSError):
-                # Only a checkpoint-wrapped launch earns an ordinary retry.
+                # Only a sleep-enabled launch (job wrapper or SHM platform)
+                # earns an ordinary retry.
                 if self._sleep_disabled or self.settings.sleep_mode != "auto":
                     raise
                 self._sleep_disabled = True

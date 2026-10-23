@@ -163,8 +163,13 @@ Corresponding `DRAMA3_*` environment variables are listed in `.env.example`.
 
 The model manager sleeps/wakes `drama3_sglang`, and switching to other TTS
 engines releases Drama 3's GPU allocations. CUDA checkpoint sleep requires
-Linux x86_64, NVIDIA driver 610+ and sufficient host RAM; unsupported or failed
-transitions fall back to stopping/restarting the isolated server. Set
+Linux x86_64, NVIDIA driver 580+ and sufficient host RAM; unsupported or failed
+transitions fall back to stopping/restarting the isolated server. Omni's stages
+normally exchange tensors over CUDA IPC, which only driver 610+ can checkpoint.
+On 580-609 (Colab's driver at the time of writing) the server launches Omni with
+a platform (`drama3_serving/omni_platform/`, loaded through
+`SGLANG_OMNI_PLATFORM_SPEC`) that routes those tensors through host shared
+memory instead; this path has not yet been verified on a GPU. Set
 `DRAMA3_SLEEP=off` to always use stop/restart.
 
 By default (`--startup_tts_backend none`) the server starts without loading any
