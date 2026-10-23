@@ -164,16 +164,21 @@ class GpuProfile:
                        use_torch_compile=self.use_torch_compile,
                        indextts25_max_parallel_segments=self.parallel_segments)
 
+    def startup_required_gib(self, *, non_vllm_gib: float = 8.0) -> float:
+        """Plan both Index engines, auxiliary models, and allocator headroom."""
+        if not math.isfinite(non_vllm_gib) or non_vllm_gib < 0:
+            raise ValueError("INDEXTTS_NON_VLLM_RESERVE_GIB must be finite and nonnegative")
+        budget = (self.index.gpu_memory_utilization + self.emotion.gpu_memory_utilization) * self.gpu.total_gib
+        return budget + non_vllm_gib + max(2.0, self.gpu.total_gib * 0.1)
+
     def check_startup_memory(self, *, non_vllm_gib: float = 8.0) -> None:
         """Preflight for the initial IndexTTS load, never for an already loaded restore.
 
         The non-vLLM reserve is a conservative planning allowance, not a measured
         hard allocation limit. Real workload validation is still required.
         """
-        if not math.isfinite(non_vllm_gib) or non_vllm_gib < 0:
-            raise ValueError("INDEXTTS_NON_VLLM_RESERVE_GIB must be finite and nonnegative")
+        required = self.startup_required_gib(non_vllm_gib=non_vllm_gib)
         budget = (self.index.gpu_memory_utilization + self.emotion.gpu_memory_utilization) * self.gpu.total_gib
-        required = budget + non_vllm_gib + max(2.0, self.gpu.total_gib * 0.1)
         if required > self.gpu.free_bytes / GIB:
             raise RuntimeError(
                 f"GPU profile {self.name} needs approximately {required:.2f} GiB for initial TTS load "
@@ -188,20 +193,36 @@ def resolve_gpu_profile(gpu: GpuInfo, environ: Mapping[str, str] | None = None, 
     total = gpu.total_gib
     if total < 20:
         raise ValueError(f"Detected {total:.2f} GiB VRAM; automatic profiles require a 24 GB-class GPU or larger")
-    if total < 32:
-        profile = GpuProfile("24gb", gpu, EngineProfile(6 / total, 4, 2560, enforce_eager=True),
+    # Pick a complete operating tier, not just smaller KV caches with unchanged
+    # concurrency. Fractions always refer to physical capacity, even when another
+    # process occupies most of the device. Keep the minimum tier if none fits so
+    # preflight can explain the shortfall instead of constructing unusable engines.
+    candidates = [GpuProfile("24gb", gpu, EngineProfile(6 / total, 4, 2560, enforce_eager=True),
                              EngineProfile(3 / total, 1, 2048, 2048, True),
                              EngineProfile(6 / total, 4, enforce_eager=True), True,
-                             1, 1, 1, 2, 4, 1, 4 / total, 7 / total)
-    elif total < 64:
-        profile = GpuProfile("48gb", gpu, EngineProfile(10 / total, 16, 4096),
+                             1, 1, 1, 2, 4, 1, 4 / total, 7 / total)]
+    if total >= 32:
+        candidates.append(GpuProfile("48gb", gpu, EngineProfile(10 / total, 16, 4096),
                              EngineProfile(4 / total, 4, 2048, 2048),
                              EngineProfile(10 / total, 16), True,
-                             4, 4, 4, 4, 16, 4, 8 / total, 14 / total)
-    else:
-        profile = GpuProfile("96gb", gpu, EngineProfile(0.15), EngineProfile(0.05, max_model_len=2048),
+                             4, 4, 4, 4, 16, 4, 8 / total, 14 / total))
+    if total >= 64:
+        candidates.append(GpuProfile("96gb", gpu, EngineProfile(0.15), EngineProfile(0.05, max_model_len=2048),
                              EngineProfile(0.20 if modal else 0.15), True,
-                             100, 100, 100, 8, 32, 16, 0.3, 0.3)
+                             100, 100, 100, 8, 32, 16, 0.3, 0.3))
+    reserve = float(env.get("INDEXTTS_NON_VLLM_RESERVE_GIB", "8"))
+    profile = candidates[0]
+    for candidate in reversed(candidates):
+        required = candidate.startup_required_gib(non_vllm_gib=reserve)
+        # Omni's stages coexist too. A high tier must fit either supported Index
+        # pipeline, although the pipelines never need to be resident together.
+        omni_required = ((candidate.omni_ar_memory + candidate.omni_s2mel_memory) * total
+                         + reserve + max(2.0, total * 0.1))
+        if max(required, omni_required) <= gpu.free_bytes / GIB:
+            profile = candidate
+            break
+    # User overrides intentionally take precedence over automatic planning;
+    # preflight reports impossible explicit budgets rather than changing them.
     updates: dict[str, Any] = {}
     for engine, prefix in ENGINE_PREFIXES.items():
         values = asdict(getattr(profile, engine))

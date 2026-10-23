@@ -215,8 +215,8 @@ class IndexTTS2:
 
         # =============================================================
         # vLLM ENGINE INITIALIZATION
-        # Parallel init only for GPUs with >40GB VRAM (e.g., A100)
-        # Sequential init for smaller GPUs (e.g., L4, T4) to avoid OOM
+        # Parallel init only with >40 GiB free; shared large GPUs may need
+        # sequential initialization too.
         # =============================================================
         from concurrent.futures import ThreadPoolExecutor
         import time as _time
@@ -224,11 +224,12 @@ class IndexTTS2:
         vllm_dir = os.path.join(model_dir, "gpt")
         qwen_emo_path = os.path.join(self.model_dir, self.cfg.qwen_emo_path)
         
-        # Check GPU VRAM to decide initialization strategy
+        # Recheck live memory: the profile may predate a lazy backend switch.
         gpu_vram_gb = self.gpu_profile.gpu.total_gib
         print(f"🔍 Detected GPU VRAM: {gpu_vram_gb:.1f} GiB ({self.gpu_profile.name})")
         
-        use_parallel_init = gpu_vram_gb > 40  # Only parallel init for >40GB GPUs
+        free_vram_gib = torch.cuda.mem_get_info(self.device)[0] / 1024**3
+        use_parallel_init = free_vram_gib > 40
         
         def init_gpt_vllm():
             """Initialize GPT vLLM engine"""
@@ -260,9 +261,9 @@ class IndexTTS2:
         _init_start = _time.time()
         
         if use_parallel_init:
-            # Staggered parallel initialization for large VRAM GPUs (>40GB)
+            # Staggered parallel initialization with ample free VRAM.
             # Start GPT first, wait for it to allocate memory, then start Qwen
-            print("🚀 Starting staggered vLLM engine initialization (GPU VRAM > 40GB)...")
+            print("🚀 Starting staggered vLLM engine initialization (free VRAM > 40 GiB)...")
             with ThreadPoolExecutor(max_workers=2) as executor:
                 gpt_future = executor.submit(init_gpt_vllm)
                 # Wait for GPT to finish allocating memory before starting Qwen
@@ -274,7 +275,7 @@ class IndexTTS2:
             print(f"✅ Staggered vLLM initialization completed in {_time.time() - _init_start:.2f}s")
         else:
             # Sequential initialization for smaller GPUs to avoid OOM
-            print("🚀 Starting sequential vLLM engine initialization (GPU VRAM <= 40GB)...")
+            print("🚀 Starting sequential vLLM engine initialization (free VRAM <= 40 GiB)...")
             indextts_vllm = init_gpt_vllm()
             self.qwen_emo = init_qwen_vllm()
             print(f"✅ Sequential vLLM initialization completed in {_time.time() - _init_start:.2f}s")

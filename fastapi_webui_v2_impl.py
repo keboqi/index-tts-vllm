@@ -3874,13 +3874,25 @@ async def _change_moss_model(action: str) -> None:
         raise HTTPException(status_code=502, detail=f"MOSS {action} failed: {exc}") from exc
 
 
-async def _release_translation_gpu_models() -> None:
-    """Called under a GPU lease before waking TTS on a small GPU."""
+async def _release_translation_gpu_models(required_mb: float | None = None) -> None:
+    """Reclaim idle translation models under a GPU lease, stopping once we fit."""
+    def enough_memory() -> bool:
+        if required_mb is None:
+            return False
+        memory = _cuda_memory_summary()
+        return bool(memory.get("available") and memory["free_mb"] >= required_mb)
+
+    if enough_memory():
+        return
     for model in await moss_model_client.inventory():
         if model["state"] == "loaded":
             await moss_model_client.change("sleep")
-    await _run_blocking(_unload_optional_model_sync, "hy_mt")
-    await _run_blocking(_unload_optional_model_sync, "audio_separator")
+            if enough_memory():
+                return
+    for key in ("hy_mt", "audio_separator"):
+        await _run_blocking(_unload_optional_model_sync, key)
+        if enough_memory():
+            return
 
 
 def _unload_optional_model_sync(model_key: str) -> List[str]:
@@ -10305,19 +10317,28 @@ class TTSManager:
         if (GPU_COORDINATOR.enabled and confucius_backend_manager._process_running()
                 and not confucius_backend_manager._vllm_sleeping):
             await confucius_backend_manager.sleep_vllm()
-        if GPU_COORDINATOR.enabled:
-            await _release_translation_gpu_models()
-        await _run_blocking(_release_cuda_cache)
         memory = _cuda_memory_summary()
-        if memory.get("available"):
-            # Reserve room for BOTH engines, even when the UI wakes only GPT.
-            # The next synthesis also wakes emotion, as seen in the reported OOM.
+        # Reserve BOTH sleeping engines, including a manual wake of only GPT.
+        # A lazy first load also needs the non-vLLM models and startup headroom.
+        if not self.is_ready():
+            required_mb = GPU_PROFILE.startup_required_gib(
+                non_vllm_gib=float(os.getenv("INDEXTTS_NON_VLLM_RESERVE_GIB", "8")),
+            ) * 1024
+        else:
             fraction = (GPU_PROFILE.index.gpu_memory_utilization if self._indextts_vllm_sleeping else 0)
             fraction += (GPU_PROFILE.emotion.gpu_memory_utilization if self._emotion_vllm_sleeping else 0)
-            required_mb = fraction * memory["total_mb"] + 512
+            required_mb = fraction * GPU_PROFILE.gpu.total_gib * 1024 + 512
+        if not memory.get("available") or memory["free_mb"] < required_mb:
+            # Try cached allocator blocks before unloading reusable models.
+            await _run_blocking(_release_cuda_cache)
+            memory = _cuda_memory_summary()
+            if GPU_COORDINATOR.enabled and (not memory.get("available") or memory["free_mb"] < required_mb):
+                await _release_translation_gpu_models(required_mb=required_mb)
+                memory = _cuda_memory_summary()
+        if memory.get("available"):
             if memory["free_mb"] < required_mb:
                 raise GpuWakeError(
-                    f"Need {required_mb / 1024:.2f} GiB free to restore sleeping TTS engines, "
+                    f"Need {required_mb / 1024:.2f} GiB free to load or restore TTS engines, "
                     f"but only {memory['free_mb'] / 1024:.2f} GiB is free. "
                     "Unload other models in Model Manager and retry. No wake allocation was attempted."
                 )

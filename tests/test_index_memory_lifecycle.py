@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import os
 import threading
 import unittest
 from collections.abc import Callable
@@ -8,9 +9,10 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
+from indextts_web.gpu_profiles import resolve_gpu_profile
 from indextts_web.infrastructure.gpu_work import GpuWorkCoordinator, await_gpu_job, gpu_operation
 from indextts_web.infrastructure.vllm_memory import GpuWakeError
-from tests.support import ROOT, load_definition, source_tree
+from tests.support import ROOT, gpu, load_definition, source_tree
 
 
 class IndexWakeTests(unittest.IsolatedAsyncioTestCase):
@@ -19,8 +21,7 @@ class IndexWakeTests(unittest.IsolatedAsyncioTestCase):
         self.ns = {
             "asyncio": asyncio, "Dict": dict, "Any": Any, "gpu_operation": gpu_operation,
             "GpuWakeError": GpuWakeError, "GPU_COORDINATOR": GpuWorkCoordinator(enabled=True),
-            "GPU_PROFILE": SimpleNamespace(index=SimpleNamespace(gpu_memory_utilization=0.25),
-                                           emotion=SimpleNamespace(gpu_memory_utilization=0.125)),
+            "GPU_PROFILE": resolve_gpu_profile(gpu(), {}), "os": os,
             "drama3_backend_manager": SimpleNamespace(sleep_vllm=AsyncMock(), process_running=lambda: False),
             "indextts25_backend_manager": SimpleNamespace(process_running=lambda: False),
             "confucius_backend_manager": SimpleNamespace(_process_running=lambda: False),
@@ -51,13 +52,65 @@ class IndexWakeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reclaims_translation_memory_before_waking_either_engine(self):
         events = []
-        self.ns["_release_translation_gpu_models"].side_effect = lambda: events.append("reclaim")
+        self.memory["free_mb"] = 7 * 1024
+
+        def reclaim(**kwargs):
+            events.append("reclaim")
+            self.memory["free_mb"] = 10 * 1024
+
+        self.ns["_release_translation_gpu_models"].side_effect = reclaim
         self.manager.tts.wake_indextts_vllm.side_effect = lambda: events.append("gpt")
         self.manager.tts.wake_emotion_vllm.side_effect = lambda: events.append("emotion")
         await self.manager.ensure_awake()
         self.assertEqual(events, ["reclaim", "gpt", "emotion"])
+        self.ns["_release_translation_gpu_models"].assert_awaited_once_with(required_mb=9.5 * 1024)
+
+    async def test_sufficient_memory_preserves_translation_models_and_allocator_cache(self):
+        await self.manager.ensure_awake()
+        self.ns["_release_translation_gpu_models"].assert_not_awaited()
+        self.ns["_run_blocking"].assert_not_awaited()
+
+    async def test_allocator_cache_is_reclaimed_before_unloading_models(self):
+        self.memory["free_mb"] = 9 * 1024
+
+        def release_cache(*args):
+            self.memory["free_mb"] = 10 * 1024
+
+        self.ns["_run_blocking"].side_effect = release_cache
+        await self.manager.ensure_awake()
+        self.ns["_run_blocking"].assert_awaited_once_with(self.ns["_release_cuda_cache"])
+        self.ns["_release_translation_gpu_models"].assert_not_awaited()
+
+    async def test_large_gpu_does_not_reclaim_models_without_exclusive_backend_lease(self):
+        self.ns["GPU_COORDINATOR"].enabled = False
+        self.memory["free_mb"] = 7 * 1024
+        with self.assertRaises(GpuWakeError):
+            await self.manager.ensure_awake()
+        self.ns["_release_translation_gpu_models"].assert_not_awaited()
+
+    async def test_recovered_telemetry_still_reserves_both_engines(self):
+        self.memory = {"available": False}
+
+        def release_cache(*args):
+            self.memory = {"available": True, "total_mb": 24 * 1024, "free_mb": 7 * 1024}
+
+        self.ns["_run_blocking"].side_effect = release_cache
+        with self.assertRaisesRegex(GpuWakeError, "9.50 GiB"):
+            await self.manager.ensure_awake()
+        self.manager.tts.wake_indextts_vllm.assert_not_awaited()
+        self.ns["_release_translation_gpu_models"].assert_awaited_once_with(required_mb=9.5 * 1024)
+
+    async def test_lazy_initialization_checks_full_model_budget(self):
+        self.manager._initialized = False
+        self.manager._indextts_vllm_sleeping = False
+        self.manager._emotion_vllm_sleeping = False
+        self.manager.initialize = AsyncMock()
+        with self.assertRaisesRegex(GpuWakeError, "19.40 GiB"):
+            await self.manager.ensure_awake()
+        self.manager.initialize.assert_not_awaited()
 
     async def test_index_initializes_lazily_after_external_backend_startup(self):
+        self.memory["free_mb"] = 24 * 1024
         self.manager._initialized = False
         self.manager._indextts_vllm_sleeping = False
         self.manager._emotion_vllm_sleeping = False
@@ -94,6 +147,50 @@ class IndexWakeTests(unittest.IsolatedAsyncioTestCase):
         code.body[0].handlers = block.handlers
         with self.assertRaisesRegex(GpuWakeError, "no VRAM"):
             exec(compile(code, "<segment error handling>", "exec"), {"GpuWakeError": GpuWakeError})
+
+
+class TranslationReclamationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.free = 0
+        self.client = SimpleNamespace(
+            inventory=AsyncMock(return_value=[{"state": "loaded"}]), change=AsyncMock(),
+        )
+        self.unload = Mock()
+        self.blocking = AsyncMock()
+        self.reclaim = load_definition(ROOT / "fastapi_webui_v2_impl.py", "_release_translation_gpu_models", {
+            "moss_model_client": self.client, "_run_blocking": self.blocking,
+            "_unload_optional_model_sync": self.unload,
+            "_cuda_memory_summary": lambda: {"available": True, "free_mb": self.free},
+        })
+
+    async def test_does_not_even_query_models_when_memory_is_sufficient(self):
+        self.free = 100
+        await self.reclaim(required_mb=100)
+        self.client.inventory.assert_not_awaited()
+        self.blocking.assert_not_awaited()
+
+    async def test_stops_after_sleeping_moss_when_that_is_enough(self):
+        def sleep(*args):
+            self.free = 100
+
+        self.client.change.side_effect = sleep
+        await self.reclaim(required_mb=100)
+        self.client.change.assert_awaited_once_with("sleep")
+        self.blocking.assert_not_awaited()
+
+    async def test_preserves_separator_when_unloading_translator_is_enough(self):
+        def unload(*args):
+            self.free = 100
+
+        self.blocking.side_effect = unload
+        await self.reclaim(required_mb=100)
+        self.blocking.assert_awaited_once_with(self.unload, "hy_mt")
+
+    async def test_no_target_keeps_existing_full_reclaim_behavior(self):
+        self.free = 100
+        await self.reclaim()
+        self.client.change.assert_awaited_once_with("sleep")
+        self.assertEqual([call.args[1] for call in self.blocking.await_args_list], ["hy_mt", "audio_separator"])
 
 
 class GpuMaintenanceTests(unittest.IsolatedAsyncioTestCase):

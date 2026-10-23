@@ -29,7 +29,7 @@ from tests.support import gpu
 
 class GpuProfileTests(unittest.TestCase):
     def test_capacity_boundaries_and_reported_capacity(self):
-        for capacity, expected in ((22.49, "24gb"), (31.99, "24gb"), (32, "48gb"),
+        for capacity, expected in ((22.49, "24gb"), (31.99, "24gb"), (32, "24gb"), (34, "48gb"),
                                    (44.5, "48gb"), (63.99, "48gb"), (64, "96gb"), (95, "96gb")):
             with self.subTest(capacity=capacity):
                 profile = resolve_gpu_profile(gpu(capacity), {})
@@ -45,6 +45,41 @@ class GpuProfileTests(unittest.TestCase):
         self.assertTrue(profile.index.enforce_eager)
         self.assertEqual(profile.index_concurrency, 1)
         self.assertTrue(profile.use_torch_compile)
+
+    def test_shared_gpu_selects_highest_complete_tier_that_fits(self):
+        for capacity, free, tier, index_gib, concurrency in (
+            (48, 22, "24gb", 6, 1),
+            (96, 30, "24gb", 6, 1),
+            (96, 40, "48gb", 10, 4),
+            (96, 80, "96gb", 14.4, 100),
+        ):
+            with self.subTest(capacity=capacity, free=free):
+                profile = resolve_gpu_profile(gpu(capacity, free), {})
+                self.assertEqual(profile.name, tier)
+                self.assertAlmostEqual(profile.index.gpu_memory_utilization * capacity, index_gib)
+                self.assertEqual(profile.index_concurrency, concurrency)
+                self.assertEqual(profile.translation_concurrency, concurrency)
+                self.assertEqual(profile.parallel_segments, concurrency)
+                profile.check_startup_memory()
+                self.assertEqual(GpuProfile.from_json(profile.to_json()), profile)
+
+    def test_pressure_tiers_are_stable_within_a_band(self):
+        first = resolve_gpu_profile(gpu(96, 40), {})
+        self.assertEqual(first.cache_key, resolve_gpu_profile(gpu(96, 41), {}).cache_key)
+        self.assertNotEqual(first.cache_key, resolve_gpu_profile(gpu(96, 30), {}).cache_key)
+
+    def test_reserve_affects_auto_tier_and_overrides_remain_explicit(self):
+        profile = resolve_gpu_profile(gpu(48, 34), {"INDEXTTS_NON_VLLM_RESERVE_GIB": "12"})
+        self.assertEqual(profile.name, "24gb")
+        for reserve in ("nan", "inf", "-1"):
+            with self.subTest(reserve=reserve), self.assertRaises(ValueError):
+                resolve_gpu_profile(gpu(), {"INDEXTTS_NON_VLLM_RESERVE_GIB": reserve})
+        explicit = resolve_gpu_profile(gpu(96, 30), {"GPU_MEMORY_UTILIZATION": "0.5",
+                                                    "INDEXTTS_GPU_WORK_CONCURRENCY": "7"})
+        self.assertEqual(explicit.index.gpu_memory_utilization, 0.5)
+        self.assertEqual(explicit.index_concurrency, 7)
+        with self.assertRaisesRegex(RuntimeError, "only 30.00"):
+            explicit.check_startup_memory()
 
     def test_medium_limits_and_high_modal_compatibility(self):
         medium = resolve_gpu_profile(gpu(48), {}, modal=True)
@@ -178,9 +213,10 @@ class OmniProfileTests(unittest.TestCase):
             root = Path(directory)
             source = root / "base.yaml"
             source.write_text(json.dumps(base))
-            for capacity, batches in ((24, (4, 1)), (48, (16, 4)), (96, (32, 16))):
-                with self.subTest(capacity=capacity):
-                    profile = resolve_gpu_profile(gpu(capacity), {}, modal=True)
+            for capacity, free, batches in ((24, 24, (4, 1)), (48, 48, (16, 4)), (96, 96, (32, 16)),
+                                            (96, 40, (16, 4)), (96, 30, (4, 1))):
+                with self.subTest(capacity=capacity, free=free):
+                    profile = resolve_gpu_profile(gpu(capacity, free), {}, modal=True)
                     target = write_omni_deploy_config(source, root / "generated", profile)
                     config = yaml.safe_load(target.read_text())
                     ar, mel = config["stages"]
@@ -193,15 +229,19 @@ class OmniProfileTests(unittest.TestCase):
                     self.assertEqual(mel["max_num_batched_tokens"], 8192)
                     self.assertTrue(mel["hf_overrides"]["s2mel_dit_torch_compile"])
                     self.assertTrue(mel["hf_overrides"]["s2mel_vocoder_torch_compile"])
-                    disabled = resolve_gpu_profile(gpu(capacity), {"INDEXTTS_USE_TORCH_COMPILE": "0"}, modal=True)
+                    disabled = resolve_gpu_profile(gpu(capacity, free), {"INDEXTTS_USE_TORCH_COMPILE": "0"}, modal=True)
                     disabled_path = write_omni_deploy_config(source, root / "generated", disabled)
                     disabled_config = yaml.safe_load(disabled_path.read_text())
                     overrides = disabled_config["stages"][1]["hf_overrides"]
                     self.assertFalse(overrides["s2mel_dit_torch_compile"])
                     self.assertFalse(overrides["s2mel_vocoder_torch_compile"])
                     self.assertEqual(target, write_omni_deploy_config(source, root / "generated", profile))
-                    if capacity == 96:
+                    if profile.name == "96gb":
                         self.assertEqual(target, source)
+                    else:
+                        self.assertNotEqual(target, source)
+                        self.assertAlmostEqual(ar["gpu_memory_utilization"], profile.omni_ar_memory)
+                        self.assertAlmostEqual(mel["gpu_memory_utilization"], profile.omni_s2mel_memory)
             self.assertEqual(json.loads(source.read_text()), base)
 
 

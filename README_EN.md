@@ -52,7 +52,25 @@ python fastapi_webui_v2.py --model_dir checkpoints --host 0.0.0.0 --port 8000
 ```
 
 GPU memory budgets, scheduler limits, and synthesis concurrency are selected
-from detected VRAM. Explicit CLI or environment settings override the profile.
+from both total and free VRAM. On a shared GPU, startup selects the highest
+operating tier that fits the IndexTTS engines or Omni stages, auxiliary models,
+and safety headroom. For example, a 96 GiB GPU with 40 GiB free uses the 48 GB
+tier; with 30 GiB free it uses the 24 GB tier. Memory fractions still refer to
+the GPU's total capacity. Explicit CLI or environment settings override the profile.
+The `INDEXTTS_NON_VLLM_RESERVE_GIB` planning allowance defaults to 8 GiB;
+headroom adds the larger of 2 GiB or 10% of total VRAM. If even the minimum
+IndexTTS budget cannot fit, preflight reports the shortfall before loading.
+
+IndexTTS wake checks live free memory and preserves translation models when
+there is enough room for both sleeping engines plus 512 MiB. Under pressure,
+it releases allocator cache first, then sleeps MOSS and unloads HY-MT and
+audio separation models only as needed, rechecking memory after each step.
+Automatic translation-model reclamation requires serialized backend access; on the large
+concurrent profile, a shortfall reports an error instead of unloading models
+that another backend may be using. Lazy first use checks the full startup budget.
+Tiers remain fixed for the process lifetime, including snapshot restores;
+restart to retune after a lasting change in available VRAM. These are planning
+estimates; validate peak usage with your checkpoints and workloads.
 Use `--use_torch_compile` / `--no-use_torch_compile` to control compilation.
 The complete CLI definition lives in [indextts_web/config.py](indextts_web/config.py).
 
